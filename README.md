@@ -949,20 +949,21 @@ podgest/
 ## Implementation Roadmap
 
 ### Phase 1: Foundation & Infrastructure
-- [ ] Initialize monorepo (pnpm + turborepo)
-- [ ] Set up Supabase project with schema + storage buckets
-- [ ] Set up Inngest account and local dev environment
-- [ ] Implement Google OAuth flow
-- [ ] Deploy Modal transcription endpoint with proper GPU config
-- [ ] Add initial podcast subscriptions via Supabase dashboard
+- [x] Initialize monorepo (pnpm + turborepo)
+- [x] Set up Supabase project with schema + storage buckets
+- [x] Set up Inngest account and local dev environment
+- [ ] Implement Google OAuth flow (skipped for now — using magic links)
+- [x] Deploy Modal transcription endpoint with proper GPU config
+- [x] Add initial podcast subscriptions via Supabase dashboard
 
 ### Phase 2: Ingestion Pipeline
 - [ ] **Verify SuperMemory** supports user_id, date, podcast filtering — if not, use pgvector
-- [ ] `poll-feeds` Inngest cron function (every 30 min)
-- [ ] `transcribe-episode` Inngest function (triggered by episode.created)
-- [ ] Modal webhook callback endpoint (`/api/webhooks/modal`)
+- [x] `poll-feeds` Inngest cron function (every 15 min)
+- [x] `transcribe-episode` Inngest function (triggered by episode.created)
+- [x] Modal webhook callback endpoint (`/api/webhooks/modal`)
 - [ ] `extract-topics` Inngest function (triggered by transcription.completed)
 - [ ] `embed-content` Inngest function (stores in SuperMemory or pgvector)
+- [ ] Deploy web app (Vercel) for Inngest + webhook endpoints
 - [ ] Test full pipeline with 2-3 real podcasts
 
 ### Phase 3: Digest Generation
