@@ -164,12 +164,13 @@ def transcribe_audio(audio_url: str, webhook_url: str | None = None, job_id: str
 
 
 @app.local_entrypoint()
-def main(audio_url: str = ""):
+def main(audio_url: str = "", output_file: str = ""):
     """Test the transcription endpoint."""
     if not audio_url:
         print("Podgest transcription service ready!")
         print("Deploy with: modal deploy transcribe.py")
         print("Test with: modal run transcribe.py --audio-url <URL>")
+        print("Save to file: modal run transcribe.py --audio-url <URL> --output-file transcript.json")
         return
     
     print(f"🚀 Starting transcription of: {audio_url}")
@@ -185,7 +186,13 @@ def main(audio_url: str = ""):
     print(f"Segments: {len(result.get('segments', []))}")
     print(f"Text length: {len(result.get('text', ''))} chars")
     print("=" * 60)
-    if result.get('status') == 'completed':
+    
+    if output_file and result.get('status') == 'completed':
+        import json
+        with open(output_file, 'w') as f:
+            json.dump(result, f, indent=2)
+        print(f"\n💾 Saved to: {output_file}")
+    elif result.get('status') == 'completed':
         print("\n📝 First 1000 chars of transcript:")
         print(result.get('text', '')[:1000])
         print("..." if len(result.get('text', '')) > 1000 else "")
