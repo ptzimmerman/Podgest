@@ -16,24 +16,29 @@ ON CONFLICT (id) DO NOTHING;
 -- Transcripts: only service role can access (backend only)
 CREATE POLICY "Service role can manage transcripts"
 ON storage.objects FOR ALL
-USING (bucket_id = 'transcripts' AND auth.role() = 'service_role')
-WITH CHECK (bucket_id = 'transcripts' AND auth.role() = 'service_role');
+TO service_role
+USING (bucket_id = 'transcripts')
+WITH CHECK (bucket_id = 'transcripts');
 
--- Digests: public read for RSS, service role for write
+-- Digests: public read for RSS
 CREATE POLICY "Public can read digests"
 ON storage.objects FOR SELECT
+TO public
 USING (bucket_id = 'digests');
 
-CREATE POLICY "Service role can manage digests"
+-- Digests: service role can write
+CREATE POLICY "Service role can write digests"
 ON storage.objects FOR INSERT
-USING (bucket_id = 'digests' AND auth.role() = 'service_role')
-WITH CHECK (bucket_id = 'digests' AND auth.role() = 'service_role');
+TO service_role
+WITH CHECK (bucket_id = 'digests');
 
 CREATE POLICY "Service role can update digests"
 ON storage.objects FOR UPDATE
-USING (bucket_id = 'digests' AND auth.role() = 'service_role')
-WITH CHECK (bucket_id = 'digests' AND auth.role() = 'service_role');
+TO service_role
+USING (bucket_id = 'digests')
+WITH CHECK (bucket_id = 'digests');
 
 CREATE POLICY "Service role can delete digests"
 ON storage.objects FOR DELETE
-USING (bucket_id = 'digests' AND auth.role() = 'service_role');
+TO service_role
+USING (bucket_id = 'digests');

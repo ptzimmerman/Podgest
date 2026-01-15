@@ -5,10 +5,6 @@ Deploy with: modal deploy transcribe.py
 """
 
 import modal
-import tempfile
-import subprocess
-import os
-import requests
 
 # Define the image with faster-whisper and ffmpeg
 image = (
@@ -42,6 +38,7 @@ class Transcriber:
 
     def _preprocess_audio(self, input_path: str, output_path: str) -> str:
         """Preprocess audio: mono, 16kHz, remove silence."""
+        import subprocess
         try:
             cmd = [
                 "ffmpeg", "-y", "-i", input_path,
@@ -64,6 +61,10 @@ class Transcriber:
         
         If webhook_url is provided, POSTs result there instead of returning.
         """
+        import tempfile
+        import os
+        import requests
+        
         input_path = None
         processed_path = None
         
