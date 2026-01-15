@@ -1,5 +1,5 @@
 {
-  "buildCommand": "cd apps/web && pnpm build",
   "installCommand": "pnpm install",
-  "framework": "sveltekit"
+  "buildCommand": "pnpm --filter @podgest/web build",
+  "outputDirectory": "apps/web/.vercel/output"
 }

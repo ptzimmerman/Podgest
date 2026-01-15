@@ -1,6 +1,4 @@
 {
   "installCommand": "cd ../.. && pnpm install",
-  "buildCommand": "cd ../.. && pnpm --filter @podgest/web build",
-  "outputDirectory": ".svelte-kit/output",
-  "framework": "sveltekit"
+  "buildCommand": "cd ../.. && pnpm --filter @podgest/web build"
 }
