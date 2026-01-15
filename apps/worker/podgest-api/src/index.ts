@@ -1,5 +1,5 @@
-// Simple Cloudflare Worker for Podgest API
-// Handles Inngest webhook and Modal callback
+import { Inngest } from "inngest";
+import { serve } from "inngest/cloudflare";
 
 export interface Env {
   SUPABASE_URL: string;
@@ -8,31 +8,61 @@ export interface Env {
   INNGEST_SIGNING_KEY: string;
 }
 
+// Create Inngest client
+const inngest = new Inngest({ 
+  id: "podgest",
+  isDev: false,  // Force production mode
+});
+
+// Define functions
+const helloWorld = inngest.createFunction(
+  { id: "hello-world" },
+  { event: "test/hello" },
+  async ({ event }) => {
+    return { message: `Hello ${event.data?.name || "World"}!` };
+  }
+);
+
+const pollSubscriptions = inngest.createFunction(
+  { id: "poll-subscriptions" },
+  { cron: "*/15 * * * *" },
+  async () => {
+    console.log("Polling subscriptions...");
+    return { polled: 0 };
+  }
+);
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // Health check
     if (url.pathname === "/health" || url.pathname === "/") {
-      return json({ status: "ok", timestamp: new Date().toISOString() });
+      return json({ 
+        status: "ok", 
+        timestamp: new Date().toISOString(),
+        hasSigningKey: !!env.INNGEST_SIGNING_KEY,
+        signingKeyLength: env.INNGEST_SIGNING_KEY?.length || 0,
+      });
     }
 
-    // Inngest endpoint - minimal implementation
+    // Inngest endpoint
     if (url.pathname === "/api/inngest") {
-      if (request.method === "GET") {
-        // Inngest introspection
-        return json({
-          framework: "cloudflare-workers",
-          appName: "podgest",
-          functions: [
-            { id: "poll-subscriptions", name: "Poll All Subscriptions", triggers: [{ cron: "*/15 * * * *" }] },
-          ],
-          url: `${url.origin}/api/inngest`,
+      try {
+        const handler = serve({
+          client: inngest,
+          functions: [helloWorld, pollSubscriptions],
+          signingKey: env.INNGEST_SIGNING_KEY,
         });
-      }
-      if (request.method === "POST" || request.method === "PUT") {
-        // Handle Inngest events - for now just acknowledge
-        return json({ ok: true });
+        // serve() returns a fetch handler directly for Cloudflare
+        return await handler(request, env, ctx);
+      } catch (error) {
+        console.error("Inngest error:", error);
+        return json({ 
+          error: "Inngest handler error", 
+          message: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        }, 500);
       }
     }
 
@@ -41,13 +71,12 @@ export default {
       return handleModalWebhook(request, env);
     }
 
-    // 404
     return json({ error: "Not found" }, 404);
   },
 };
 
 function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
+  return new Response(JSON.stringify(data, null, 2), {
     status,
     headers: { "Content-Type": "application/json" },
   });
@@ -65,7 +94,6 @@ async function handleModalWebhook(request: Request, env: Env): Promise<Response>
       error?: string;
     };
 
-    // Parse job_id
     let jobData: { episode_id: string; transcription_id: string };
     try {
       jobData = JSON.parse(payload.job_id);
@@ -81,16 +109,12 @@ async function handleModalWebhook(request: Request, env: Env): Promise<Response>
     };
 
     if (payload.status === "completed" && payload.text) {
-      // Upload transcript to storage
       const transcriptPath = `${jobData.episode_id}/transcript.json`;
-      const storageResponse = await fetch(
+      await fetch(
         `${env.SUPABASE_URL}/storage/v1/object/transcripts/${transcriptPath}`,
         {
           method: "POST",
-          headers: {
-            ...supabaseHeaders,
-            "x-upsert": "true",
-          },
+          headers: { ...supabaseHeaders, "x-upsert": "true" },
           body: JSON.stringify({
             text: payload.text,
             segments: payload.segments,
@@ -99,9 +123,7 @@ async function handleModalWebhook(request: Request, env: Env): Promise<Response>
           }),
         }
       );
-      console.log("Storage upload:", storageResponse.status);
 
-      // Update transcription record
       await fetch(
         `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${jobData.episode_id}`,
         {
@@ -109,13 +131,12 @@ async function handleModalWebhook(request: Request, env: Env): Promise<Response>
           headers: supabaseHeaders,
           body: JSON.stringify({
             status: "completed",
-            transcript_text: payload.text.substring(0, 10000), // Truncate for DB
+            transcript_text: payload.text.substring(0, 10000),
             completed_at: new Date().toISOString(),
           }),
         }
       );
 
-      // Update episode status
       await fetch(
         `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${jobData.episode_id}`,
         {
@@ -128,19 +149,14 @@ async function handleModalWebhook(request: Request, env: Env): Promise<Response>
         }
       );
 
-      console.log("Transcription completed for episode:", jobData.episode_id);
       return json({ success: true, status: "completed" });
     } else {
-      // Update as failed
       await fetch(
         `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${jobData.episode_id}`,
         {
           method: "PATCH",
           headers: supabaseHeaders,
-          body: JSON.stringify({
-            status: "failed",
-            error_message: payload.error,
-          }),
+          body: JSON.stringify({ status: "failed", error_message: payload.error }),
         }
       );
 
@@ -153,11 +169,10 @@ async function handleModalWebhook(request: Request, env: Env): Promise<Response>
         }
       );
 
-      console.log("Transcription failed for episode:", jobData.episode_id);
       return json({ success: true, status: "failed" });
     }
   } catch (error) {
     console.error("Webhook error:", error);
-    return json({ error: "Internal error" }, 500);
+    return json({ error: "Internal error", message: error instanceof Error ? error.message : String(error) }, 500);
   }
 }
