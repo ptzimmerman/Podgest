@@ -1,0 +1,21 @@
+{
+  "name": "@podgest/workflows",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@podgest/core": "workspace:*",
+    "@supabase/supabase-js": "^2.49.1",
+    "inngest": "^3.27.5",
+    "fast-xml-parser": "^4.5.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "@types/node": "^22.10.5"
+  }
+}

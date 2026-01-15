@@ -16,6 +16,7 @@ image = (
     .pip_install(
         "faster-whisper==1.0.3",
         "requests",
+        "fastapi",
     )
 )
 
@@ -161,6 +162,38 @@ def transcribe_audio(audio_url: str, webhook_url: str | None = None, job_id: str
     """Convenience function to transcribe audio."""
     transcriber = Transcriber()
     return transcriber.transcribe.remote(audio_url, webhook_url, job_id)
+
+
+# Web endpoint for HTTP triggers from Inngest
+@app.function()
+@modal.fastapi_endpoint(method="POST")
+def transcribe_web(request: dict) -> dict:
+    """
+    HTTP endpoint for triggering transcription.
+    
+    Expected JSON body:
+    {
+        "audio_url": "https://...",
+        "webhook_url": "https://...",
+        "job_id": "..."
+    }
+    """
+    audio_url = request.get("audio_url")
+    webhook_url = request.get("webhook_url")
+    job_id = request.get("job_id")
+    
+    if not audio_url:
+        return {"error": "audio_url is required"}
+    
+    # Spawn async transcription (don't wait for result)
+    transcriber = Transcriber()
+    transcriber.transcribe.spawn(audio_url, webhook_url, job_id)
+    
+    return {
+        "status": "accepted",
+        "message": "Transcription job started",
+        "job_id": job_id,
+    }
 
 
 @app.local_entrypoint()
