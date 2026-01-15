@@ -963,7 +963,8 @@ podgest/
 - [x] Modal webhook callback endpoint (`/api/webhooks/modal`)
 - [ ] `extract-topics` Inngest function (triggered by transcription.completed)
 - [ ] `embed-content` Inngest function (stores in SuperMemory or pgvector)
-- [ ] Deploy web app (Vercel) for Inngest + webhook endpoints
+- [x] Deploy web app (Vercel) for Inngest + webhook endpoints
+- [ ] Register Inngest app URL in dashboard
 - [ ] Test full pipeline with 2-3 real podcasts
 
 ### Phase 3: Digest Generation
