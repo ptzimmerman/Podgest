@@ -965,7 +965,7 @@ podgest/
 - [ ] `embed-content` Inngest function (stores in SuperMemory or pgvector)
 - [x] Deploy API (Cloudflare Workers) for Inngest + webhook endpoints
 - [x] Register Inngest app URL in dashboard
-- [ ] Test full pipeline with 2-3 real podcasts
+- [x] Test full pipeline with 2-3 real podcasts
 
 ### Phase 3: Digest Generation
 - [ ] `generate-digest` Inngest scheduled function (per-user timezone)
