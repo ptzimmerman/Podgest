@@ -6,9 +6,12 @@ Deploy with: modal deploy transcribe.py
 
 import modal
 
-# Define the image with faster-whisper and ffmpeg
+# Define the image with faster-whisper, ffmpeg, and CUDA
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04",
+        add_python="3.11"
+    )
     .apt_install("ffmpeg")
     .pip_install(
         "faster-whisper==1.0.3",
@@ -22,7 +25,7 @@ app = modal.App("podgest-transcribe", image=image)
 @app.cls(
     gpu="A10G",
     timeout=1800,  # 30 min for long podcasts
-    container_idle_timeout=300,  # Keep warm 5 min between jobs
+    scaledown_window=300,  # Keep warm 5 min between jobs
     memory=8192,  # 8GB RAM
     retries=2,
 )
@@ -94,15 +97,15 @@ class Transcriber:
                 temperature=0.0,
             )
             
-            # Collect segments
+            # Collect segments (convert to plain Python types for serialization)
             segments_list = []
             full_text_parts = []
             
             for segment in segments:
                 segments_list.append({
-                    "start": segment.start,
-                    "end": segment.end,
-                    "text": segment.text.strip(),
+                    "start": float(segment.start),
+                    "end": float(segment.end),
+                    "text": str(segment.text.strip()),
                 })
                 full_text_parts.append(segment.text.strip())
             
@@ -111,8 +114,8 @@ class Transcriber:
                 "job_id": job_id,
                 "text": " ".join(full_text_parts),
                 "segments": segments_list,
-                "language": info.language,
-                "duration": info.duration,
+                "language": str(info.language),
+                "duration": float(info.duration),
             }
             
             print(f"✅ Transcribed: {len(result['text'])} chars, {len(segments_list)} segments")
@@ -126,10 +129,14 @@ class Transcriber:
             return result
             
         except Exception as e:
+            import traceback
+            print(f"❌ Error: {e}")
+            print(traceback.format_exc())
             error_result = {
                 "status": "failed",
                 "job_id": job_id,
                 "error": str(e),
+                "traceback": traceback.format_exc(),
             }
             
             if webhook_url:
@@ -157,8 +164,28 @@ def transcribe_audio(audio_url: str, webhook_url: str | None = None, job_id: str
 
 
 @app.local_entrypoint()
-def main():
+def main(audio_url: str = ""):
     """Test the transcription endpoint."""
-    print("Podgest transcription service ready!")
-    print("Deploy with: modal deploy transcribe.py")
-    print("Test with: modal run transcribe.py")
+    if not audio_url:
+        print("Podgest transcription service ready!")
+        print("Deploy with: modal deploy transcribe.py")
+        print("Test with: modal run transcribe.py --audio-url <URL>")
+        return
+    
+    print(f"🚀 Starting transcription of: {audio_url}")
+    transcriber = Transcriber()
+    result = transcriber.transcribe.remote(audio_url)
+    
+    print("\n" + "=" * 60)
+    print(f"Status: {result.get('status')}")
+    if result.get('error'):
+        print(f"Error: {result.get('error')}")
+    print(f"Language: {result.get('language')}")
+    print(f"Duration: {result.get('duration', 0):.1f}s")
+    print(f"Segments: {len(result.get('segments', []))}")
+    print(f"Text length: {len(result.get('text', ''))} chars")
+    print("=" * 60)
+    if result.get('status') == 'completed':
+        print("\n📝 First 1000 chars of transcript:")
+        print(result.get('text', '')[:1000])
+        print("..." if len(result.get('text', '')) > 1000 else "")
