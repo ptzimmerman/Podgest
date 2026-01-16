@@ -2,7 +2,7 @@
 
 > **Daily podcast digest + AI-powered Q&A for podcast content**
 
-Transform hours of daily podcasts into a 30-minute professional news recap, and query all your podcast knowledge via Claude Desktop.
+Transform hours of daily podcasts into a 5-minute professional news recap, and query all your podcast knowledge via Claude Desktop.
 
 ---
 
@@ -37,10 +37,11 @@ You subscribe to many podcasts but don't have time to listen to them all. Hours 
 
 | Feature | Description |
 |---------|-------------|
-| **RSS Aggregation** | Subscribe to any podcast via RSS |
-| **Auto-Transcription** | GPU-accelerated transcription via Modal |
-| **Topic Clustering** | AI groups related content across podcasts |
-| **Daily Digest** | 30-min professional audio summary via ElevenLabs |
+| **RSS Aggregation** | Subscribe to any podcast via RSS (or ListenNotes playlists) |
+| **Auto-Transcription** | GPU-accelerated transcription via Modal (faster-whisper) |
+| **Topic Extraction** | Claude extracts topics, themes, key points per episode |
+| **Daily Digest** | 5-min professional news recap via ElevenLabs (expandable later) |
+| **Smart Citations** | Host cites original source podcasts naturally |
 | **Spotify Distribution** | Listen in your existing podcast app |
 | **MCP Q&A** | Ask questions about any podcast content via Claude Desktop |
 | **Multi-tenant** | Supports multiple users with isolated data |
@@ -967,14 +968,20 @@ podgest/
 - [x] Register Inngest app URL in dashboard
 - [x] Test full pipeline with 2-3 real podcasts
 
-### Phase 3: Digest Generation
+### Phase 3: Digest Generation ✅
 - [x] `generate-digest` endpoint (POST `/api/generate-digest`)
 - [x] Script generation with news broadcaster style (Claude Sonnet 4)
-- [x] ElevenLabs TTS integration (single voice: Eric)
+- [x] Host persona: Alex Chen, neutral news reader
+- [x] Accurate podcast citations (extracts original podcast names from ListenNotes)
+- [x] Peter Zeihan content permanently excluded
+- [x] ElevenLabs TTS integration (single voice: Eric) via Modal
+- [x] Async TTS generation (Worker triggers Modal, returns immediately)
+- [x] TTS webhook callback (`/api/webhooks/tts`)
 - [x] Store generated audio in Supabase Storage (`digests` bucket)
 - [x] Save digest records to database for RSS feed
-- [ ] Scheduled generation via Inngest cron (per-user timezone)
-- [ ] Conversational two-host format (requires ElevenLabs Studio/enterprise)
+- [x] Scheduled generation via Inngest cron (per-user timezone)
+- [x] Free Edge TTS endpoint for testing (`test-audio` bucket)
+- [ ] Conversational two-host format (future - requires ElevenLabs enterprise)
 
 ### Phase 4: Distribution + MCP
 - [x] RSS feed endpoint (`/feed/{userId}`) - Spotify/iTunes compatible
@@ -999,11 +1006,14 @@ podgest/
 
 | Question | Decision |
 |----------|----------|
-| **Digest length** | Configurable: 15, 30, or 45 minutes (stored in user profile) |
+| **Digest length** | Fixed at 5 minutes for now (Cloudflare Worker limits); configurable preset lengths (5/10/15/30) planned for future |
+| **TTS generation** | Modal handles ElevenLabs API calls (no Worker timeout issues) |
 | **Podcast priority** | Weighted priorities (1-10) per subscription; higher = more airtime in digest |
 | **Skip episodes** | Not for now; may add later |
 | **Real-time vs batch** | Batch (overnight) — no real-time digest |
 | **Transcript access** | MCP only — no need for transcripts in web UI |
+| **Episode deduplication** | Episodes covered in last 7 days are excluded from new digests |
+| **ListenNotes feeds** | Original podcast names extracted from episode descriptions for accurate citations |
 
 ## Working Endpoints
 
@@ -1011,9 +1021,13 @@ podgest/
 |----------|--------|-------------|
 | `/health` | GET | Health check |
 | `/api/poll` | POST | Trigger RSS polling for all subscriptions |
-| `/api/generate-digest` | POST | Generate a digest (body: `{user_id, hours_back, max_length_minutes}`) |
+| `/api/generate-digest` | POST | Generate a digest (body: `{user_id, hours_back}`) — returns immediately, audio generated async |
+| `/api/scheduled-digest` | POST | Check all users and generate digests for those at their scheduled time |
+| `/api/extract-topics` | POST | Manually extract topics for an episode (body: `{episode_id}`) |
+| `/api/embed-content` | POST | Manually embed episode in SuperMemory (body: `{episode_id}`) |
 | `/api/inngest` | POST | Inngest webhook handler |
 | `/api/webhooks/modal` | POST | Modal transcription callback |
+| `/api/webhooks/tts` | POST | Modal TTS completion callback |
 | `/feed/{userId}` | GET | RSS feed for Spotify/podcatchers |
 
 **Base URL:** `https://podgest-api.pztest.workers.dev`
@@ -1022,6 +1036,14 @@ podgest/
 ```
 https://podgest-api.pztest.workers.dev/feed/18f513bd-8ecf-4922-84b7-4ab7c7cc14df
 ```
+
+### Modal Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `https://ptzimmerman--podgest-transcribe-transcribe-web.modal.run` | Transcription (Whisper) |
+| `https://ptzimmerman--podgest-transcribe-tts-web.modal.run` | Production TTS (ElevenLabs) |
+| `https://ptzimmerman--podgest-transcribe-test-tts-web.modal.run` | Free test TTS (Edge TTS) |
 
 ## Open Questions
 
