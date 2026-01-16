@@ -25,6 +25,17 @@ function shouldExcludeEpisode(title: string, description: string): boolean {
   return EXCLUDED_CONTENT_CREATORS.some(name => text.includes(name.toLowerCase()));
 }
 
+// Extract original podcast name from ListenNotes description HTML
+// Format: <strong>Podcast</strong>: <a href="...">Freakonomics Radio</a>
+function extractOriginalPodcastName(description: string): string | null {
+  // Try ListenNotes format first
+  const listenNotesMatch = description.match(/<strong>Podcast<\/strong>:\s*<a[^>]*>([^<]+)<\/a>/i);
+  if (listenNotesMatch) {
+    return listenNotesMatch[1].trim();
+  }
+  return null;
+}
+
 // ============================================
 // INNGEST CLIENT & FUNCTIONS
 // ============================================
@@ -887,7 +898,7 @@ async function handleScheduledDigest(env: Env): Promise<Response> {
     
     // Get all users with their timezone and digest preferences
     const profilesResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?select=id,timezone,digest_time,digest_length_minutes`,
+      `${env.SUPABASE_URL}/rest/v1/profiles?select=id,timezone,digest_time`,
       { headers }
     );
     
@@ -899,7 +910,6 @@ async function handleScheduledDigest(env: Env): Promise<Response> {
       id: string;
       timezone: string;
       digest_time: string;
-      digest_length_minutes: number;
     }>;
     
     const now = new Date();
@@ -972,7 +982,6 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
     const body = await request.json() as { 
       user_id?: string; 
       hours_back?: number;
-      max_length_minutes?: number;
     };
     
     const headers = {
@@ -983,24 +992,10 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
     
     const hoursBack = body.hours_back || 24;
     
-    // Default to 15 min, but can be overridden by request or user profile
-    let maxLengthMinutes = body.max_length_minutes || 15;
+    // Fixed at 5 minutes for now (avoids Cloudflare Worker CPU limits)
+    const maxLengthMinutes = 5;
     
-    // If user_id provided, check their profile for preferred digest length
-    if (body.user_id && !body.max_length_minutes) {
-      const profileResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${body.user_id}&select=digest_length_minutes`,
-        { headers }
-      );
-      if (profileResponse.ok) {
-        const profiles = await profileResponse.json() as Array<{ digest_length_minutes: number | null }>;
-        if (profiles.length > 0 && profiles[0].digest_length_minutes) {
-          maxLengthMinutes = profiles[0].digest_length_minutes;
-        }
-      }
-    }
-    
-    console.log(`[Digest] Generating digest for last ${hoursBack} hours, max ${maxLengthMinutes} min`);
+    console.log(`[Digest] Generating ${maxLengthMinutes}-minute digest for last ${hoursBack} hours`);
     
     // 1. Get episodes already covered in recent digests (last 7 days) to avoid repeats
     const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -1107,11 +1102,16 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
     }
     
     // 3. Build context for Claude (including podcast name for citations)
+    // For ListenNotes feeds, extract the original podcast name from description
     const episodeSummaries = episodes.map(ep => {
       const topics = episodeTopics.get(ep.id);
+      // Try to extract original podcast name from ListenNotes description
+      const originalPodcastName = extractOriginalPodcastName(ep.description || "");
+      // Fall back to subscription's podcast_title only if no original found
+      const podcastName = originalPodcastName || podcastNames.get(ep.feed_url) || "Unknown Podcast";
       return {
         title: ep.title,
-        podcast_name: podcastNames.get(ep.feed_url) || "Unknown Podcast",
+        podcast_name: podcastName,
         summary: topics?.summary || ep.description?.substring(0, 200) || "No summary available",
         topics: topics?.topics || [],
         themes: topics?.themes || [],
@@ -1126,48 +1126,56 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
     
     console.log(`[Digest] Script generated: ${script.word_count} words`);
     
-    // 5. Generate single audio file with ElevenLabs
-    console.log(`[Digest] Generating audio with ElevenLabs (${script.script.length} chars)...`);
+    // 5. Generate audio via Modal TTS (no timeout issues)
+    const digestId = crypto.randomUUID();
+    console.log(`[Digest] Calling Modal TTS for ${script.script.length} chars...`);
     
-    const audioBase64 = await generateSpeech(script.script, VOICE_BROADCASTER, env.ELEVENLABS_API_KEY);
+    const ttsResponse = await fetch(
+      "https://ptzimmerman--podgest-transcribe-tts-web.modal.run",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          script: script.script,
+          elevenlabs_api_key: env.ELEVENLABS_API_KEY,
+          voice_id: VOICE_BROADCASTER,
+          supabase_url: env.SUPABASE_URL,
+          supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
+          digest_id: digestId,
+        }),
+      }
+    );
     
-    if (!audioBase64) {
+    if (!ttsResponse.ok) {
+      const err = await ttsResponse.text();
+      console.error(`[Digest] Modal TTS failed: ${err}`);
       return json({ 
-        error: "Failed to generate audio",
+        error: "Failed to generate audio via Modal",
+        details: err,
         script: script, // Return script so user can manually use it
       }, 500);
     }
     
-    console.log(`[Digest] Audio generated successfully`);
+    const ttsResult = await ttsResponse.json() as {
+      status: string;
+      audio_url?: string;
+      duration_seconds?: number;
+      characters?: number;
+      error?: string;
+    };
     
-    // 6. Upload to Supabase Storage
-    const digestId = crypto.randomUUID();
-    const audioPath = `${digestId}/digest.mp3`;
-    
-    const uploadResponse = await fetch(
-      `${env.SUPABASE_URL}/storage/v1/object/digests/${audioPath}`,
-      {
-        method: "POST",
-        headers: {
-          ...headers,
-          "Content-Type": "audio/mpeg",
-          "x-upsert": "true",
-        },
-        body: Uint8Array.from(atob(audioBase64), c => c.charCodeAt(0)),
-      }
-    );
-    
-    if (!uploadResponse.ok) {
-      const err = await uploadResponse.text();
-      console.error(`[Digest] Upload failed: ${err}`);
-      return json({ error: "Failed to upload audio", details: err }, 500);
+    if (ttsResult.status !== "completed" || !ttsResult.audio_url) {
+      console.error(`[Digest] TTS error: ${ttsResult.error}`);
+      return json({ 
+        error: ttsResult.error || "TTS failed",
+        script: script,
+      }, 500);
     }
     
-    // Get public URL
-    const audioUrl = `${env.SUPABASE_URL}/storage/v1/object/public/digests/${audioPath}`;
-    const durationSeconds = Math.round(script.word_count / 2.5); // ~150 words/min
+    const audioUrl = ttsResult.audio_url;
+    const durationSeconds = ttsResult.duration_seconds || Math.round(script.word_count / 2.5);
     
-    console.log(`[Digest] Uploaded to: ${audioUrl}`);
+    console.log(`[Digest] Audio ready: ${audioUrl} (${durationSeconds}s)`);
     
     // 7. Save digest record to database
     // Note: For now, use a placeholder user_id since we don't have auth yet
@@ -1179,7 +1187,7 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
       digest_date: new Date().toISOString().split('T')[0],
       status: "completed",
       topic_clusters: { topics: script.topics_covered, title: script.title },
-      audio_storage_path: audioPath,
+      audio_storage_path: `${digestId}/digest.mp3`,
       audio_url: audioUrl,
       duration_seconds: durationSeconds,
       episodes_included: episodeIds,
@@ -1486,140 +1494,4 @@ function formatDuration(seconds: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-async function generateSpeech(text: string, voiceId: string, apiKey: string): Promise<string | null> {
-  try {
-    // Replace [PAUSE] markers with natural pause indicator
-    let processedText = text.replace(/\[PAUSE\]/g, '...');
-    
-    console.log(`[TTS] Generating speech for ${processedText.length} chars with voice ${voiceId}`);
-    
-    // ElevenLabs works best with chunks under 5000 chars
-    // For longer text, we need to split and concatenate
-    const MAX_CHUNK_SIZE = 4500;
-    
-    if (processedText.length <= MAX_CHUNK_SIZE) {
-      // Short text - single request
-      return await generateSpeechChunk(processedText, voiceId, apiKey);
-    }
-    
-    // Split on paragraph breaks (double newline or section transitions)
-    const sections = processedText.split(/\n\n+/);
-    const chunks: string[] = [];
-    let currentChunk = "";
-    
-    for (const section of sections) {
-      if (currentChunk.length + section.length + 2 > MAX_CHUNK_SIZE) {
-        if (currentChunk) chunks.push(currentChunk.trim());
-        currentChunk = section;
-      } else {
-        currentChunk += (currentChunk ? "\n\n" : "") + section;
-      }
-    }
-    if (currentChunk) chunks.push(currentChunk.trim());
-    
-    console.log(`[TTS] Split into ${chunks.length} chunks`);
-    
-    // Generate audio for each chunk
-    const audioChunks: string[] = [];
-    for (let i = 0; i < chunks.length; i++) {
-      console.log(`[TTS] Processing chunk ${i + 1}/${chunks.length} (${chunks[i].length} chars)`);
-      const chunkAudio = await generateSpeechChunk(chunks[i], voiceId, apiKey);
-      if (!chunkAudio) {
-        console.error(`[TTS] Failed on chunk ${i + 1}`);
-        return null;
-      }
-      audioChunks.push(chunkAudio);
-    }
-    
-    // For now, we'll concatenate the base64 MP3s
-    // This is a simple concatenation that works for MP3s
-    return concatenateBase64Audio(audioChunks);
-    
-  } catch (error) {
-    console.error("[TTS] Exception:", error);
-    return null;
-  }
-}
-
-async function generateSpeechChunk(text: string, voiceId: string, apiKey: string): Promise<string | null> {
-  try {
-    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
-      method: "POST",
-      headers: {
-        "xi-api-key": apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        text: text,
-        model_id: "eleven_turbo_v2_5",
-        voice_settings: {
-          stability: 0.75,
-          similarity_boost: 0.8,
-        },
-      }),
-    });
-
-    console.log(`[TTS] Response status: ${response.status}`);
-
-    if (!response.ok) {
-      const err = await response.text();
-      console.error(`[TTS] API Error: ${response.status} - ${err}`);
-      return null;
-    }
-
-    // Get array buffer
-    const arrayBuffer = await response.arrayBuffer();
-    console.log(`[TTS] Received ${arrayBuffer.byteLength} bytes`);
-    
-    // Convert to base64 in chunks to avoid stack overflow
-    const bytes = new Uint8Array(arrayBuffer);
-    let binary = '';
-    const chunkSize = 8192;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      const chunk = bytes.slice(i, i + chunkSize);
-      binary += String.fromCharCode.apply(null, Array.from(chunk));
-    }
-    const base64 = btoa(binary);
-    
-    console.log(`[TTS] Converted to base64: ${base64.length} chars`);
-    return base64;
-    
-  } catch (error) {
-    console.error("[TTS] Exception:", error);
-    return null;
-  }
-}
-
-// Concatenate multiple base64-encoded MP3 chunks
-function concatenateBase64Audio(chunks: string[]): string {
-  // Decode all chunks to binary
-  const binaryChunks = chunks.map(chunk => {
-    const binary = atob(chunk);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-  });
-  
-  // Calculate total length
-  const totalLength = binaryChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  
-  // Concatenate
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of binaryChunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
-  
-  // Convert back to base64
-  let binary = '';
-  const chunkSize = 8192;
-  for (let i = 0; i < result.length; i += chunkSize) {
-    const chunk = result.slice(i, i + chunkSize);
-    binary += String.fromCharCode.apply(null, Array.from(chunk));
-  }
-  
-  return btoa(binary);
-}
+// TTS now handled by Modal - see modal/transcribe.py
