@@ -1000,18 +1000,24 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
       completed_at: new Date().toISOString(),
     };
     
+    // Use upsert to allow regenerating same-day digests
     const insertDigestResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests`,
+      `${env.SUPABASE_URL}/rest/v1/digests?on_conflict=user_id,digest_date`,
       {
         method: "POST",
-        headers: { ...headers, "Prefer": "return=minimal" },
+        headers: { 
+          ...headers, 
+          "Prefer": "return=representation,resolution=merge-duplicates" 
+        },
         body: JSON.stringify(digestRecord),
       }
     );
     
     if (!insertDigestResponse.ok) {
-      console.error(`[Digest] Failed to save record: ${await insertDigestResponse.text()}`);
-      // Still return success since audio was generated
+      const errorText = await insertDigestResponse.text();
+      console.error(`[Digest] Failed to save record: ${errorText}`);
+    } else {
+      console.log(`[Digest] Record saved successfully`);
     }
     
     return json({
