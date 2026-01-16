@@ -37,6 +37,7 @@ if (!fs.existsSync(TOKEN_DIR)) {
 // Token management
 let currentToken = null;
 let refreshToken = null;
+let authInProgress = null; // Promise to prevent concurrent OAuth flows
 
 function loadSavedToken() {
   try {
@@ -113,6 +114,8 @@ async function validateToken(token) {
 function startOAuthFlow() {
   return new Promise((resolve, reject) => {
     console.error("[Auth] Starting OAuth flow...");
+    
+    let resolved = false; // Prevent multiple resolutions
     
     // Create callback server
     const server = createServer((req, res) => {
@@ -196,21 +199,29 @@ function startOAuthFlow() {
 </html>
         `);
       } else if (url.pathname === "/token" && req.method === "POST") {
-        // Receive token from browser
+        // Receive token from browser (only process once)
+        if (resolved) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true, duplicate: true }));
+          return;
+        }
+        
         let body = "";
         req.on("data", chunk => body += chunk);
         req.on("end", () => {
+          if (resolved) return; // Double-check after body received
+          
           try {
             const { access_token, refresh_token } = JSON.parse(body);
+            resolved = true; // Mark as resolved immediately
+            
             saveToken(access_token, refresh_token);
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ success: true }));
             
-            // Close server and resolve
-            setTimeout(() => {
-              server.close();
-              resolve(access_token);
-            }, 500);
+            // Close server and resolve immediately
+            server.close();
+            resolve(access_token);
           } catch (err) {
             res.writeHead(400);
             res.end("Invalid request");
@@ -238,14 +249,22 @@ function startOAuthFlow() {
     
     // Timeout after 5 minutes
     setTimeout(() => {
-      server.close();
-      reject(new Error("OAuth timeout - no callback received within 5 minutes"));
+      if (!resolved) {
+        server.close();
+        reject(new Error("OAuth timeout - no callback received within 5 minutes"));
+      }
     }, 5 * 60 * 1000);
   });
 }
 
-// Ensure we have a valid token
+// Ensure we have a valid token (with lock to prevent concurrent OAuth flows)
 async function ensureAuthenticated() {
+  // If OAuth is already in progress, wait for it
+  if (authInProgress) {
+    console.error("[Auth] OAuth already in progress, waiting...");
+    return await authInProgress;
+  }
+  
   // Try existing token
   if (currentToken && await validateToken(currentToken)) {
     return currentToken;
@@ -256,9 +275,16 @@ async function ensureAuthenticated() {
     return currentToken;
   }
   
-  // Need fresh OAuth
+  // Need fresh OAuth - acquire lock
   console.error("[Auth] No valid token found, starting OAuth flow...");
-  return await startOAuthFlow();
+  authInProgress = startOAuthFlow();
+  
+  try {
+    const token = await authInProgress;
+    return token;
+  } finally {
+    authInProgress = null; // Release lock
+  }
 }
 
 // Forward a request to the remote server
