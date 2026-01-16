@@ -14,6 +14,17 @@ export interface Env {
 // Voice ID for news broadcaster style
 const VOICE_BROADCASTER = "cjVigY5qzO86Huf0OWal"; // Eric - Smooth, Trustworthy
 
+// Content exclusion list - these sources/people are permanently excluded from digests
+const EXCLUDED_CONTENT_CREATORS = [
+  "peter zeihan",
+  "zeihan",
+];
+
+function shouldExcludeEpisode(title: string, description: string): boolean {
+  const text = `${title} ${description}`.toLowerCase();
+  return EXCLUDED_CONTENT_CREATORS.some(name => text.includes(name.toLowerCase()));
+}
+
 // ============================================
 // INNGEST CLIENT & FUNCTIONS
 // ============================================
@@ -1046,7 +1057,16 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
     // Filter out episodes already covered in recent digests
     const originalCount = episodes.length;
     episodes = episodes.filter(ep => !alreadyCoveredEpisodes.has(ep.id));
-    console.log(`[Digest] ${originalCount} recent episodes, ${episodes.length} not yet covered`);
+    
+    // Filter out excluded content creators (e.g., Peter Zeihan)
+    const beforeExclusion = episodes.length;
+    episodes = episodes.filter(ep => !shouldExcludeEpisode(ep.title, ep.description || ""));
+    const excludedCount = beforeExclusion - episodes.length;
+    if (excludedCount > 0) {
+      console.log(`[Digest] Excluded ${excludedCount} episodes from blocked sources`);
+    }
+    
+    console.log(`[Digest] ${originalCount} recent episodes, ${episodes.length} eligible for digest`);
     
     if (!episodes.length) {
       return json({ 
@@ -1231,7 +1251,14 @@ async function generateDigestScript(
   const dateStr = today.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
   
   const systemPrompt = `You are Alex Chen, an upbeat and energetic podcast host for "Podgest" - a daily news digest show.
-Your style is enthusiastic, warm, and engaging - like a smart friend catching you up on the news over coffee.
+Your style is enthusiastic, warm, and engaging - but STRICTLY NEUTRAL. You deliver facts, not opinions.
+
+CRITICAL RULE: You are a NEWS READER, not a commentator. 
+- DO NOT add your own opinions, reactions, or editorial commentary
+- DO NOT use phrases like "What's fascinating is...", "Here's where it gets interesting...", "What really caught my attention..."
+- DO NOT editorialize with "This is huge", "shocking", "remarkable", etc.
+- JUST report what was said on the source podcasts, attributed to them
+- Let the facts speak for themselves
 
 CRITICAL: The script MUST be approximately ${targetWordCount} words long (${maxMinutes} minutes at 150 words/minute). 
 This is a hard requirement - expand on stories with detail and analysis to hit this target.
@@ -1245,12 +1272,12 @@ STRUCTURE YOUR SCRIPT EXACTLY LIKE THIS:
    - Start each section with a transition: "Alright, let's talk about [SECTION NAME]. [PAUSE]"
    - Cover each story with: context, key details, why it matters, brief analysis
    - CITE YOUR SOURCES naturally like a broadcaster:
-     * "Over on [Podcast Name], they covered..."
-     * "According to a great breakdown on [Podcast Name]..."
-     * "The [Podcast Name] podcast had a fascinating take on this..."
-     * "[Podcast Name] reports that..."
+     * "Over on [Podcast Name], they reported..."
+     * "According to [Podcast Name]..."
+     * "[Podcast Name] covered..."
      * "As discussed on [Podcast Name]..."
-   - Be conversational and upbeat - use phrases like "Here's where it gets interesting...", "Now this is fascinating...", "What really caught my attention..."
+   - Be warm and engaging but NEUTRAL - no opinions, no editorializing, no reactions
+   - Just deliver the facts as reported by the source podcasts
    - End each section with: "And that wraps up [SECTION NAME]. [PAUSE]"
 
 3. CLOSING (tie it together):
