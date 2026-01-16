@@ -992,9 +992,9 @@ podgest/
 - [x] Local proxy for Claude Desktop connectivity
 - [x] Cursor project MCP config (`.cursor/mcp.json`)
 - [x] Test with Claude Desktop + Cursor
-- [ ] OAuth authentication flow (see Phase 4.1 below)
+- [x] OAuth authentication flow (see Phase 4.1 below)
 
-### Phase 4.1: OAuth Authentication (Multi-User Support)
+### Phase 4.1: OAuth Authentication (Multi-User Support) ✅
 
 This sub-phase enables proper authentication so multiple users can use Podgest with their own isolated data.
 
@@ -1048,59 +1048,59 @@ This sub-phase enables proper authentication so multiple users can use Podgest w
 
 #### Setup Steps
 
-**Part A: Google Cloud Console**
-- [ ] A1. Create Google Cloud project (or use existing)
-- [ ] A2. Configure OAuth consent screen
+**Part A: Google Cloud Console** ✅
+- [x] A1. Create Google Cloud project (or use existing)
+- [x] A2. Configure OAuth consent screen
   - App name: "Podgest"
   - User type: External (for multi-user) or Internal (Google Workspace only)
   - Scopes: `email`, `profile`, `openid`
   - Test users: Add your email (required while in "Testing" status)
-- [ ] A3. Create OAuth 2.0 Client ID
+- [x] A3. Create OAuth 2.0 Client ID
   - Application type: **Web application**
   - Name: "Podgest Supabase Auth"
   - Authorized redirect URIs: `https://xpviiukiavtpsnafpdmy.supabase.co/auth/v1/callback`
-- [ ] A4. Copy **Client ID** and **Client Secret**
+- [x] A4. Copy **Client ID** and **Client Secret**
 
-**Part B: Supabase Auth Configuration**
-- [ ] B1. Go to Supabase Dashboard → Authentication → Providers → Google
-- [ ] B2. Enable Google provider
-- [ ] B3. Paste Google Client ID and Client Secret
-- [ ] B4. Add to Redirect URLs (Authentication → URL Configuration):
+**Part B: Supabase Auth Configuration** ✅
+- [x] B1. Go to Supabase Dashboard → Authentication → Providers → Google
+- [x] B2. Enable Google provider
+- [x] B3. Paste Google Client ID and Client Secret
+- [x] B4. Add to Redirect URLs (Authentication → URL Configuration):
   - `http://localhost:9876/callback` (for local proxy OAuth callback)
-- [ ] B5. Verify `profiles` table auto-creation trigger exists (or create on first login)
+- [x] B5. Verify `profiles` table auto-creation trigger exists (or create on first login)
 
-**Part C: Local Proxy Updates**
-- [ ] C1. Add OAuth flow to local proxy:
+**Part C: Local Proxy Updates** ✅
+- [x] C1. Add OAuth flow to local proxy:
   - Check for token in `~/.podgest/token` on startup
   - If missing/expired, start localhost HTTP server on port 9876
   - Open browser to Supabase OAuth URL
   - Receive callback with token
   - Save token to `~/.podgest/token`
-- [ ] C2. Include `Authorization: Bearer {token}` header in all requests to remote MCP server
-- [ ] C3. Handle token refresh (Supabase tokens expire after 1 hour by default)
+- [x] C2. Include `Authorization: Bearer {token}` header in all requests to remote MCP server
+- [x] C3. Handle token refresh (Supabase tokens expire after 1 hour by default)
 
-**Part D: Remote MCP Server Updates**
-- [ ] D1. Add auth middleware to validate JWT:
+**Part D: Remote MCP Server Updates** ✅
+- [x] D1. Add auth middleware to validate JWT:
   ```typescript
   const { data: { user }, error } = await supabase.auth.getUser(token);
   if (error) return new Response("Unauthorized", { status: 401 });
   const userId = user.id;
   ```
-- [ ] D2. Pass `userId` to all tool handlers (instead of hardcoded constant)
-- [ ] D3. Update SuperMemory queries to use `containerTags: [userId]`
-- [ ] D4. Update Supabase queries to use `user_id=eq.${userId}`
-- [ ] D5. Handle missing/invalid token gracefully (return helpful error)
+- [x] D2. Pass `userId` to all tool handlers (instead of hardcoded constant)
+- [x] D3. Update SuperMemory queries to use `containerTags: [userId]`
+- [x] D4. Update Supabase queries to use `user_id=eq.${userId}`
+- [x] D5. Handle missing/invalid token gracefully (return helpful error)
 
-**Part E: New User Onboarding Flow**
-- [ ] E1. User adds `podgest` to Claude Desktop config (or Cursor)
-- [ ] E2. First MCP request triggers OAuth flow automatically
-- [ ] E3. Browser opens → Google sign-in → redirect to localhost callback
-- [ ] E4. Token saved locally, MCP ready to use
-- [ ] E5. User's profile created in Supabase if first login
-- [ ] E6. Subsequent sessions reuse saved token (until expiry)
+**Part E: New User Onboarding Flow** ✅
+- [x] E1. User adds `podgest` to Claude Desktop config (or Cursor)
+- [x] E2. First MCP request triggers OAuth flow automatically
+- [x] E3. Browser opens → Google sign-in → redirect to localhost callback
+- [x] E4. Token saved locally, MCP ready to use
+- [x] E5. User's profile created in Supabase if first login
+- [x] E6. Subsequent sessions reuse saved token (until expiry)
 
-**Part F: Profile Auto-Creation**
-- [ ] F1. Create Supabase trigger to auto-create profile on first auth:
+**Part F: Profile Auto-Creation** ✅
+- [x] F1. Create Supabase trigger to auto-create profile on first auth:
   ```sql
   CREATE OR REPLACE FUNCTION public.handle_new_user()
   RETURNS TRIGGER AS $$
@@ -1145,12 +1145,12 @@ This sub-phase enables proper authentication so multiple users can use Podgest w
 | MCP Tokens | `user_id` foreign key + RLS |
 
 #### Testing Checklist
-- [ ] Fresh user can authenticate via Google
-- [ ] Token is saved and reused across Claude Desktop restarts
-- [ ] Expired token triggers re-auth automatically
-- [ ] User A cannot see User B's subscriptions or digests
-- [ ] SuperMemory searches are scoped to authenticated user
-- [ ] New user gets profile auto-created
+- [x] Fresh user can authenticate via Google
+- [x] Token is saved and reused across Claude Desktop restarts
+- [x] Expired token triggers re-auth automatically
+- [ ] User A cannot see User B's subscriptions or digests (needs second user to test)
+- [x] SuperMemory searches are scoped to authenticated user
+- [x] New user gets profile auto-created
 
 ### Phase 5: Resilience & Polish
 - [ ] Deepgram fallback if Modal GPU issues persist
