@@ -968,15 +968,17 @@ podgest/
 - [x] Test full pipeline with 2-3 real podcasts
 
 ### Phase 3: Digest Generation
-- [ ] `generate-digest` Inngest scheduled function (per-user timezone)
-- [ ] Topic clustering logic (Claude API)
-- [ ] Script generation with style guide prompts
-- [ ] ElevenLabs TTS integration
-- [ ] Audio post-processing (ffmpeg on Modal or locally)
-- [ ] Store generated audio in Supabase Storage
+- [x] `generate-digest` endpoint (POST `/api/generate-digest`)
+- [x] Script generation with news broadcaster style (Claude Sonnet 4)
+- [x] ElevenLabs TTS integration (single voice: Eric)
+- [x] Store generated audio in Supabase Storage (`digests` bucket)
+- [x] Save digest records to database for RSS feed
+- [ ] Scheduled generation via Inngest cron (per-user timezone)
+- [ ] Conversational two-host format (requires ElevenLabs Studio/enterprise)
 
 ### Phase 4: Distribution + MCP
-- [ ] RSS feed endpoint (`/api/feed/[userId]`)
+- [x] RSS feed endpoint (`/feed/{userId}`) - Spotify/iTunes compatible
+- [ ] Upload podcast cover art to Supabase Storage
 - [ ] Submit personal feed to Spotify for Podcasters
 - [ ] MCP server implementation (Cloudflare Worker)
 - [ ] SuperMemory query integration in MCP tools
@@ -1002,6 +1004,24 @@ podgest/
 | **Skip episodes** | Not for now; may add later |
 | **Real-time vs batch** | Batch (overnight) — no real-time digest |
 | **Transcript access** | MCP only — no need for transcripts in web UI |
+
+## Working Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check |
+| `/api/poll` | POST | Trigger RSS polling for all subscriptions |
+| `/api/generate-digest` | POST | Generate a digest (body: `{user_id, hours_back, max_length_minutes}`) |
+| `/api/inngest` | POST | Inngest webhook handler |
+| `/api/webhooks/modal` | POST | Modal transcription callback |
+| `/feed/{userId}` | GET | RSS feed for Spotify/podcatchers |
+
+**Base URL:** `https://podgest-api.pztest.workers.dev`
+
+**Example RSS Feed:**
+```
+https://podgest-api.pztest.workers.dev/feed/18f513bd-8ecf-4922-84b7-4ab7c7cc14df
+```
 
 ## Open Questions
 
