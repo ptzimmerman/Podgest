@@ -78,7 +78,7 @@ async function tryRefreshToken() {
       method: "POST",
       headers: { 
         "Content-Type": "application/json",
-        "apikey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFhYmFzZSIsInJlZiI6InhwdmlpdWtpYXZ0cHNuYWZwZG15Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg1MDU4NzAsImV4cCI6MjA4NDA4MTg3MH0.ZabAkmSAA6mzPGdnEfA30n6gNK-XqlHJoM2n1m9uyHs"
+        "apikey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhwdmlpdWtpYXZ0cHNuYWZwZG15Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg1MDU4NzAsImV4cCI6MjA4NDA4MTg3MH0.ZabAkmSAA6mzPGdnEfA30n6gNK-XqlHJoM2n1m9uyHs"
       },
       body: JSON.stringify({ refresh_token: refreshToken }),
     });
@@ -101,7 +101,7 @@ async function validateToken(token) {
     const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
       headers: { 
         "Authorization": `Bearer ${token}`,
-        "apikey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFhYmFzZSIsInJlZiI6InhwdmlpdWtpYXZ0cHNuYWZwZG15Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg1MDU4NzAsImV4cCI6MjA4NDA4MTg3MH0.ZabAkmSAA6mzPGdnEfA30n6gNK-XqlHJoM2n1m9uyHs"
+        "apikey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhwdmlpdWtpYXZ0cHNuYWZwZG15Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg1MDU4NzAsImV4cCI6MjA4NDA4MTg3MH0.ZabAkmSAA6mzPGdnEfA30n6gNK-XqlHJoM2n1m9uyHs"
       },
     });
     return response.ok;
