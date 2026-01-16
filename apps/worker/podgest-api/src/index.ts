@@ -1168,47 +1168,76 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
     const feedUrl = `https://podgest-api.pztest.workers.dev/feed/${userId}`;
     const now = new Date().toUTCString();
     
-    const items = digests.map(d => {
+    // Build items with actual file sizes
+    const items: string[] = [];
+    for (const d of digests) {
       const pubDate = new Date(d.completed_at).toUTCString();
       const title = d.topic_clusters?.title || `Daily Digest - ${d.digest_date}`;
       const description = d.topic_clusters?.topics?.join(", ") || "Your daily podcast digest";
       const duration = formatDuration(d.duration_seconds || 0);
       
-      return `
+      // Get actual file size from audio URL
+      let fileSize = 0;
+      try {
+        const headResponse = await fetch(d.audio_url, { method: "HEAD" });
+        const contentLength = headResponse.headers.get("content-length");
+        if (contentLength) {
+          fileSize = parseInt(contentLength, 10);
+        }
+      } catch (e) {
+        console.error(`[RSS] Failed to get file size for ${d.id}`);
+      }
+      
+      items.push(`
     <item>
       <title><![CDATA[${title}]]></title>
       <description><![CDATA[Topics covered: ${description}]]></description>
       <pubDate>${pubDate}</pubDate>
       <guid isPermaLink="false">${d.id}</guid>
-      <enclosure url="${d.audio_url}" length="0" type="audio/mpeg"/>
+      <enclosure url="${d.audio_url}" length="${fileSize}" type="audio/mpeg"/>
       <itunes:duration>${duration}</itunes:duration>
       <itunes:explicit>no</itunes:explicit>
-    </item>`;
-    }).join("\n");
+      <itunes:episodeType>full</itunes:episodeType>
+    </item>`);
+    }
     
     const rss = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" 
   xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
-  xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:atom="http://www.w3.org/2005/Atom">
   <channel>
     <title>Podgest Daily Digest</title>
-    <description>Your personalized podcast news digest, delivered daily.</description>
+    <description>Your personalized podcast news digest, delivered daily. AI-powered summaries of your favorite podcasts.</description>
     <link>${feedUrl}</link>
     <language>en-us</language>
     <lastBuildDate>${now}</lastBuildDate>
+    <atom:link href="${feedUrl}" rel="self" type="application/rss+xml"/>
     <itunes:author>Podgest</itunes:author>
     <itunes:summary>AI-powered daily digest of your favorite podcasts.</itunes:summary>
-    <itunes:category text="News"/>
+    <itunes:category text="News">
+      <itunes:category text="Daily News"/>
+    </itunes:category>
     <itunes:explicit>no</itunes:explicit>
+    <itunes:type>episodic</itunes:type>
+    <itunes:owner>
+      <itunes:name>Podgest</itunes:name>
+      <itunes:email>podgest@example.com</itunes:email>
+    </itunes:owner>
     <itunes:image href="https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/podcast-cover.png"/>
-${items}
+    <image>
+      <url>https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/podcast-cover.png</url>
+      <title>Podgest Daily Digest</title>
+      <link>${feedUrl}</link>
+    </image>
+${items.join("\n")}
   </channel>
 </rss>`;
 
     return new Response(rss, {
       headers: {
         "Content-Type": "application/rss+xml; charset=utf-8",
-        "Cache-Control": "public, max-age=300", // Cache for 5 minutes
+        "Cache-Control": "public, max-age=300",
       },
     });
     
