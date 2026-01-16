@@ -202,8 +202,8 @@ async function pollAllSubscriptions(env: Env): Promise<{
       // Find new episodes
       const newEpisodes = feed.episodes.filter(ep => !existingGuids.has(ep.guid));
       
-      // Limit to 3 per poll to avoid overwhelming Modal
-      const episodesToProcess = newEpisodes.slice(0, 3);
+      // Limit to 10 per poll (can run multiple polls to catch up)
+      const episodesToProcess = newEpisodes.slice(0, 10);
       console.log(`[Poll] ${sub.podcast_title}: ${newEpisodes.length} new, processing ${episodesToProcess.length}`);
 
       // Insert new episodes and trigger transcription
