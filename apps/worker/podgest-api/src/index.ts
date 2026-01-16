@@ -1197,7 +1197,7 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
       <enclosure url="${d.audio_url}" length="${fileSize}" type="audio/mpeg"/>
       <itunes:duration>${duration}</itunes:duration>
       <itunes:explicit>no</itunes:explicit>
-      <itunes:episodeType>full</itunes:episodeType>
+      <itunes:episodeType>Full</itunes:episodeType>
     </item>`);
     }
     
@@ -1238,6 +1238,7 @@ ${items.join("\n")}
       headers: {
         "Content-Type": "application/rss+xml; charset=utf-8",
         "Cache-Control": "public, max-age=300",
+        "Access-Control-Allow-Origin": "*",
       },
     });
     
