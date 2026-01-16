@@ -985,65 +985,58 @@ podgest/
 
 ### Phase 4: Distribution + MCP ✅
 - [x] RSS feed endpoint (`/feed/{userId}`) - Spotify/iTunes compatible
-- [ ] Upload podcast cover art to Supabase Storage
-- [ ] Submit personal feed to Spotify for Podcasters
-- [x] MCP server implementation (Cloudflare Worker) - `https://podgest-mcp.pztest.workers.dev`
+- [x] Upload podcast cover art to Supabase Storage (staging)
+- [ ] Submit personal feed to Spotify for Podcasters (waiting for production domain)
+- [x] MCP server implementation (Cloudflare Worker) - fully remote, no local proxy
 - [x] SuperMemory query integration in MCP tools (`search_podcasts`, `compare_takes`)
-- [x] Local proxy for Claude Desktop connectivity
+- [x] Direct remote MCP connection (no local proxy needed!)
 - [x] Cursor project MCP config (`.cursor/mcp.json`)
 - [x] Test with Claude Desktop + Cursor
 - [x] OAuth authentication flow (see Phase 4.1 below)
+- [x] One-time auth CLI for API key generation
 
 ### Phase 4.1: OAuth Authentication (Multi-User Support) ✅
 
 This sub-phase enables proper authentication so multiple users can use Podgest with their own isolated data.
 
-#### Architecture Overview
+#### Architecture Overview (Fully Remote - No Local Proxy)
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  Claude Desktop │     │   Local Proxy   │     │   MCP Server    │     │    Supabase     │
-│    / Cursor     │     │   (Node.js)     │     │  (Cloudflare)   │     │      Auth       │
-└────────┬────────┘     └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-         │                       │                       │                       │
-         │  1. MCP request       │                       │                       │
-         │──────────────────────▶│                       │                       │
-         │                       │                       │                       │
-         │                       │  2. No token? Start   │                       │
-         │                       │     local HTTP server │                       │
-         │                       │     on localhost:9876 │                       │
-         │                       │                       │                       │
-         │  3. Opens browser     │                       │                       │
-         │◀──────────────────────│                       │                       │
-         │     to Supabase OAuth │                       │                       │
-         │                       │                       │                       │
-         │  4. User signs in ────────────────────────────────────────────────────▶│
-         │     with Google       │                       │                       │
-         │                       │                       │                       │
-         │  5. Supabase redirects to localhost:9876/callback ◀───────────────────│
-         │     with access_token in URL fragment         │                       │
-         │                       │                       │                       │
-         │                       │  6. Extract token,    │                       │
-         │                       │     save to           │                       │
-         │                       │     ~/.podgest/token  │                       │
-         │                       │                       │                       │
-         │                       │  7. Forward request   │                       │
-         │                       │     with Bearer token │                       │
-         │                       │──────────────────────▶│                       │
-         │                       │                       │                       │
-         │                       │                       │  8. Validate JWT      │
-         │                       │                       │──────────────────────▶│
-         │                       │                       │                       │
-         │                       │                       │  9. Get user_id       │
-         │                       │                       │◀──────────────────────│
-         │                       │                       │                       │
-         │                       │                       │  10. Query with       │
-         │                       │                       │      user_id filter   │
-         │                       │                       │      ↓                │
-         │                       │                       │  SuperMemory:         │
-         │                       │                       │    containerTags:[uid]│
-         │                       │                       │  Supabase:            │
-         │                       │                       │    user_id=eq.{uid}   │
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         ONE-TIME AUTH SETUP                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. User runs: node apps/mcp-server/auth-cli/index.js                       │
+│                                                                              │
+│  2. Browser opens → https://podgest-mcp.../auth                             │
+│                           │                                                  │
+│                           ▼                                                  │
+│  3. Google OAuth → Supabase Auth → Redirect to MCP server /auth/callback    │
+│                                          │                                   │
+│                                          ▼                                   │
+│  4. MCP server generates API key, redirects to localhost:9876/save          │
+│                                          │                                   │
+│                                          ▼                                   │
+│  5. Auth CLI saves key to ~/.podgest/api_key AND updates .cursor/mcp.json   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         RUNTIME (Direct Connection)                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────┐                         ┌─────────────────────────────┐│
+│  │  Cursor / Claude │ ─── HTTPS + API Key ──▶│  Cloudflare Worker          ││
+│  │  (no local proxy)│                        │  podgest-mcp.pztest...      ││
+│  └─────────────────┘                         └──────────────┬──────────────┘│
+│                                                             │               │
+│         Authorization: Bearer pk_xxxxx                      │               │
+│                                                             ▼               │
+│                                              ┌─────────────────────────────┐│
+│                                              │  Supabase + SuperMemory     ││
+│                                              │  (user_id from API key)     ││
+│                                              └─────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 #### Setup Steps
@@ -1151,13 +1144,93 @@ This sub-phase enables proper authentication so multiple users can use Podgest w
 - [x] SuperMemory searches are scoped to authenticated user
 - [x] New user gets profile auto-created
 
-### Phase 5: Resilience & Polish
+### Phase 5: Production Deployment & Polish
+
+#### 5.1 Custom Domain Setup
+- [ ] Register domain (e.g., `podgest.io` or use subdomain of existing domain)
+- [ ] Configure Cloudflare DNS
+- [ ] Update Cloudflare Workers with custom domains:
+  - `api.podgest.yourdomain.com` → podgest-api worker (RSS, webhooks)
+  - `mcp.podgest.yourdomain.com` → podgest-mcp worker
+- [ ] Update Supabase Auth redirect URLs to production domain
+- [ ] Update Google OAuth authorized redirect URIs
+- [ ] Update all hardcoded URLs in codebase
+
+#### 5.2 Spotify Submission
+- [ ] Generate podcast cover art (3000x3000px, square)
+- [ ] Upload cover art to Supabase Storage (`digests/cover.jpg`)
+- [ ] Update RSS feed to include cover art URL
+- [ ] Submit RSS feed to Spotify for Podcasters
+- [ ] Set visibility to "Not searchable" (private)
+- [ ] Wait for approval (24-48 hours)
+
+#### 5.3 Resilience
 - [ ] Deepgram fallback if Modal GPU issues persist
 - [ ] Inngest dead-letter handling and alerting
-- [ ] Cost tracking dashboard (Modal, ElevenLabs, Claude usage)
 - [ ] Error notification (email or Slack)
-- [ ] End-to-end testing with real podcast load
-- [ ] Documentation for adding new users
+
+#### 5.4 Observability
+- [ ] Cost tracking dashboard (Modal, ElevenLabs, Claude usage)
+- [ ] End-to-end monitoring
+- [ ] Alerting for failed digests
+
+#### 5.5 Documentation
+- [ ] User onboarding guide
+- [ ] Adding new podcast subscriptions
+- [ ] Troubleshooting guide
+
+---
+
+## Spotify Submission Guide
+
+> **Note:** Wait until production domain is configured before submitting to Spotify. The RSS feed URL is permanent.
+
+### Prerequisites
+1. Custom domain configured and working
+2. Podcast cover art (3000x3000px square, JPEG/PNG, <500KB)
+3. At least one digest episode generated
+
+### RSS Feed URL (Production)
+```
+https://api.podgest.yourdomain.com/feed/{userId}
+```
+
+### Submission Steps
+
+1. **Go to Spotify for Podcasters**
+   - https://podcasters.spotify.com
+   - Sign in with Spotify account
+
+2. **Add Your Podcast**
+   - Click "Get Started" → "I have a podcast"
+   - Paste your RSS feed URL
+
+3. **Verify Ownership**
+   - Spotify shows preview of your podcast
+   - Confirm the details are correct
+
+4. **Fill in Details**
+   | Field | Value |
+   |-------|-------|
+   | Name | Podgest Daily |
+   | Description | Your personalized daily podcast digest - AI-curated summaries from your favorite shows |
+   | Category | News > Daily News |
+   | Language | English |
+   | Explicit | No |
+
+5. **Set Visibility**
+   - Choose **"Not searchable"** to keep it private
+   - Only people with the direct link can find it
+
+6. **Submit & Wait**
+   - Spotify reviews within 24-48 hours
+   - You'll receive email confirmation
+
+### Cover Art Requirements
+- **Size:** 3000x3000px (minimum 1400x1400)
+- **Format:** JPEG or PNG
+- **File size:** Under 500KB
+- **Content:** No explicit imagery, readable at small sizes
 
 ---
 
