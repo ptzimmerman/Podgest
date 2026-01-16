@@ -293,7 +293,7 @@ async function pollAllSubscriptions(env: Env): Promise<{
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
+		const url = new URL(request.url);
 
     // Health check
     if (url.pathname === "/health" || url.pathname === "/") {
@@ -400,7 +400,9 @@ async function handleModalWebhook(request: Request, env: Env): Promise<Response>
           headers,
           body: JSON.stringify({
             status: "completed",
-            transcript_text: payload.text.substring(0, 10000),
+            transcript_storage_path: transcriptPath,
+            word_count: payload.text.split(/\s+/).length,
+            language: payload.language || "en",
             completed_at: new Date().toISOString(),
           }),
         }
