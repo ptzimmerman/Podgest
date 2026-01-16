@@ -1069,15 +1069,14 @@ This sub-phase enables proper authentication so multiple users can use Podgest w
   - `http://localhost:9876/callback` (for local proxy OAuth callback)
 - [x] B5. Verify `profiles` table auto-creation trigger exists (or create on first login)
 
-**Part C: Local Proxy Updates** ✅
-- [x] C1. Add OAuth flow to local proxy:
-  - Check for token in `~/.podgest/token` on startup
-  - If missing/expired, start localhost HTTP server on port 9876
-  - Open browser to Supabase OAuth URL
-  - Receive callback with token
-  - Save token to `~/.podgest/token`
-- [x] C2. Include `Authorization: Bearer {token}` header in all requests to remote MCP server
-- [x] C3. Handle token refresh (Supabase tokens expire after 1 hour by default)
+**Part C: Auth CLI + Direct Remote Connection** ✅
+- [x] C1. Create one-time auth CLI (`apps/mcp-server/auth-cli/`)
+  - Opens browser to `https://podgest-mcp.../auth`
+  - Receives API key via localhost:9876 redirect
+  - Saves API key to `~/.podgest/api_key`
+  - Updates `.cursor/mcp.json` automatically
+- [x] C2. Direct remote connection (no local proxy running)
+- [x] C3. API keys stored in `mcp_tokens` table (long-lived, no refresh needed)
 
 **Part D: Remote MCP Server Updates** ✅
 - [x] D1. Add auth middleware to validate JWT:
@@ -1197,7 +1196,7 @@ This sub-phase enables proper authentication so multiple users can use Podgest w
 https://podgest-api.pztest.workers.dev/feed/18f513bd-8ecf-4922-84b7-4ab7c7cc14df
 ```
 
-### MCP Server
+### MCP Server (Fully Remote)
 
 **Base URL:** `https://podgest-mcp.pztest.workers.dev`
 
@@ -1209,9 +1208,25 @@ https://podgest-api.pztest.workers.dev/feed/18f513bd-8ecf-4922-84b7-4ab7c7cc14df
 | `list_podcasts` | List user's subscriptions |
 | `recent_episodes` | Recent episodes across subscriptions |
 
-**Local Proxy (for Claude Desktop):** `apps/mcp-server/local-proxy/index.js`
+**Auth Setup (one-time):**
+```bash
+cd apps/mcp-server/auth-cli && node index.js
+```
+This opens browser for Google OAuth, generates an API key, and updates `.cursor/mcp.json` automatically.
 
-**Cursor Config:** `.cursor/mcp.json` (project-specific MCP)
+**Cursor Config Format:** `.cursor/mcp.json`
+```json
+{
+  "mcpServers": {
+    "podgest": {
+      "url": "https://podgest-mcp.pztest.workers.dev/sse",
+      "headers": {
+        "Authorization": "Bearer pk_YOUR_API_KEY"
+      }
+    }
+  }
+}
+```
 
 ### Modal Endpoints
 
