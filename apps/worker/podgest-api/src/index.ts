@@ -857,16 +857,32 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
       max_length_minutes?: number;
     };
     
-    const hoursBack = body.hours_back || 24;
-    const maxLengthMinutes = body.max_length_minutes || 30;
-    
-    console.log(`[Digest] Generating digest for last ${hoursBack} hours, max ${maxLengthMinutes} min`);
-    
     const headers = {
       "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
       "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
       "Content-Type": "application/json",
     };
+    
+    const hoursBack = body.hours_back || 24;
+    
+    // Default to 15 min, but can be overridden by request or user profile
+    let maxLengthMinutes = body.max_length_minutes || 15;
+    
+    // If user_id provided, check their profile for preferred digest length
+    if (body.user_id && !body.max_length_minutes) {
+      const profileResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${body.user_id}&select=digest_length_minutes`,
+        { headers }
+      );
+      if (profileResponse.ok) {
+        const profiles = await profileResponse.json() as Array<{ digest_length_minutes: number | null }>;
+        if (profiles.length > 0 && profiles[0].digest_length_minutes) {
+          maxLengthMinutes = profiles[0].digest_length_minutes;
+        }
+      }
+    }
+    
+    console.log(`[Digest] Generating digest for last ${hoursBack} hours, max ${maxLengthMinutes} min`);
     
     // 1. Fetch recent episodes with their topic extractions
     const cutoffDate = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
@@ -1061,14 +1077,17 @@ async function generateDigestScript(
   const systemPrompt = `You are a professional news broadcaster writing a podcast script.
 Write in a clear, engaging news anchor style - authoritative but approachable.
 
+CRITICAL: The script MUST be approximately ${targetWordCount} words long (${maxMinutes} minutes at 150 words/minute). 
+This is a hard requirement - do not write less. Expand on stories with more detail, analysis, and context to hit this target.
+
 Guidelines:
 - Start with a brief intro ("Good morning, I'm your host for today's digest...")
-- Cover the most important and interesting stories first
+- Cover ALL the stories provided - give each one proper attention
+- For each story: provide context, key details, implications, and brief analysis
 - Group related topics together with smooth transitions
-- Use clear, concise language suitable for audio
-- Include brief analysis and context, not just facts
-- Aim for approximately ${targetWordCount} words (${maxMinutes} minutes at natural pace)
-- End with a brief sign-off
+- Use clear, engaging language suitable for audio
+- Include "why this matters" commentary for important stories
+- End with a sign-off summarizing key themes
 
 Return a JSON object with this structure:
 {
