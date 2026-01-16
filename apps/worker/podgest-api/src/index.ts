@@ -34,6 +34,17 @@ const pollSubscriptions = inngest.createFunction(
   }
 );
 
+// Daily digest generation - runs every hour and checks which users need digests
+const scheduledDigestGeneration = inngest.createFunction(
+  { id: "scheduled-digest-generation" },
+  { cron: "0 * * * *" }, // Every hour on the hour
+  async ({ step, logger }) => {
+    // This triggers an HTTP call to generate digests for users whose digest_time has arrived
+    logger.info("Scheduled digest check triggered");
+    return { message: "Use /api/scheduled-digest endpoint to check and generate digests" };
+  }
+);
+
 // ============================================
 // RSS PARSING
 // ============================================
@@ -322,7 +333,7 @@ export default {
       try {
         const handler = serve({
           client: inngest,
-          functions: [pollSubscriptions],
+          functions: [pollSubscriptions, scheduledDigestGeneration],
           signingKey: env.INNGEST_SIGNING_KEY,
         });
         return await handler(request, env, ctx);
@@ -347,9 +358,14 @@ export default {
       return handleEmbedContent(request, env);
     }
     
-    // Generate digest (for testing)
+    // Generate digest (for testing / manual trigger)
     if (url.pathname === "/api/generate-digest" && request.method === "POST") {
       return handleGenerateDigest(request, env);
+    }
+    
+    // Scheduled digest generation (called by Inngest cron)
+    if (url.pathname === "/api/scheduled-digest" && request.method === "POST") {
+      return handleScheduledDigest(env);
     }
     
     // RSS feed for Spotify
@@ -847,6 +863,97 @@ interface DigestScript {
   script: string;  // Single narrator script
   topics_covered: string[];
   word_count: number;
+}
+
+// Check which users need digests generated based on their timezone and digest_time
+async function handleScheduledDigest(env: Env): Promise<Response> {
+  try {
+    const headers = {
+      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+    };
+    
+    // Get all users with their timezone and digest preferences
+    const profilesResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?select=id,timezone,digest_time,digest_length_minutes`,
+      { headers }
+    );
+    
+    if (!profilesResponse.ok) {
+      return json({ error: "Failed to fetch profiles" }, 500);
+    }
+    
+    const profiles = await profilesResponse.json() as Array<{
+      id: string;
+      timezone: string;
+      digest_time: string;
+      digest_length_minutes: number;
+    }>;
+    
+    const now = new Date();
+    const generatedFor: string[] = [];
+    
+    for (const profile of profiles) {
+      // Get current time in user's timezone
+      const userTime = new Date(now.toLocaleString("en-US", { timeZone: profile.timezone }));
+      const userHour = userTime.getHours();
+      const userMinute = userTime.getMinutes();
+      
+      // Parse digest_time (e.g., "06:00:00")
+      const [targetHour, targetMinute] = (profile.digest_time || "06:00:00").split(":").map(Number);
+      
+      // Check if current hour matches digest time (within the hour window)
+      // We run hourly, so check if we're in the right hour
+      if (userHour === targetHour && userMinute < 30) {
+        // Check if we already generated a digest today for this user
+        const today = new Date(userTime).toISOString().split('T')[0];
+        
+        const existingResponse = await fetch(
+          `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${profile.id}&digest_date=eq.${today}&select=id`,
+          { headers }
+        );
+        
+        const existing = await existingResponse.json() as Array<{ id: string }>;
+        
+        if (existing.length === 0) {
+          // Generate digest for this user
+          console.log(`[Scheduled] Generating digest for user ${profile.id} (${profile.timezone} @ ${userHour}:${userMinute})`);
+          
+          // Call the generate endpoint internally
+          const generateResponse = await fetch(
+            `https://podgest-api.pztest.workers.dev/api/generate-digest`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                user_id: profile.id,
+                hours_back: 24,
+              }),
+            }
+          );
+          
+          if (generateResponse.ok) {
+            generatedFor.push(profile.id);
+          } else {
+            console.error(`[Scheduled] Failed to generate for ${profile.id}: ${await generateResponse.text()}`);
+          }
+        } else {
+          console.log(`[Scheduled] Digest already exists for ${profile.id} on ${today}`);
+        }
+      }
+    }
+    
+    return json({
+      checked_users: profiles.length,
+      generated_for: generatedFor,
+      current_utc: now.toISOString(),
+    });
+    
+  } catch (error) {
+    console.error("[Scheduled] Error:", error);
+    return json({ error: String(error) }, 500);
+  }
 }
 
 async function handleGenerateDigest(request: Request, env: Env): Promise<Response> {
