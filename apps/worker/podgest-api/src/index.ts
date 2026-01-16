@@ -351,6 +351,12 @@ export default {
     if (url.pathname === "/api/generate-digest" && request.method === "POST") {
       return handleGenerateDigest(request, env);
     }
+    
+    // RSS feed for Spotify
+    if (url.pathname.startsWith("/feed/") && request.method === "GET") {
+      const userId = url.pathname.replace("/feed/", "").replace(".xml", "");
+      return handleRSSFeed(userId, env);
+    }
 
     return json({ error: "Not found" }, 404);
   },
@@ -973,8 +979,40 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
     
     // Get public URL
     const audioUrl = `${env.SUPABASE_URL}/storage/v1/object/public/digests/${audioPath}`;
+    const durationSeconds = Math.round(script.word_count / 2.5); // ~150 words/min
     
     console.log(`[Digest] Uploaded to: ${audioUrl}`);
+    
+    // 7. Save digest record to database
+    // Note: For now, use a placeholder user_id since we don't have auth yet
+    const placeholderUserId = body.user_id || "00000000-0000-0000-0000-000000000000";
+    
+    const digestRecord = {
+      id: digestId,
+      user_id: placeholderUserId,
+      digest_date: new Date().toISOString().split('T')[0],
+      status: "completed",
+      topic_clusters: { topics: script.topics_covered, title: script.title },
+      audio_storage_path: audioPath,
+      audio_url: audioUrl,
+      duration_seconds: durationSeconds,
+      episodes_included: episodeIds,
+      completed_at: new Date().toISOString(),
+    };
+    
+    const insertDigestResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests`,
+      {
+        method: "POST",
+        headers: { ...headers, "Prefer": "return=minimal" },
+        body: JSON.stringify(digestRecord),
+      }
+    );
+    
+    if (!insertDigestResponse.ok) {
+      console.error(`[Digest] Failed to save record: ${await insertDigestResponse.text()}`);
+      // Still return success since audio was generated
+    }
     
     return json({
       success: true,
@@ -989,7 +1027,7 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
       audio: {
         url: audioUrl,
         characters: script.script.length,
-        estimated_duration_seconds: Math.round(script.word_count / 2.5), // ~150 words/min
+        duration_seconds: durationSeconds,
       },
     });
     
@@ -1093,6 +1131,102 @@ Topics: ${ep.topics.join(", ")}`
   }
   
   return result;
+}
+
+// ============================================
+// RSS FEED FOR SPOTIFY
+// ============================================
+
+async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
+  try {
+    const headers = {
+      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+    };
+    
+    // Fetch completed digests for this user
+    const digestsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&status=eq.completed&order=digest_date.desc&limit=50`,
+      { headers }
+    );
+    
+    if (!digestsResponse.ok) {
+      return new Response("Failed to fetch digests", { status: 500 });
+    }
+    
+    const digests = await digestsResponse.json() as Array<{
+      id: string;
+      digest_date: string;
+      topic_clusters: { topics: string[]; title: string };
+      audio_url: string;
+      duration_seconds: number;
+      completed_at: string;
+    }>;
+    
+    // Build RSS XML
+    const feedUrl = `https://podgest-api.pztest.workers.dev/feed/${userId}`;
+    const now = new Date().toUTCString();
+    
+    const items = digests.map(d => {
+      const pubDate = new Date(d.completed_at).toUTCString();
+      const title = d.topic_clusters?.title || `Daily Digest - ${d.digest_date}`;
+      const description = d.topic_clusters?.topics?.join(", ") || "Your daily podcast digest";
+      const duration = formatDuration(d.duration_seconds || 0);
+      
+      return `
+    <item>
+      <title><![CDATA[${title}]]></title>
+      <description><![CDATA[Topics covered: ${description}]]></description>
+      <pubDate>${pubDate}</pubDate>
+      <guid isPermaLink="false">${d.id}</guid>
+      <enclosure url="${d.audio_url}" length="0" type="audio/mpeg"/>
+      <itunes:duration>${duration}</itunes:duration>
+      <itunes:explicit>no</itunes:explicit>
+    </item>`;
+    }).join("\n");
+    
+    const rss = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" 
+  xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Podgest Daily Digest</title>
+    <description>Your personalized podcast news digest, delivered daily.</description>
+    <link>${feedUrl}</link>
+    <language>en-us</language>
+    <lastBuildDate>${now}</lastBuildDate>
+    <itunes:author>Podgest</itunes:author>
+    <itunes:summary>AI-powered daily digest of your favorite podcasts.</itunes:summary>
+    <itunes:category text="News"/>
+    <itunes:explicit>no</itunes:explicit>
+    <itunes:image href="https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/podcast-cover.png"/>
+${items}
+  </channel>
+</rss>`;
+
+    return new Response(rss, {
+      headers: {
+        "Content-Type": "application/rss+xml; charset=utf-8",
+        "Cache-Control": "public, max-age=300", // Cache for 5 minutes
+      },
+    });
+    
+  } catch (error) {
+    console.error("[RSS] Error:", error);
+    return new Response("Internal error", { status: 500 });
+  }
+}
+
+function formatDuration(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  
+  if (h > 0) {
+    return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  }
+  return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
 async function generateSpeech(text: string, voiceId: string, apiKey: string): Promise<string | null> {
