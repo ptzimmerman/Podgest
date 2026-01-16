@@ -599,7 +599,8 @@ interface SupabaseUser {
   };
 }
 
-async function validateToken(token: string, env: Env): Promise<SupabaseUser | null> {
+// Validate Supabase JWT token
+async function validateJWT(token: string, env: Env): Promise<SupabaseUser | null> {
   try {
     const response = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
       headers: {
@@ -609,33 +610,121 @@ async function validateToken(token: string, env: Env): Promise<SupabaseUser | nu
     });
 
     if (!response.ok) {
-      console.log(`[Auth] Token validation failed: ${response.status}`);
       return null;
     }
 
-    const user = await response.json() as SupabaseUser;
-    console.log(`[Auth] Validated user: ${user.id} (${user.email})`);
-    return user;
-  } catch (error) {
-    console.error("[Auth] Token validation error:", error);
+    return await response.json() as SupabaseUser;
+  } catch {
     return null;
   }
 }
 
-function extractToken(request: Request): string | null {
-  const authHeader = request.headers.get("Authorization");
-  if (authHeader?.startsWith("Bearer ")) {
-    return authHeader.slice(7);
+// Validate API key from mcp_tokens table
+async function validateAPIKey(apiKey: string, env: Env): Promise<string | null> {
+  try {
+    // API keys are stored as "pk_" + random string
+    // We look up the token_hash (which is the full key for simplicity)
+    const response = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/mcp_tokens?token_hash=eq.${encodeURIComponent(apiKey)}&select=user_id,expires_at`,
+      {
+        headers: {
+          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        },
+      }
+    );
+
+    if (!response.ok) return null;
+
+    const tokens = await response.json() as Array<{ user_id: string; expires_at: string | null }>;
+    if (!tokens.length) return null;
+
+    const token = tokens[0];
+    
+    // Check expiry
+    if (token.expires_at && new Date(token.expires_at) < new Date()) {
+      return null;
+    }
+
+    // Update last_used_at
+    fetch(
+      `${env.SUPABASE_URL}/rest/v1/mcp_tokens?token_hash=eq.${encodeURIComponent(apiKey)}`,
+      {
+        method: "PATCH",
+        headers: {
+          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ last_used_at: new Date().toISOString() }),
+      }
+    ); // Fire and forget
+
+    return token.user_id;
+  } catch {
+    return null;
   }
-  return null;
+}
+
+// Generate a new API key for a user
+async function generateAPIKey(userId: string, email: string, env: Env): Promise<string> {
+  const apiKey = `pk_${crypto.randomUUID().replace(/-/g, "")}`;
+  
+  await fetch(
+    `${env.SUPABASE_URL}/rest/v1/mcp_tokens`,
+    {
+      method: "POST",
+      headers: {
+        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+      },
+      body: JSON.stringify({
+        user_id: userId,
+        token_hash: apiKey,
+        name: `API Key for ${email}`,
+        created_at: new Date().toISOString(),
+      }),
+    }
+  );
+
+  return apiKey;
+}
+
+// Authenticate request - supports both JWT and API key
+async function authenticateRequest(request: Request, env: Env): Promise<{ userId: string } | { error: string }> {
+  const authHeader = request.headers.get("Authorization");
+  
+  if (!authHeader?.startsWith("Bearer ")) {
+    return { error: "Missing Authorization header" };
+  }
+
+  const token = authHeader.slice(7);
+
+  // Check if it's an API key (starts with pk_)
+  if (token.startsWith("pk_")) {
+    const userId = await validateAPIKey(token, env);
+    if (userId) {
+      return { userId };
+    }
+    return { error: "Invalid API key" };
+  }
+
+  // Otherwise treat as Supabase JWT
+  const user = await validateJWT(token, env);
+  if (user) {
+    return { userId: user.id };
+  }
+
+  return { error: "Invalid token" };
 }
 
 // ============================================
-// HTTP HANDLER (SSE for MCP)
+// HTTP HANDLER
 // ============================================
 
-// Fallback user ID for development/testing (remove in production)
-const DEV_USER_ID = "18f513bd-8ecf-4922-84b7-4ab7c7cc14df";
+const MCP_SERVER_URL = "https://podgest-mcp.pztest.workers.dev";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -658,47 +747,83 @@ export default {
       return new Response(JSON.stringify({
         status: "ok",
         service: "podgest-mcp",
-        version: "1.0.0",
+        version: "2.0.0",
+        auth_url: `${MCP_SERVER_URL}/auth`,
       }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    // MCP endpoint - supports both SSE and simple POST
-    if (url.pathname === "/mcp" || url.pathname === "/sse") {
-      // Authenticate user
-      let userId: string;
+    // ========== AUTH PAGES ==========
+    
+    // Auth landing page - "Sign in with Google"
+    if (url.pathname === "/auth" && request.method === "GET") {
+      const redirectUri = `${MCP_SERVER_URL}/auth/callback`;
+      const authUrl = `${env.SUPABASE_URL}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(redirectUri)}`;
       
-      const token = extractToken(request);
-      if (token) {
-        // Validate JWT token with Supabase
-        const user = await validateToken(token, env);
+      return new Response(renderAuthPage(authUrl), {
+        headers: { "Content-Type": "text/html" },
+      });
+    }
+
+    // OAuth callback - receives token, generates API key
+    if (url.pathname === "/auth/callback" && request.method === "GET") {
+      // Supabase redirects with token in fragment, so we need JS to extract it
+      return new Response(renderCallbackPage(), {
+        headers: { "Content-Type": "text/html" },
+      });
+    }
+
+    // Token exchange - called by callback page JS
+    if (url.pathname === "/auth/token" && request.method === "POST") {
+      try {
+        const { access_token } = await request.json() as { access_token: string };
+        
+        // Validate the Supabase JWT
+        const user = await validateJWT(access_token, env);
         if (!user) {
-          return new Response(JSON.stringify({
-            error: "invalid_token",
-            message: "The provided token is invalid or expired. Please re-authenticate.",
-          }), {
+          return new Response(JSON.stringify({ error: "Invalid token" }), {
             status: 401,
             headers: { ...corsHeaders, "Content-Type": "application/json" },
           });
         }
-        userId = user.id;
-      } else {
-        // No token - check for dev mode fallback
-        const devMode = url.searchParams.get("dev") === "true";
-        if (devMode) {
-          console.log("[Auth] Dev mode - using fallback user ID");
-          userId = DEV_USER_ID;
-        } else {
-          return new Response(JSON.stringify({
-            error: "auth_required",
-            message: "Authentication required. Please sign in with Google via the local proxy.",
-          }), {
-            status: 401,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          });
-        }
+
+        // Generate API key for this user
+        const apiKey = await generateAPIKey(user.id, user.email, env);
+
+        return new Response(JSON.stringify({
+          api_key: apiKey,
+          user_id: user.id,
+          email: user.email,
+        }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: "Invalid request" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
       }
+    }
+
+    // ========== MCP ENDPOINT ==========
+    
+    if (url.pathname === "/mcp" || url.pathname === "/sse") {
+      // Authenticate request
+      const auth = await authenticateRequest(request, env);
+      
+      if ("error" in auth) {
+        return new Response(JSON.stringify({
+          error: "auth_required",
+          message: auth.error,
+          auth_url: `${MCP_SERVER_URL}/auth`,
+        }), {
+          status: 401,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const userId = auth.userId;
 
       // Handle SSE connection for streaming
       if (request.headers.get("Accept") === "text/event-stream") {
@@ -720,6 +845,255 @@ export default {
     return new Response("Not found", { status: 404, headers: corsHeaders });
   },
 };
+
+// ============================================
+// AUTH PAGE TEMPLATES
+// ============================================
+
+function renderAuthPage(authUrl: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Podgest - Sign In</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, #0f0f23 0%, #1a1a3e 50%, #0f0f23 100%);
+      color: #fff;
+    }
+    .container {
+      text-align: center;
+      padding: 48px;
+      max-width: 420px;
+    }
+    .logo {
+      font-size: 48px;
+      margin-bottom: 8px;
+    }
+    h1 {
+      font-size: 32px;
+      font-weight: 600;
+      margin-bottom: 12px;
+      background: linear-gradient(135deg, #60a5fa, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    p {
+      color: #94a3b8;
+      font-size: 16px;
+      line-height: 1.6;
+      margin-bottom: 32px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 32px;
+      font-size: 16px;
+      font-weight: 500;
+      color: #1f2937;
+      background: #fff;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      text-decoration: none;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(255,255,255,0.15);
+    }
+    .btn svg { width: 20px; height: 20px; }
+    .features {
+      margin-top: 48px;
+      text-align: left;
+      background: rgba(255,255,255,0.05);
+      border-radius: 16px;
+      padding: 24px;
+    }
+    .features h3 {
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #64748b;
+      margin-bottom: 16px;
+    }
+    .feature {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 0;
+      color: #cbd5e1;
+      font-size: 14px;
+    }
+    .feature span { font-size: 18px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">🎙️</div>
+    <h1>Podgest</h1>
+    <p>Sign in to connect your podcast intelligence to Claude, Cursor, and other AI tools.</p>
+    
+    <a href="${authUrl}" class="btn">
+      <svg viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+      Sign in with Google
+    </a>
+
+    <div class="features">
+      <h3>What you'll get</h3>
+      <div class="feature"><span>🔍</span> Search across all your podcast transcripts</div>
+      <div class="feature"><span>📊</span> Compare perspectives from different shows</div>
+      <div class="feature"><span>🎧</span> Daily AI-generated digest of your podcasts</div>
+      <div class="feature"><span>🔐</span> Your data stays private and secure</div>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+function renderCallbackPage(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Podgest - Authentication</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, #0f0f23 0%, #1a1a3e 50%, #0f0f23 100%);
+      color: #fff;
+    }
+    .container {
+      text-align: center;
+      padding: 48px;
+      max-width: 560px;
+    }
+    .spinner {
+      width: 48px;
+      height: 48px;
+      border: 3px solid rgba(255,255,255,0.1);
+      border-top-color: #60a5fa;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin: 0 auto 24px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    h1 { font-size: 24px; margin-bottom: 8px; }
+    .status { color: #94a3b8; margin-bottom: 32px; }
+    
+    .success { display: none; }
+    .success h1 { color: #4ade80; }
+    
+    .saving { display: none; }
+    .saving h1 { color: #60a5fa; }
+    
+    .done { display: none; }
+    .done h1 { color: #4ade80; }
+    
+    .error { display: none; }
+    .error h1 { color: #f87171; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="loading">
+      <div class="spinner"></div>
+      <h1>Authenticating...</h1>
+      <p class="status">Please wait while we set up your account.</p>
+    </div>
+    
+    <div class="saving">
+      <div class="spinner"></div>
+      <h1>Saving credentials...</h1>
+      <p class="status">Storing your API key locally.</p>
+    </div>
+    
+    <div class="done">
+      <h1>✓ You're all set!</h1>
+      <p class="status">Your API key has been saved. You can close this window and reload Cursor.</p>
+      <p style="color: #64748b; font-size: 14px; margin-top: 24px;">
+        API key saved to: <code style="color: #a78bfa;">~/.podgest/api_key</code>
+      </p>
+    </div>
+    
+    <div class="error">
+      <h1>Authentication Failed</h1>
+      <p class="status error-message">Something went wrong. Please try again.</p>
+      <a href="/auth" style="color: #60a5fa;">← Back to sign in</a>
+    </div>
+  </div>
+
+  <script>
+    async function init() {
+      // Extract token from URL fragment
+      const hash = window.location.hash.substring(1);
+      const params = new URLSearchParams(hash);
+      const accessToken = params.get('access_token');
+      
+      if (!accessToken) {
+        showError('No access token received');
+        return;
+      }
+      
+      try {
+        // Exchange for API key
+        const response = await fetch('/auth/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ access_token: accessToken })
+        });
+        
+        if (!response.ok) {
+          const data = await response.json();
+          showError(data.error || 'Authentication failed');
+          return;
+        }
+        
+        const data = await response.json();
+        
+        // Now save the API key locally via localhost redirect
+        document.querySelector('.loading').style.display = 'none';
+        document.querySelector('.saving').style.display = 'block';
+        
+        // Redirect to localhost to save the key
+        window.location.href = 'http://localhost:9876/save?key=' + encodeURIComponent(data.api_key);
+        
+      } catch (err) {
+        showError('Network error: ' + err.message);
+      }
+    }
+    
+    function showError(message) {
+      document.querySelector('.loading').style.display = 'none';
+      document.querySelector('.error').style.display = 'block';
+      document.querySelector('.error-message').textContent = message;
+    }
+    
+    // Check if we're on the success page (redirected back from localhost)
+    if (window.location.search.includes('success=true')) {
+      document.querySelector('.loading').style.display = 'none';
+      document.querySelector('.done').style.display = 'block';
+    } else {
+      init();
+    }
+  </script>
+</body>
+</html>`;
+}
 
 // SSE handler for streaming MCP
 async function handleSSE(request: Request, env: Env, userId: string): Promise<Response> {

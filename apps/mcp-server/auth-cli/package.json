@@ -1,0 +1,12 @@
+{
+  "name": "podgest-auth",
+  "version": "1.0.0",
+  "description": "One-time authentication for Podgest MCP",
+  "type": "module",
+  "bin": {
+    "podgest-auth": "./index.js"
+  },
+  "dependencies": {
+    "open": "^10.0.0"
+  }
+}
