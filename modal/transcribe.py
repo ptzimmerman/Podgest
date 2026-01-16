@@ -33,6 +33,17 @@ tts_image = (
     )
 )
 
+# Test TTS image with Edge TTS (free Microsoft TTS)
+test_tts_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg")
+    .pip_install(
+        "edge-tts",
+        "requests",
+        "fastapi",
+    )
+)
+
 app = modal.App("podgest-transcribe")
 
 
@@ -438,6 +449,152 @@ def tts_web(request: dict) -> dict:
         supabase_key=request.get("supabase_key"),
         digest_id=request.get("digest_id"),
         webhook_url=request.get("webhook_url"),
+    )
+
+
+# ============================================
+# TEST TTS (Free Edge TTS - for testing only)
+# ============================================
+
+@app.cls(
+    image=test_tts_image,
+    timeout=600,
+    scaledown_window=60,
+    memory=2048,
+)
+class TestTTS:
+    """Generate audio using free Edge TTS (Microsoft) for testing."""
+    
+    @modal.method()
+    def generate(
+        self,
+        script: str,
+        voice: str = "en-US-GuyNeural",  # Good male news voice
+        supabase_url: str | None = None,
+        supabase_key: str | None = None,
+        test_id: str | None = None,
+    ) -> dict:
+        """Generate test audio using Edge TTS (free)."""
+        import asyncio
+        import edge_tts
+        import tempfile
+        import os
+        import requests
+        import subprocess
+        import json
+        
+        try:
+            test_id = test_id or f"test-{int(__import__('time').time())}"
+            print(f"🎙️ Generating test TTS for {len(script)} characters")
+            
+            # Clean script
+            clean_script = script.replace("[PAUSE]", "...")
+            
+            # Generate with Edge TTS
+            output_path = tempfile.mktemp(suffix=".mp3")
+            
+            async def generate_audio():
+                communicate = edge_tts.Communicate(clean_script, voice)
+                await communicate.save(output_path)
+            
+            asyncio.run(generate_audio())
+            
+            # Get duration
+            duration = 0
+            try:
+                result = subprocess.run([
+                    "ffprobe", "-v", "quiet", "-print_format", "json",
+                    "-show_format", output_path
+                ], capture_output=True, text=True)
+                if result.returncode == 0:
+                    data = json.loads(result.stdout)
+                    duration = int(float(data.get("format", {}).get("duration", 0)))
+            except:
+                pass
+            
+            print(f"⏱️ Duration: {duration}s")
+            
+            # Read audio
+            with open(output_path, "rb") as f:
+                audio_data = f.read()
+            
+            result = {
+                "status": "completed",
+                "test_id": test_id,
+                "duration_seconds": duration,
+                "characters": len(clean_script),
+                "voice": voice,
+            }
+            
+            # Upload to test bucket if Supabase configured
+            if supabase_url and supabase_key:
+                audio_path = f"{test_id}/test-audio.mp3"
+                upload_url = f"{supabase_url}/storage/v1/object/test-audio/{audio_path}"
+                
+                print(f"📤 Uploading to test bucket: {audio_path}")
+                upload_response = requests.post(
+                    upload_url,
+                    headers={
+                        "Authorization": f"Bearer {supabase_key}",
+                        "Content-Type": "audio/mpeg",
+                        "x-upsert": "true",
+                    },
+                    data=audio_data,
+                    timeout=120,
+                )
+                
+                if upload_response.ok:
+                    result["audio_url"] = f"{supabase_url}/storage/v1/object/public/test-audio/{audio_path}"
+                    print(f"✅ Uploaded: {result['audio_url']}")
+                else:
+                    print(f"❌ Upload failed: {upload_response.status_code} - {upload_response.text}")
+                    result["upload_error"] = upload_response.text
+            
+            # Cleanup
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+            
+            return result
+            
+        except Exception as e:
+            import traceback
+            print(f"❌ Test TTS Error: {e}")
+            print(traceback.format_exc())
+            return {
+                "status": "failed",
+                "test_id": test_id,
+                "error": str(e),
+            }
+
+
+# Test TTS Web endpoint (free, for testing only)
+@app.function(image=test_tts_image)
+@modal.fastapi_endpoint(method="POST")
+def test_tts_web(request: dict) -> dict:
+    """
+    FREE TTS endpoint for testing (uses Microsoft Edge TTS).
+    
+    Expected JSON body:
+    {
+        "script": "...",
+        "voice": "en-US-GuyNeural" (optional),
+        "supabase_url": "..." (optional),
+        "supabase_key": "..." (optional),
+        "test_id": "..." (optional)
+    }
+    """
+    script = request.get("script")
+    
+    if not script:
+        return {"error": "script is required"}
+    
+    tts = TestTTS()
+    return tts.generate.remote(
+        script=script,
+        voice=request.get("voice", "en-US-GuyNeural"),
+        supabase_url=request.get("supabase_url"),
+        supabase_key=request.get("supabase_key"),
+        test_id=request.get("test_id"),
     )
 
 

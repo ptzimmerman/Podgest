@@ -61,9 +61,19 @@ const scheduledDigestGeneration = inngest.createFunction(
   { id: "scheduled-digest-generation" },
   { cron: "0 * * * *" }, // Every hour on the hour
   async ({ step, logger }) => {
-    // This triggers an HTTP call to generate digests for users whose digest_time has arrived
-    logger.info("Scheduled digest check triggered");
-    return { message: "Use /api/scheduled-digest endpoint to check and generate digests" };
+    logger.info("Scheduled digest check triggered - calling endpoint");
+    
+    // Call our own endpoint to check and generate digests
+    const result = await step.run("check-and-generate", async () => {
+      const response = await fetch(
+        "https://podgest-api.pztest.workers.dev/api/scheduled-digest",
+        { method: "POST", headers: { "Content-Type": "application/json" } }
+      );
+      return response.json();
+    });
+    
+    logger.info(`Scheduled digest result: ${JSON.stringify(result)}`);
+    return result;
   }
 );
 
@@ -365,9 +375,14 @@ export default {
       }
     }
 
-    // Modal webhook
+    // Modal transcription webhook
     if (url.pathname === "/api/webhooks/modal" && request.method === "POST") {
       return handleModalWebhook(request, env, ctx);
+    }
+    
+    // Modal TTS webhook (updates digest when audio is ready)
+    if (url.pathname === "/api/webhooks/tts" && request.method === "POST") {
+      return handleTTSWebhook(request, env);
     }
     
     // Manual topic extraction trigger (for testing)
@@ -382,7 +397,7 @@ export default {
     
     // Generate digest (for testing / manual trigger)
     if (url.pathname === "/api/generate-digest" && request.method === "POST") {
-      return handleGenerateDigest(request, env);
+      return handleGenerateDigest(request, env, ctx);
     }
     
     // Scheduled digest generation (called by Inngest cron)
@@ -498,6 +513,72 @@ async function handleModalWebhook(request: Request, env: Env, ctx: ExecutionCont
     }
   } catch (error) {
     console.error("[Webhook] Error:", error);
+    return json({ error: "Internal error" }, 500);
+  }
+}
+
+// Handle TTS completion webhook from Modal
+async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
+  try {
+    const payload = await request.json() as {
+      status: string;
+      digest_id?: string;
+      audio_url?: string;
+      duration_seconds?: number;
+      characters?: number;
+      error?: string;
+    };
+
+    console.log(`[TTS Webhook] Received: status=${payload.status}, digest_id=${payload.digest_id}`);
+
+    if (!payload.digest_id) {
+      return json({ error: "digest_id required" }, 400);
+    }
+
+    const headers = {
+      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      "Prefer": "return=minimal",
+    };
+
+    if (payload.status === "completed" && payload.audio_url) {
+      // Update digest record with audio URL
+      await fetch(
+        `${env.SUPABASE_URL}/rest/v1/digests?id=eq.${payload.digest_id}`,
+        {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({
+            status: "completed",
+            audio_url: payload.audio_url,
+            duration_seconds: payload.duration_seconds,
+            completed_at: new Date().toISOString(),
+          }),
+        }
+      );
+
+      console.log(`[TTS Webhook] Digest ${payload.digest_id} completed: ${payload.audio_url}`);
+      return json({ success: true, status: "completed" });
+    } else {
+      // Update as failed
+      await fetch(
+        `${env.SUPABASE_URL}/rest/v1/digests?id=eq.${payload.digest_id}`,
+        {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ 
+            status: "failed", 
+            error_message: payload.error || "TTS generation failed",
+          }),
+        }
+      );
+
+      console.log(`[TTS Webhook] Digest ${payload.digest_id} failed: ${payload.error}`);
+      return json({ success: true, status: "failed" });
+    }
+  } catch (error) {
+    console.error("[TTS Webhook] Error:", error);
     return json({ error: "Internal error" }, 500);
   }
 }
@@ -977,7 +1058,7 @@ async function handleScheduledDigest(env: Env): Promise<Response> {
   }
 }
 
-async function handleGenerateDigest(request: Request, env: Env): Promise<Response> {
+async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
     const body = await request.json() as { 
       user_id?: string; 
@@ -1126,72 +1207,22 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
     
     console.log(`[Digest] Script generated: ${script.word_count} words`);
     
-    // 5. Generate audio via Modal TTS (no timeout issues)
+    // 5. Save pending digest record first (so we can update it when TTS completes)
     const digestId = crypto.randomUUID();
-    console.log(`[Digest] Calling Modal TTS for ${script.script.length} chars...`);
-    
-    const ttsResponse = await fetch(
-      "https://ptzimmerman--podgest-transcribe-tts-web.modal.run",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          script: script.script,
-          elevenlabs_api_key: env.ELEVENLABS_API_KEY,
-          voice_id: VOICE_BROADCASTER,
-          supabase_url: env.SUPABASE_URL,
-          supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
-          digest_id: digestId,
-        }),
-      }
-    );
-    
-    if (!ttsResponse.ok) {
-      const err = await ttsResponse.text();
-      console.error(`[Digest] Modal TTS failed: ${err}`);
-      return json({ 
-        error: "Failed to generate audio via Modal",
-        details: err,
-        script: script, // Return script so user can manually use it
-      }, 500);
-    }
-    
-    const ttsResult = await ttsResponse.json() as {
-      status: string;
-      audio_url?: string;
-      duration_seconds?: number;
-      characters?: number;
-      error?: string;
-    };
-    
-    if (ttsResult.status !== "completed" || !ttsResult.audio_url) {
-      console.error(`[Digest] TTS error: ${ttsResult.error}`);
-      return json({ 
-        error: ttsResult.error || "TTS failed",
-        script: script,
-      }, 500);
-    }
-    
-    const audioUrl = ttsResult.audio_url;
-    const durationSeconds = ttsResult.duration_seconds || Math.round(script.word_count / 2.5);
-    
-    console.log(`[Digest] Audio ready: ${audioUrl} (${durationSeconds}s)`);
-    
-    // 7. Save digest record to database
-    // Note: For now, use a placeholder user_id since we don't have auth yet
     const placeholderUserId = body.user_id || "00000000-0000-0000-0000-000000000000";
+    const estimatedDuration = Math.round(script.word_count / 2.5);
     
     const digestRecord = {
       id: digestId,
       user_id: placeholderUserId,
       digest_date: new Date().toISOString().split('T')[0],
-      status: "completed",
+      status: "generating", // Will be updated to "completed" by webhook
       topic_clusters: { topics: script.topics_covered, title: script.title },
       audio_storage_path: `${digestId}/digest.mp3`,
-      audio_url: audioUrl,
-      duration_seconds: durationSeconds,
+      audio_url: null, // Will be set by webhook
+      duration_seconds: estimatedDuration,
       episodes_included: episodeIds,
-      completed_at: new Date().toISOString(),
+      completed_at: null,
     };
     
     // Use upsert to allow regenerating same-day digests
@@ -1210,24 +1241,48 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
     if (!insertDigestResponse.ok) {
       const errorText = await insertDigestResponse.text();
       console.error(`[Digest] Failed to save record: ${errorText}`);
-    } else {
-      console.log(`[Digest] Record saved successfully`);
+      return json({ error: "Failed to save digest record", details: errorText }, 500);
     }
     
+    console.log(`[Digest] Saved pending digest ${digestId}`);
+    
+    // 6. Trigger Modal TTS asynchronously with webhook callback
+    console.log(`[Digest] Triggering Modal TTS for ${script.script.length} chars...`);
+    
+    // Use waitUntil to ensure the request is sent even after response is returned
+    ctx.waitUntil(
+      fetch(
+        "https://ptzimmerman--podgest-transcribe-tts-web.modal.run",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            script: script.script,
+            elevenlabs_api_key: env.ELEVENLABS_API_KEY,
+            voice_id: VOICE_BROADCASTER,
+            supabase_url: env.SUPABASE_URL,
+            supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
+            digest_id: digestId,
+            webhook_url: "https://podgest-api.pztest.workers.dev/api/webhooks/tts",
+          }),
+        }
+      ).then(res => console.log(`[Digest] Modal TTS triggered: ${res.status}`))
+       .catch(err => console.error(`[Digest] Modal trigger error: ${err}`))
+    );
+    
+    // Return immediately - audio will be ready in ~1 minute
     return json({
       success: true,
+      status: "generating",
+      message: "Digest script generated, audio processing in background. Check back in ~1 minute.",
       digest_id: digestId,
       episodes_count: episodes.length,
+      estimated_duration_seconds: estimatedDuration,
       script: {
         title: script.title,
         word_count: script.word_count,
         topics_covered: script.topics_covered,
         preview: script.script.substring(0, 500) + "...",
-      },
-      audio: {
-        url: audioUrl,
-        characters: script.script.length,
-        duration_seconds: durationSeconds,
       },
     });
     
@@ -1284,6 +1339,13 @@ STRUCTURE YOUR SCRIPT EXACTLY LIKE THIS:
      * "According to [Podcast Name]..."
      * "[Podcast Name] covered..."
      * "As discussed on [Podcast Name]..."
+   
+   CRITICAL - ACCURATE CITATIONS:
+   - ONLY cite a podcast for information that actually came from that podcast
+   - Each story below has a "Source Podcast" field - use ONLY that podcast name when citing that story's content
+   - DO NOT mix up sources - if "Prof G Markets" discussed Delta Airlines, do NOT say "The Daily" discussed it
+   - When in doubt, cite the specific source podcast listed for each story
+   
    - Be warm and engaging but NEUTRAL - no opinions, no editorializing, no reactions
    - Just deliver the facts as reported by the source podcasts
    - End each section with: "And that wraps up [SECTION NAME]. [PAUSE]"
