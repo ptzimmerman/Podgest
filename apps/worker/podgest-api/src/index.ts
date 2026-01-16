@@ -11,9 +11,8 @@ export interface Env {
   ELEVENLABS_API_KEY: string;
 }
 
-// Voice IDs for two-host format
-const VOICE_HOST_1 = "iP95p4xoKVk53GoZ742B"; // Chris - male, conversational
-const VOICE_HOST_2 = "EXAVITQu4vr4xnSDxMaL"; // Sarah - female, professional
+// Voice ID for news broadcaster style
+const VOICE_BROADCASTER = "cjVigY5qzO86Huf0OWal"; // Eric - Smooth, Trustworthy
 
 // ============================================
 // INNGEST CLIENT & FUNCTIONS
@@ -837,15 +836,11 @@ async function handleExtractTopics(request: Request, env: Env): Promise<Response
 // DIGEST GENERATION
 // ============================================
 
-interface DigestLine {
-  speaker: "host1" | "host2";
-  text: string;
-}
-
 interface DigestScript {
   title: string;
-  lines: DigestLine[];
+  script: string;  // Single narrator script
   topics_covered: string[];
+  word_count: number;
 }
 
 async function handleGenerateDigest(request: Request, env: Env): Promise<Response> {
@@ -934,46 +929,67 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
     
     console.log(`[Digest] Generating script with Claude...`);
     
-    // 4. Generate script with Claude
+    // 4. Generate news broadcaster script with Claude
     const script = await generateDigestScript(episodeSummaries, maxLengthMinutes, env.ANTHROPIC_API_KEY);
     
-    console.log(`[Digest] Script generated: ${script.lines.length} lines`);
+    console.log(`[Digest] Script generated: ${script.word_count} words`);
     
-    // 5. Generate audio for each line
-    console.log(`[Digest] Generating audio with ElevenLabs...`);
-    const audioSegments: Array<{ speaker: string; audioBase64: string }> = [];
+    // 5. Generate single audio file with ElevenLabs
+    console.log(`[Digest] Generating audio with ElevenLabs (${script.script.length} chars)...`);
     
-    for (let i = 0; i < script.lines.length; i++) {
-      const line = script.lines[i];
-      console.log(`[Digest] Generating line ${i + 1}/${script.lines.length}: ${line.text.substring(0, 50)}...`);
-      
-      const voiceId = line.speaker === "host1" ? VOICE_HOST_1 : VOICE_HOST_2;
-      const audioData = await generateSpeech(line.text, voiceId, env.ELEVENLABS_API_KEY);
-      
-      if (audioData) {
-        audioSegments.push({
-          speaker: line.speaker,
-          audioBase64: audioData,
-        });
-      }
+    const audioBase64 = await generateSpeech(script.script, VOICE_BROADCASTER, env.ELEVENLABS_API_KEY);
+    
+    if (!audioBase64) {
+      return json({ 
+        error: "Failed to generate audio",
+        script: script, // Return script so user can manually use it
+      }, 500);
     }
     
-    console.log(`[Digest] Generated ${audioSegments.length} audio segments`);
+    console.log(`[Digest] Audio generated successfully`);
     
-    // For now, return the script and audio segment info
-    // Full concatenation will be done via Modal
+    // 6. Upload to Supabase Storage
+    const digestId = crypto.randomUUID();
+    const audioPath = `${digestId}/digest.mp3`;
+    
+    const uploadResponse = await fetch(
+      `${env.SUPABASE_URL}/storage/v1/object/digests/${audioPath}`,
+      {
+        method: "POST",
+        headers: {
+          ...headers,
+          "Content-Type": "audio/mpeg",
+          "x-upsert": "true",
+        },
+        body: Uint8Array.from(atob(audioBase64), c => c.charCodeAt(0)),
+      }
+    );
+    
+    if (!uploadResponse.ok) {
+      const err = await uploadResponse.text();
+      console.error(`[Digest] Upload failed: ${err}`);
+      return json({ error: "Failed to upload audio", details: err }, 500);
+    }
+    
+    // Get public URL
+    const audioUrl = `${env.SUPABASE_URL}/storage/v1/object/public/digests/${audioPath}`;
+    
+    console.log(`[Digest] Uploaded to: ${audioUrl}`);
+    
     return json({
       success: true,
+      digest_id: digestId,
       episodes_count: episodes.length,
       script: {
         title: script.title,
-        line_count: script.lines.length,
+        word_count: script.word_count,
         topics_covered: script.topics_covered,
-        preview: script.lines.slice(0, 4),
+        preview: script.script.substring(0, 500) + "...",
       },
       audio: {
-        segments_generated: audioSegments.length,
-        total_characters: script.lines.reduce((sum, l) => sum + l.text.length, 0),
+        url: audioUrl,
+        characters: script.script.length,
+        estimated_duration_seconds: Math.round(script.word_count / 2.5), // ~150 words/min
       },
     });
     
@@ -998,34 +1014,31 @@ async function generateDigestScript(
   // ~150 words per minute for natural speech
   const targetWordCount = maxMinutes * 150;
   
-  const systemPrompt = `You are a script writer for a professional podcast news digest. 
-You write conversational dialogue between two hosts:
-- Host 1 (Chris): Male, conversational, often introduces topics and asks questions
-- Host 2 (Sarah): Female, professional, provides analysis and insights
+  const systemPrompt = `You are a professional news broadcaster writing a podcast script.
+Write in a clear, engaging news anchor style - authoritative but approachable.
 
 Guidelines:
-- Keep it conversational but informative
-- Each host should speak for 1-3 sentences at a time before the other responds
-- Cover the most important stories first
-- Aim for approximately ${targetWordCount} words total (${maxMinutes} minutes)
-- Group related topics together naturally
+- Start with a brief intro ("Good morning, I'm your host for today's digest...")
+- Cover the most important and interesting stories first
+- Group related topics together with smooth transitions
+- Use clear, concise language suitable for audio
+- Include brief analysis and context, not just facts
+- Aim for approximately ${targetWordCount} words (${maxMinutes} minutes at natural pace)
 - End with a brief sign-off
 
 Return a JSON object with this structure:
 {
   "title": "Daily Digest - [Date or main theme]",
-  "lines": [
-    {"speaker": "host1", "text": "Welcome to today's digest..."},
-    {"speaker": "host2", "text": "Thanks Chris! We have some great stories..."},
-    ...
-  ],
-  "topics_covered": ["topic1", "topic2", ...]
+  "script": "Good morning, I'm your host... [full script as single string]",
+  "topics_covered": ["topic1", "topic2", ...],
+  "word_count": 450
 }
 
-IMPORTANT: Return ONLY the JSON object, no markdown formatting.`;
+IMPORTANT: Return ONLY the JSON object, no markdown formatting.
+The "script" field should be the complete script as a single string with natural paragraph breaks.`;
 
   const episodeContext = episodes.map((ep, i) => 
-    `Episode ${i + 1}: "${ep.title}"
+    `Story ${i + 1}: "${ep.title}"
 Summary: ${ep.summary}
 Key Points: ${ep.key_points.join("; ")}
 Topics: ${ep.topics.join(", ")}`
@@ -1045,7 +1058,7 @@ Topics: ${ep.topics.join(", ")}`
       messages: [
         {
           role: "user",
-          content: `Create a ${maxMinutes}-minute podcast digest script covering these ${episodes.length} episodes:\n\n${episodeContext}`,
+          content: `Create a ${maxMinutes}-minute news-style podcast script covering these ${episodes.length} stories:\n\n${episodeContext}`,
         },
       ],
     }),
@@ -1072,11 +1085,20 @@ Topics: ${ep.topics.join(", ")}`
   if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3);
   jsonText = jsonText.trim();
   
-  return JSON.parse(jsonText) as DigestScript;
+  const result = JSON.parse(jsonText) as DigestScript;
+  
+  // Ensure word_count is set
+  if (!result.word_count) {
+    result.word_count = result.script.split(/\s+/).length;
+  }
+  
+  return result;
 }
 
 async function generateSpeech(text: string, voiceId: string, apiKey: string): Promise<string | null> {
   try {
+    console.log(`[TTS] Generating speech for ${text.length} chars with voice ${voiceId}`);
+    
     const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
       method: "POST",
       headers: {
@@ -1093,19 +1115,33 @@ async function generateSpeech(text: string, voiceId: string, apiKey: string): Pr
       }),
     });
 
+    console.log(`[TTS] Response status: ${response.status}`);
+
     if (!response.ok) {
       const err = await response.text();
-      console.error(`[TTS] Error: ${response.status} - ${err}`);
+      console.error(`[TTS] API Error: ${response.status} - ${err}`);
       return null;
     }
 
-    // Convert to base64
+    // Get array buffer
     const arrayBuffer = await response.arrayBuffer();
-    const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+    console.log(`[TTS] Received ${arrayBuffer.byteLength} bytes`);
+    
+    // Convert to base64 in chunks to avoid stack overflow
+    const bytes = new Uint8Array(arrayBuffer);
+    let binary = '';
+    const chunkSize = 8192;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.slice(i, i + chunkSize);
+      binary += String.fromCharCode.apply(null, Array.from(chunk));
+    }
+    const base64 = btoa(binary);
+    
+    console.log(`[TTS] Converted to base64: ${base64.length} chars`);
     return base64;
     
   } catch (error) {
-    console.error("[TTS] Error:", error);
+    console.error("[TTS] Exception:", error);
     return null;
   }
 }
