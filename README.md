@@ -957,7 +957,7 @@ podgest/
 - [x] Add initial podcast subscriptions via Supabase dashboard
 
 ### Phase 2: Ingestion Pipeline
-- [ ] **Verify SuperMemory** supports user_id, date, podcast filtering — if not, use pgvector
+- [x] **Verify SuperMemory** supports user_id, date, podcast filtering ✅ (containerTags + metadata filters)
 - [x] `poll-feeds` Inngest cron function (every 15 min)
 - [x] `transcribe-episode` Inngest function (triggered by episode.created)
 - [x] Modal webhook callback endpoint (`/api/webhooks/modal`)
