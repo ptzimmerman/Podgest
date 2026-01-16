@@ -962,7 +962,7 @@ podgest/
 - [x] `transcribe-episode` Inngest function (triggered by episode.created)
 - [x] Modal webhook callback endpoint (`/api/webhooks/modal`)
 - [x] `extract-topics` function (Claude Sonnet 4) — auto-triggers after transcription completes
-- [ ] `embed-content` function (stores in SuperMemory)
+- [x] `embed-content` function (stores in SuperMemory) — auto-triggers after topic extraction
 - [x] Deploy API (Cloudflare Workers) for Inngest + webhook endpoints
 - [x] Register Inngest app URL in dashboard
 - [x] Test full pipeline with 2-3 real podcasts

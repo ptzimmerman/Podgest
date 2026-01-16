@@ -337,6 +337,11 @@ export default {
     if (url.pathname === "/api/extract-topics" && request.method === "POST") {
       return handleExtractTopics(request, env);
     }
+    
+    // Manual SuperMemory embedding trigger (for testing)
+    if (url.pathname === "/api/embed-content" && request.method === "POST") {
+      return handleEmbedContent(request, env);
+    }
 
     return json({ error: "Not found" }, 404);
   },
@@ -417,8 +422,11 @@ async function handleModalWebhook(request: Request, env: Env, ctx: ExecutionCont
 
       console.log(`[Webhook] Transcription completed for episode: ${jobData.episode_id}`);
       
-      // Trigger topic extraction asynchronously (don't wait)
-      ctx.waitUntil(extractTopicsForEpisode(jobData.episode_id, payload.text, env));
+      // Trigger topic extraction and SuperMemory embedding asynchronously (don't wait)
+      ctx.waitUntil(
+        extractTopicsForEpisode(jobData.episode_id, payload.text, env)
+          .then(() => embedInSuperMemory(jobData.episode_id, payload.text, env))
+      );
       
       return json({ success: true, status: "completed" });
     } else {
@@ -590,6 +598,158 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code fenc
       key_points: [],
       sentiment: "neutral",
     };
+  }
+}
+
+// ============================================
+// SUPERMEMORY EMBEDDING
+// ============================================
+
+async function embedInSuperMemory(episodeId: string, transcriptText: string, env: Env): Promise<void> {
+  console.log(`[SuperMemory] Starting embedding for episode: ${episodeId}`);
+  
+  try {
+    const headers = {
+      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+    };
+    
+    // Get episode metadata
+    const episodeResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episodeId}&select=id,title,published_at,feed_url`,
+      { headers }
+    );
+    
+    if (!episodeResponse.ok) {
+      console.error(`[SuperMemory] Failed to fetch episode: ${episodeResponse.status}`);
+      return;
+    }
+    
+    const episodes = await episodeResponse.json() as Array<{
+      id: string;
+      title: string;
+      published_at: string;
+      feed_url: string;
+    }>;
+    
+    if (!episodes.length) {
+      console.error(`[SuperMemory] Episode not found: ${episodeId}`);
+      return;
+    }
+    
+    const episode = episodes[0];
+    
+    // Get subscription info via feed_url
+    const subResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/subscriptions?feed_url=eq.${encodeURIComponent(episode.feed_url)}&select=user_id,podcast_title&limit=1`,
+      { headers }
+    );
+    const subs = await subResponse.json() as Array<{ user_id: string; podcast_title: string }>;
+    
+    const userId = subs[0]?.user_id || "unknown";
+    const podcastTitle = subs[0]?.podcast_title || "Unknown Podcast";
+    
+    // Get transcription ID first
+    const transcriptionResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episodeId}&select=id`,
+      { headers }
+    );
+    const transcriptions = await transcriptionResponse.json() as Array<{ id: string }>;
+    const transcriptionId = transcriptions[0]?.id;
+    
+    // Get topic extraction if available
+    let topics: TopicExtractionResult | undefined;
+    if (transcriptionId) {
+      const topicsResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/topic_extractions?transcription_id=eq.${transcriptionId}&select=topics`,
+        { headers }
+      );
+      const topicExtractions = await topicsResponse.json() as Array<{ topics: TopicExtractionResult }>;
+      topics = topicExtractions[0]?.topics;
+    }
+    
+    // Send to SuperMemory
+    const superMemoryResponse = await fetch("https://api.supermemory.ai/v3/documents", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.SUPERMEMORY_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        content: transcriptText,
+        metadata: {
+          episode_id: episodeId,
+          episode_title: episode.title,
+          podcast_title: podcastTitle,
+          published_at: new Date(episode.published_at).getTime(),
+          topics: topics?.topics || [],
+          themes: topics?.themes || [],
+          summary: topics?.summary || "",
+        },
+        containerTags: [userId], // Multi-tenant isolation
+      }),
+    });
+    
+    if (!superMemoryResponse.ok) {
+      const err = await superMemoryResponse.text();
+      console.error(`[SuperMemory] API error: ${superMemoryResponse.status} - ${err}`);
+      return;
+    }
+    
+    const result = await superMemoryResponse.json() as { id: string; status: string };
+    console.log(`[SuperMemory] Embedded episode ${episodeId} as doc ${result.id}`);
+    
+    // Update transcription with SuperMemory doc ID
+    await fetch(
+      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episodeId}`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ supermemory_doc_id: result.id }),
+      }
+    );
+    
+    console.log(`[SuperMemory] Embedding complete for episode: ${episodeId}`);
+    
+  } catch (error) {
+    console.error(`[SuperMemory] Error for episode ${episodeId}:`, error);
+  }
+}
+
+async function handleEmbedContent(request: Request, env: Env): Promise<Response> {
+  try {
+    const { episode_id } = await request.json() as { episode_id: string };
+    
+    if (!episode_id) {
+      return json({ error: "episode_id required" }, 400);
+    }
+    
+    const headers = {
+      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+    };
+    
+    // Get transcript
+    const transcriptResponse = await fetch(
+      `${env.SUPABASE_URL}/storage/v1/object/transcripts/${episode_id}/transcript.json`,
+      { headers }
+    );
+    
+    if (!transcriptResponse.ok) {
+      return json({ error: "Transcript not found" }, 404);
+    }
+    
+    const transcript = await transcriptResponse.json() as { text: string };
+    
+    await embedInSuperMemory(episode_id, transcript.text, env);
+    
+    return json({ success: true, episode_id });
+    
+  } catch (error) {
+    console.error("[EmbedContent] Error:", error);
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
   }
 }
 
