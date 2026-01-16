@@ -1169,10 +1169,153 @@ This sub-phase enables proper authentication so multiple users can use Podgest w
 - [ ] Inngest dead-letter handling and alerting
 - [ ] Error notification (email or Slack)
 
-#### 5.4 Observability
-- [ ] Cost tracking dashboard (Modal, ElevenLabs, Claude usage)
-- [ ] End-to-end monitoring
-- [ ] Alerting for failed digests
+#### 5.4 Observability & Tracing
+
+**Problem:** Logs are currently scattered across 6+ dashboards (Cloudflare, Inngest, Modal, Supabase, SuperMemory, ElevenLabs). When something fails, it's hard to trace what happened.
+
+**Solution:** Centralized logging with distributed tracing using natural trace IDs.
+
+##### Recommended Stack
+
+| Component | Purpose | Why |
+|-----------|---------|-----|
+| **Axiom** | Central log aggregation | Free tier, native Cloudflare integration, fast queries |
+| **OpenTelemetry** | Distributed tracing | Industry standard, works with Axiom |
+| **Sentry** | Error tracking | Automatic error capture, Cloudflare integration |
+| **Supabase table** | Cost tracking | Custom `operation_costs` table for per-user billing |
+
+##### Natural Trace IDs
+
+Instead of generating random trace IDs, use the natural identifiers that flow through the system:
+
+| Pipeline | Trace ID | Follows |
+|----------|----------|---------|
+| **Ingestion** | `episode_id` | RSS poll → transcription → topics → embedding |
+| **Digest** | `digest_id` | Trigger → script → TTS → publish |
+| **MCP Query** | `request_id` | Auth → tool call → response |
+
+##### Structured Log Schema
+
+All services should emit logs in this format:
+
+```json
+{
+  "timestamp": "2026-01-16T22:00:00Z",
+  "level": "info|warn|error",
+  "service": "podgest-api|podgest-mcp|modal-transcribe|modal-tts",
+  "trace_id": "episode_id or digest_id",
+  "span": "rss_poll|transcription|topic_extraction|embedding|script_gen|tts",
+  "user_id": "uuid",
+  "event": "started|completed|failed",
+  "duration_ms": 1234,
+  "metadata": { },
+  "cost_usd": 0.05
+}
+```
+
+##### Ingestion Pipeline Tracing
+
+```
+trace_id = episode_id
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Episode Lifecycle (single trace)                                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. rss_poll.episode_found                                                  │
+│     └─ feed_url, episode_guid, title                                        │
+│                                                                             │
+│  2. transcription.started                                                   │
+│     └─ modal_job_id, audio_url, audio_duration_estimate                     │
+│                                                                             │
+│  3. transcription.completed | transcription.failed                          │
+│     └─ word_count, language, processing_time_ms, cost_usd                   │
+│                                                                             │
+│  4. topic_extraction.started                                                │
+│     └─ transcript_length                                                    │
+│                                                                             │
+│  5. topic_extraction.completed                                              │
+│     └─ topics_count, themes_count, claude_tokens_used, cost_usd             │
+│                                                                             │
+│  6. embedding.started                                                       │
+│     └─ chunk_count                                                          │
+│                                                                             │
+│  7. embedding.completed                                                     │
+│     └─ supermemory_doc_id, cost_usd                                         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### Digest Pipeline Tracing
+
+```
+trace_id = digest_id
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Digest Lifecycle (single trace)                                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. digest.triggered                                                        │
+│     └─ user_id, hours_back, eligible_episodes_count                         │
+│                                                                             │
+│  2. script_generation.started                                               │
+│     └─ episode_ids[], target_length_minutes                                 │
+│                                                                             │
+│  3. script_generation.completed                                             │
+│     └─ word_count, topics_covered[], claude_tokens_used, cost_usd           │
+│                                                                             │
+│  4. tts.started                                                             │
+│     └─ modal_job_id, script_length_chars, voice_id                          │
+│                                                                             │
+│  5. tts.completed | tts.failed                                              │
+│     └─ audio_duration_seconds, audio_url, elevenlabs_chars, cost_usd        │
+│                                                                             │
+│  6. digest.published                                                        │
+│     └─ rss_updated, audio_size_bytes                                        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### Cost Tracking Table
+
+```sql
+CREATE TABLE public.operation_costs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES public.profiles(id),
+  trace_id TEXT NOT NULL,           -- episode_id or digest_id
+  service TEXT NOT NULL,            -- modal, elevenlabs, claude, supermemory
+  operation TEXT NOT NULL,          -- transcription, tts, summarization, embedding
+  units_used DECIMAL,               -- seconds, characters, tokens, etc.
+  unit_type TEXT,                   -- gpu_seconds, characters, tokens
+  cost_usd DECIMAL(10, 6),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_costs_user_date ON public.operation_costs(user_id, created_at);
+```
+
+##### Alerting Rules
+
+| Alert | Condition | Channel |
+|-------|-----------|---------|
+| Transcription stuck | No completion webhook > 30 min | Slack/Email |
+| TTS failed | Status = failed | Slack/Email |
+| Digest not generated | User scheduled time passed, no digest | Slack/Email |
+| High cost spike | Daily cost > 2x average | Email |
+| Error rate spike | >5% errors in 1 hour | Slack |
+
+##### Implementation Checklist
+
+- [ ] Set up Axiom account and get API key
+- [ ] Add Axiom integration to Cloudflare Workers
+- [ ] Add structured logging to podgest-api worker
+- [ ] Add structured logging to podgest-mcp worker
+- [ ] Add logging webhook from Modal to Axiom
+- [ ] Create `operation_costs` table in Supabase
+- [ ] Add cost logging to each operation
+- [ ] Set up Sentry for error tracking
+- [ ] Configure alerting rules in Axiom
+- [ ] Create cost dashboard (simple Supabase query or Axiom dashboard)
 
 #### 5.5 Documentation
 - [ ] User onboarding guide
