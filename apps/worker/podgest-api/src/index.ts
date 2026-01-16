@@ -8,7 +8,12 @@ export interface Env {
   INNGEST_SIGNING_KEY: string;
   ANTHROPIC_API_KEY: string;
   SUPERMEMORY_API_KEY: string;
+  ELEVENLABS_API_KEY: string;
 }
+
+// Voice IDs for two-host format
+const VOICE_HOST_1 = "iP95p4xoKVk53GoZ742B"; // Chris - male, conversational
+const VOICE_HOST_2 = "EXAVITQu4vr4xnSDxMaL"; // Sarah - female, professional
 
 // ============================================
 // INNGEST CLIENT & FUNCTIONS
@@ -341,6 +346,11 @@ export default {
     // Manual SuperMemory embedding trigger (for testing)
     if (url.pathname === "/api/embed-content" && request.method === "POST") {
       return handleEmbedContent(request, env);
+    }
+    
+    // Generate digest (for testing)
+    if (url.pathname === "/api/generate-digest" && request.method === "POST") {
+      return handleGenerateDigest(request, env);
     }
 
     return json({ error: "Not found" }, 404);
@@ -820,5 +830,282 @@ async function handleExtractTopics(request: Request, env: Env): Promise<Response
   } catch (error) {
     console.error("[ExtractTopics] Error:", error);
     return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+}
+
+// ============================================
+// DIGEST GENERATION
+// ============================================
+
+interface DigestLine {
+  speaker: "host1" | "host2";
+  text: string;
+}
+
+interface DigestScript {
+  title: string;
+  lines: DigestLine[];
+  topics_covered: string[];
+}
+
+async function handleGenerateDigest(request: Request, env: Env): Promise<Response> {
+  try {
+    const body = await request.json() as { 
+      user_id?: string; 
+      hours_back?: number;
+      max_length_minutes?: number;
+    };
+    
+    const hoursBack = body.hours_back || 24;
+    const maxLengthMinutes = body.max_length_minutes || 30;
+    
+    console.log(`[Digest] Generating digest for last ${hoursBack} hours, max ${maxLengthMinutes} min`);
+    
+    const headers = {
+      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+    };
+    
+    // 1. Fetch recent episodes with their topic extractions
+    const cutoffDate = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
+    
+    const episodesResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/episodes?created_at=gte.${cutoffDate}&select=id,title,description,published_at`,
+      { headers }
+    );
+    
+    if (!episodesResponse.ok) {
+      return json({ error: "Failed to fetch episodes" }, 500);
+    }
+    
+    const episodes = await episodesResponse.json() as Array<{
+      id: string;
+      title: string;
+      description: string;
+      published_at: string;
+    }>;
+    
+    if (!episodes.length) {
+      return json({ error: "No recent episodes found", hours_back: hoursBack }, 404);
+    }
+    
+    console.log(`[Digest] Found ${episodes.length} episodes`);
+    
+    // 2. Get topic extractions for these episodes
+    const episodeIds = episodes.map(e => e.id);
+    const topicsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=in.(${episodeIds.join(",")})&select=episode_id,id`,
+      { headers }
+    );
+    const transcriptions = await topicsResponse.json() as Array<{ episode_id: string; id: string }>;
+    
+    const transcriptionIds = transcriptions.map(t => t.id);
+    const extractionsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/topic_extractions?transcription_id=in.(${transcriptionIds.join(",")})&select=transcription_id,topics`,
+      { headers }
+    );
+    const extractions = await extractionsResponse.json() as Array<{ 
+      transcription_id: string; 
+      topics: TopicExtractionResult;
+    }>;
+    
+    // Map extractions to episodes
+    const transcriptionToEpisode = new Map(transcriptions.map(t => [t.id, t.episode_id]));
+    const episodeTopics = new Map<string, TopicExtractionResult>();
+    for (const ext of extractions) {
+      const episodeId = transcriptionToEpisode.get(ext.transcription_id);
+      if (episodeId) {
+        episodeTopics.set(episodeId, ext.topics);
+      }
+    }
+    
+    // 3. Build context for Claude
+    const episodeSummaries = episodes.map(ep => {
+      const topics = episodeTopics.get(ep.id);
+      return {
+        title: ep.title,
+        summary: topics?.summary || ep.description?.substring(0, 200) || "No summary available",
+        topics: topics?.topics || [],
+        themes: topics?.themes || [],
+        key_points: topics?.key_points || [],
+      };
+    });
+    
+    console.log(`[Digest] Generating script with Claude...`);
+    
+    // 4. Generate script with Claude
+    const script = await generateDigestScript(episodeSummaries, maxLengthMinutes, env.ANTHROPIC_API_KEY);
+    
+    console.log(`[Digest] Script generated: ${script.lines.length} lines`);
+    
+    // 5. Generate audio for each line
+    console.log(`[Digest] Generating audio with ElevenLabs...`);
+    const audioSegments: Array<{ speaker: string; audioBase64: string }> = [];
+    
+    for (let i = 0; i < script.lines.length; i++) {
+      const line = script.lines[i];
+      console.log(`[Digest] Generating line ${i + 1}/${script.lines.length}: ${line.text.substring(0, 50)}...`);
+      
+      const voiceId = line.speaker === "host1" ? VOICE_HOST_1 : VOICE_HOST_2;
+      const audioData = await generateSpeech(line.text, voiceId, env.ELEVENLABS_API_KEY);
+      
+      if (audioData) {
+        audioSegments.push({
+          speaker: line.speaker,
+          audioBase64: audioData,
+        });
+      }
+    }
+    
+    console.log(`[Digest] Generated ${audioSegments.length} audio segments`);
+    
+    // For now, return the script and audio segment info
+    // Full concatenation will be done via Modal
+    return json({
+      success: true,
+      episodes_count: episodes.length,
+      script: {
+        title: script.title,
+        line_count: script.lines.length,
+        topics_covered: script.topics_covered,
+        preview: script.lines.slice(0, 4),
+      },
+      audio: {
+        segments_generated: audioSegments.length,
+        total_characters: script.lines.reduce((sum, l) => sum + l.text.length, 0),
+      },
+    });
+    
+  } catch (error) {
+    console.error("[Digest] Error:", error);
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+}
+
+async function generateDigestScript(
+  episodes: Array<{
+    title: string;
+    summary: string;
+    topics: string[];
+    themes: string[];
+    key_points: string[];
+  }>,
+  maxMinutes: number,
+  apiKey: string
+): Promise<DigestScript> {
+  
+  // ~150 words per minute for natural speech
+  const targetWordCount = maxMinutes * 150;
+  
+  const systemPrompt = `You are a script writer for a professional podcast news digest. 
+You write conversational dialogue between two hosts:
+- Host 1 (Chris): Male, conversational, often introduces topics and asks questions
+- Host 2 (Sarah): Female, professional, provides analysis and insights
+
+Guidelines:
+- Keep it conversational but informative
+- Each host should speak for 1-3 sentences at a time before the other responds
+- Cover the most important stories first
+- Aim for approximately ${targetWordCount} words total (${maxMinutes} minutes)
+- Group related topics together naturally
+- End with a brief sign-off
+
+Return a JSON object with this structure:
+{
+  "title": "Daily Digest - [Date or main theme]",
+  "lines": [
+    {"speaker": "host1", "text": "Welcome to today's digest..."},
+    {"speaker": "host2", "text": "Thanks Chris! We have some great stories..."},
+    ...
+  ],
+  "topics_covered": ["topic1", "topic2", ...]
+}
+
+IMPORTANT: Return ONLY the JSON object, no markdown formatting.`;
+
+  const episodeContext = episodes.map((ep, i) => 
+    `Episode ${i + 1}: "${ep.title}"
+Summary: ${ep.summary}
+Key Points: ${ep.key_points.join("; ")}
+Topics: ${ep.topics.join(", ")}`
+  ).join("\n\n");
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages: [
+        {
+          role: "user",
+          content: `Create a ${maxMinutes}-minute podcast digest script covering these ${episodes.length} episodes:\n\n${episodeContext}`,
+        },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Claude API error: ${response.status} - ${err}`);
+  }
+
+  const data = await response.json() as {
+    content: Array<{ type: string; text: string }>;
+  };
+  
+  const textContent = data.content.find(c => c.type === "text");
+  if (!textContent) {
+    throw new Error("No text content in Claude response");
+  }
+  
+  // Parse JSON, stripping markdown if present
+  let jsonText = textContent.text.trim();
+  if (jsonText.startsWith("```json")) jsonText = jsonText.slice(7);
+  else if (jsonText.startsWith("```")) jsonText = jsonText.slice(3);
+  if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3);
+  jsonText = jsonText.trim();
+  
+  return JSON.parse(jsonText) as DigestScript;
+}
+
+async function generateSpeech(text: string, voiceId: string, apiKey: string): Promise<string | null> {
+  try {
+    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+      method: "POST",
+      headers: {
+        "xi-api-key": apiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        text,
+        model_id: "eleven_turbo_v2_5",
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.75,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      console.error(`[TTS] Error: ${response.status} - ${err}`);
+      return null;
+    }
+
+    // Convert to base64
+    const arrayBuffer = await response.arrayBuffer();
+    const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+    return base64;
+    
+  } catch (error) {
+    console.error("[TTS] Error:", error);
+    return null;
   }
 }
