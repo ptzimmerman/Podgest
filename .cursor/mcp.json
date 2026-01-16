@@ -1,10 +1,10 @@
 {
   "mcpServers": {
     "podgest": {
-      "command": "node",
-      "args": [
-        "/Users/pete/Documents/dev/Podgest/apps/mcp-server/local-proxy/index.js"
-      ]
+      "url": "https://podgest-mcp.pztest.workers.dev/sse",
+      "headers": {
+        "Authorization": "Bearer pk_f6917a9ed48e492cbe323cc6a96429b7"
+      }
     }
   }
 }
