@@ -991,7 +991,25 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
     
     console.log(`[Digest] Generating digest for last ${hoursBack} hours, max ${maxLengthMinutes} min`);
     
-    // 1. Fetch recent episodes with their topic extractions
+    // 1. Get episodes already covered in recent digests (last 7 days) to avoid repeats
+    const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const recentDigestsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests?digest_date=gte.${weekAgo}&select=episodes_included`,
+      { headers }
+    );
+    
+    let alreadyCoveredEpisodes = new Set<string>();
+    if (recentDigestsResponse.ok) {
+      const recentDigests = await recentDigestsResponse.json() as Array<{ episodes_included: string[] }>;
+      for (const digest of recentDigests) {
+        for (const epId of (digest.episodes_included || [])) {
+          alreadyCoveredEpisodes.add(epId);
+        }
+      }
+    }
+    console.log(`[Digest] Found ${alreadyCoveredEpisodes.size} episodes already covered in recent digests`);
+    
+    // 2. Fetch recent episodes with their topic extractions
     const cutoffDate = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
     
     const episodesResponse = await fetch(
@@ -1003,15 +1021,24 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
       return json({ error: "Failed to fetch episodes" }, 500);
     }
     
-    const episodes = await episodesResponse.json() as Array<{
+    let episodes = await episodesResponse.json() as Array<{
       id: string;
       title: string;
       description: string;
       published_at: string;
     }>;
     
+    // Filter out episodes already covered in recent digests
+    const originalCount = episodes.length;
+    episodes = episodes.filter(ep => !alreadyCoveredEpisodes.has(ep.id));
+    console.log(`[Digest] ${originalCount} recent episodes, ${episodes.length} not yet covered`);
+    
     if (!episodes.length) {
-      return json({ error: "No recent episodes found", hours_back: hoursBack }, 404);
+      return json({ 
+        error: "No new episodes to cover - all recent episodes were in previous digests",
+        hours_back: hoursBack,
+        already_covered: originalCount
+      }, 404);
     }
     
     console.log(`[Digest] Found ${episodes.length} episodes`);
@@ -1181,31 +1208,48 @@ async function generateDigestScript(
   // ~150 words per minute for natural speech
   const targetWordCount = maxMinutes * 150;
   
-  const systemPrompt = `You are a professional news broadcaster writing a podcast script.
-Write in a clear, engaging news anchor style - authoritative but approachable.
+  // Get today's date for the intro
+  const today = new Date();
+  const dayOfWeek = today.toLocaleDateString('en-US', { weekday: 'long' });
+  const dateStr = today.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+  
+  const systemPrompt = `You are Alex Chen, an upbeat and energetic podcast host for "Podgest" - a daily news digest show.
+Your style is enthusiastic, warm, and engaging - like a smart friend catching you up on the news over coffee.
 
 CRITICAL: The script MUST be approximately ${targetWordCount} words long (${maxMinutes} minutes at 150 words/minute). 
-This is a hard requirement - do not write less. Expand on stories with more detail, analysis, and context to hit this target.
+This is a hard requirement - expand on stories with detail and analysis to hit this target.
 
-Guidelines:
-- Start with a brief intro ("Good morning, I'm your host for today's digest...")
-- Cover ALL the stories provided - give each one proper attention
-- For each story: provide context, key details, implications, and brief analysis
-- Group related topics together with smooth transitions
-- Use clear, engaging language suitable for audio
-- Include "why this matters" commentary for important stories
-- End with a sign-off summarizing key themes
+STRUCTURE YOUR SCRIPT EXACTLY LIKE THIS:
+
+1. OPENING (warm, energetic):
+   "Hey there! It's ${dayOfWeek}, ${dateStr}, and this is the Podgest Podcast. I'm Alex Chen, and I've got a great lineup for you today. [PAUSE] Here's what's on deck: [brief 2-3 sentence preview of main themes]. Let's get into it! [PAUSE]"
+
+2. MAIN CONTENT - Group stories into 3-5 SECTIONS by theme (e.g., "Markets & Money", "Politics & Policy", "Tech & Innovation", "Culture & Ideas"):
+   - Start each section with a transition: "Alright, let's talk about [SECTION NAME]. [PAUSE]"
+   - Cover each story with: context, key details, why it matters, brief analysis
+   - Be conversational and upbeat - use phrases like "Here's where it gets interesting...", "Now this is fascinating...", "What really caught my attention..."
+   - End each section with: "And that wraps up [SECTION NAME]. [PAUSE]"
+
+3. CLOSING (tie it together):
+   - "Alright, let's zoom out for a second. [PAUSE]"
+   - Draw connections between stories - what themes emerged today?
+   - End with: "That's your Podgest for ${dayOfWeek}. Thanks for hanging out with me today - I'll catch you tomorrow. Until then, stay curious! [PAUSE]"
+
+IMPORTANT FORMATTING:
+- Include [PAUSE] markers where natural breaks should occur (between sections, after transitions)
+- Write in a conversational, slightly upbeat tone - avoid being dry or overly formal
+- Use contractions naturally (I'm, you'll, here's, that's)
+- Vary sentence length for natural rhythm
 
 Return a JSON object with this structure:
 {
-  "title": "Daily Digest - [Date or main theme]",
-  "script": "Good morning, I'm your host... [full script as single string]",
+  "title": "Podgest - ${dateStr}",
+  "script": "Hey there! It's ${dayOfWeek}... [full script with [PAUSE] markers]",
   "topics_covered": ["topic1", "topic2", ...],
   "word_count": 450
 }
 
-IMPORTANT: Return ONLY the JSON object, no markdown formatting.
-The "script" field should be the complete script as a single string with natural paragraph breaks.`;
+IMPORTANT: Return ONLY the JSON object, no markdown formatting.`;
 
   const episodeContext = episodes.map((ep, i) => 
     `Story ${i + 1}: "${ep.title}"
@@ -1393,7 +1437,11 @@ function formatDuration(seconds: number): string {
 
 async function generateSpeech(text: string, voiceId: string, apiKey: string): Promise<string | null> {
   try {
-    console.log(`[TTS] Generating speech for ${text.length} chars with voice ${voiceId}`);
+    // Replace [PAUSE] markers with natural pause indicator
+    // Using "..." creates a natural brief pause in speech synthesis
+    let processedText = text.replace(/\[PAUSE\]/g, '...');
+    
+    console.log(`[TTS] Generating speech for ${processedText.length} chars with voice ${voiceId}`);
     
     const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
       method: "POST",
@@ -1402,11 +1450,13 @@ async function generateSpeech(text: string, voiceId: string, apiKey: string): Pr
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        text,
+        text: processedText,
         model_id: "eleven_turbo_v2_5",
         voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.75,
+          stability: 0.75,        // Higher = more consistent, fewer random pauses
+          similarity_boost: 0.8,  // Slightly higher for more natural voice
+          style: 0.4,             // Add some expressiveness
+          use_speaker_boost: true // Enhance clarity
         },
       }),
     });
