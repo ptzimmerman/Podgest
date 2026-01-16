@@ -15,10 +15,8 @@
 export interface Env {
   SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
+  SUPABASE_ANON_KEY: string;
   SUPERMEMORY_API_KEY: string;
-  // OAuth secrets (for future)
-  // GOOGLE_CLIENT_ID: string;
-  // GOOGLE_CLIENT_SECRET: string;
 }
 
 // MCP Protocol Types
@@ -589,12 +587,71 @@ async function handleMCPRequest(
 }
 
 // ============================================
+// AUTHENTICATION
+// ============================================
+
+interface SupabaseUser {
+  id: string;
+  email: string;
+  user_metadata: {
+    full_name?: string;
+    name?: string;
+  };
+}
+
+async function validateToken(token: string, env: Env): Promise<SupabaseUser | null> {
+  try {
+    const response = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "apikey": env.SUPABASE_ANON_KEY,
+      },
+    });
+
+    if (!response.ok) {
+      console.log(`[Auth] Token validation failed: ${response.status}`);
+      return null;
+    }
+
+    const user = await response.json() as SupabaseUser;
+    console.log(`[Auth] Validated user: ${user.id} (${user.email})`);
+    return user;
+  } catch (error) {
+    console.error("[Auth] Token validation error:", error);
+    return null;
+  }
+}
+
+function extractToken(request: Request): string | null {
+  const authHeader = request.headers.get("Authorization");
+  if (authHeader?.startsWith("Bearer ")) {
+    return authHeader.slice(7);
+  }
+  return null;
+}
+
+// ============================================
 // HTTP HANDLER (SSE for MCP)
 // ============================================
+
+// Fallback user ID for development/testing (remove in production)
+const DEV_USER_ID = "18f513bd-8ecf-4922-84b7-4ab7c7cc14df";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
+    // CORS headers for all responses
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    };
+
+    // Handle CORS preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
 
     // Health check
     if (url.pathname === "/health" || url.pathname === "/") {
@@ -603,15 +660,45 @@ export default {
         service: "podgest-mcp",
         version: "1.0.0",
       }), {
-        headers: { "Content-Type": "application/json" },
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
     // MCP endpoint - supports both SSE and simple POST
     if (url.pathname === "/mcp" || url.pathname === "/sse") {
-      // For now, use a hardcoded user ID for testing
-      // TODO: Implement OAuth flow using Cloudflare's workers-oauth-provider
-      const userId = url.searchParams.get("user_id") || "18f513bd-8ecf-4922-84b7-4ab7c7cc14df";
+      // Authenticate user
+      let userId: string;
+      
+      const token = extractToken(request);
+      if (token) {
+        // Validate JWT token with Supabase
+        const user = await validateToken(token, env);
+        if (!user) {
+          return new Response(JSON.stringify({
+            error: "invalid_token",
+            message: "The provided token is invalid or expired. Please re-authenticate.",
+          }), {
+            status: 401,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+        userId = user.id;
+      } else {
+        // No token - check for dev mode fallback
+        const devMode = url.searchParams.get("dev") === "true";
+        if (devMode) {
+          console.log("[Auth] Dev mode - using fallback user ID");
+          userId = DEV_USER_ID;
+        } else {
+          return new Response(JSON.stringify({
+            error: "auth_required",
+            message: "Authentication required. Please sign in with Google via the local proxy.",
+          }), {
+            status: 401,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+      }
 
       // Handle SSE connection for streaming
       if (request.headers.get("Accept") === "text/event-stream") {
@@ -623,25 +710,14 @@ export default {
         const mcpRequest = await request.json() as MCPRequest;
         const response = await handleMCPRequest(mcpRequest, env, userId);
         return new Response(JSON.stringify(response), {
-          headers: { "Content-Type": "application/json" },
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
       }
 
-      return new Response("Method not allowed", { status: 405 });
+      return new Response("Method not allowed", { status: 405, headers: corsHeaders });
     }
 
-    // OAuth endpoints (placeholder for future)
-    if (url.pathname === "/oauth/authorize") {
-      // TODO: Implement OAuth authorization
-      return new Response("OAuth not yet implemented", { status: 501 });
-    }
-
-    if (url.pathname === "/oauth/callback") {
-      // TODO: Implement OAuth callback
-      return new Response("OAuth not yet implemented", { status: 501 });
-    }
-
-    return new Response("Not found", { status: 404 });
+    return new Response("Not found", { status: 404, headers: corsHeaders });
   },
 };
 

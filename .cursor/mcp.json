@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "podgest": {
+      "command": "node",
+      "args": [
+        "/Users/pete/Documents/dev/Podgest/apps/mcp-server/local-proxy/index.js"
+      ]
+    }
+  }
+}
