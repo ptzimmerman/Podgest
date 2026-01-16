@@ -6,6 +6,8 @@ export interface Env {
   SUPABASE_SERVICE_ROLE_KEY: string;
   INNGEST_EVENT_KEY: string;
   INNGEST_SIGNING_KEY: string;
+  ANTHROPIC_API_KEY: string;
+  SUPERMEMORY_API_KEY: string;
 }
 
 // ============================================
@@ -328,7 +330,12 @@ export default {
 
     // Modal webhook
     if (url.pathname === "/api/webhooks/modal" && request.method === "POST") {
-      return handleModalWebhook(request, env);
+      return handleModalWebhook(request, env, ctx);
+    }
+    
+    // Manual topic extraction trigger (for testing)
+    if (url.pathname === "/api/extract-topics" && request.method === "POST") {
+      return handleExtractTopics(request, env);
     }
 
     return json({ error: "Not found" }, 404);
@@ -346,7 +353,7 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
-async function handleModalWebhook(request: Request, env: Env): Promise<Response> {
+async function handleModalWebhook(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
     const payload = await request.json() as {
       status: string;
@@ -409,6 +416,10 @@ async function handleModalWebhook(request: Request, env: Env): Promise<Response>
       );
 
       console.log(`[Webhook] Transcription completed for episode: ${jobData.episode_id}`);
+      
+      // Trigger topic extraction asynchronously (don't wait)
+      ctx.waitUntil(extractTopicsForEpisode(jobData.episode_id, payload.text, env));
+      
       return json({ success: true, status: "completed" });
     } else {
       // Update as failed
@@ -427,5 +438,227 @@ async function handleModalWebhook(request: Request, env: Env): Promise<Response>
   } catch (error) {
     console.error("[Webhook] Error:", error);
     return json({ error: "Internal error" }, 500);
+  }
+}
+
+// ============================================
+// TOPIC EXTRACTION (Claude)
+// ============================================
+
+interface TopicExtractionResult {
+  topics: string[];
+  themes: string[];
+  summary: string;
+  key_points: string[];
+  sentiment: "positive" | "negative" | "neutral" | "mixed";
+}
+
+async function extractTopicsForEpisode(episodeId: string, transcriptText: string, env: Env): Promise<void> {
+  console.log(`[Topics] Starting extraction for episode: ${episodeId}`);
+  
+  try {
+    const result = await callClaudeForTopics(transcriptText, env.ANTHROPIC_API_KEY);
+    
+    // Get transcription ID
+    const headers = {
+      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+    };
+    
+    const transcriptionResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episodeId}&select=id`,
+      { headers }
+    );
+    const transcriptions = await transcriptionResponse.json() as { id: string }[];
+    
+    if (!transcriptions.length) {
+      console.error(`[Topics] No transcription found for episode: ${episodeId}`);
+      return;
+    }
+    
+    const transcriptionId = transcriptions[0].id;
+    
+    // Insert topic extraction
+    const insertResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/topic_extractions`,
+      {
+        method: "POST",
+        headers: { ...headers, "Prefer": "return=minimal" },
+        body: JSON.stringify({
+          transcription_id: transcriptionId,
+          topics: result,
+        }),
+      }
+    );
+    
+    if (!insertResponse.ok) {
+      const err = await insertResponse.text();
+      console.error(`[Topics] Failed to insert: ${err}`);
+      return;
+    }
+    
+    console.log(`[Topics] Extraction complete for episode: ${episodeId}`);
+    console.log(`[Topics] Found ${result.topics.length} topics, ${result.themes.length} themes`);
+    
+  } catch (error) {
+    console.error(`[Topics] Error for episode ${episodeId}:`, error);
+  }
+}
+
+async function callClaudeForTopics(transcriptText: string, apiKey: string): Promise<TopicExtractionResult> {
+  // Truncate if too long (Claude has ~200k context, but we'll be conservative)
+  const maxChars = 100000;
+  const text = transcriptText.length > maxChars 
+    ? transcriptText.substring(0, maxChars) + "\n\n[Transcript truncated...]"
+    : transcriptText;
+  
+  const systemPrompt = `You are an expert at analyzing podcast transcripts. Extract structured information from the transcript provided.
+
+Return a JSON object with exactly this structure:
+{
+  "topics": ["topic1", "topic2", ...],  // Main topics discussed (5-10 items)
+  "themes": ["theme1", "theme2", ...],  // Broader themes (3-5 items)
+  "summary": "A 2-3 sentence summary of the episode",
+  "key_points": ["point1", "point2", ...],  // Key takeaways (3-7 items)
+  "sentiment": "positive" | "negative" | "neutral" | "mixed"
+}
+
+Be specific with topics (e.g., "Federal Reserve interest rate policy" not just "economics").
+Keep the summary concise but informative.
+IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code fences. Do NOT include any text before or after the JSON.`;
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: `Analyze this podcast transcript and extract topics:\n\n${text}`,
+        },
+      ],
+      system: systemPrompt,
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Claude API error: ${response.status} - ${err}`);
+  }
+
+  const data = await response.json() as {
+    content: Array<{ type: string; text: string }>;
+  };
+  
+  const textContent = data.content.find(c => c.type === "text");
+  if (!textContent) {
+    throw new Error("No text content in Claude response");
+  }
+  
+  // Parse the JSON response - strip markdown code fences if present
+  try {
+    let jsonText = textContent.text.trim();
+    
+    // Remove markdown code fences if present
+    if (jsonText.startsWith("```json")) {
+      jsonText = jsonText.slice(7);
+    } else if (jsonText.startsWith("```")) {
+      jsonText = jsonText.slice(3);
+    }
+    if (jsonText.endsWith("```")) {
+      jsonText = jsonText.slice(0, -3);
+    }
+    jsonText = jsonText.trim();
+    
+    console.log("[Topics] Parsing JSON:", jsonText.substring(0, 200) + "...");
+    return JSON.parse(jsonText) as TopicExtractionResult;
+  } catch (parseError) {
+    console.error("[Topics] Failed to parse Claude response:", textContent.text.substring(0, 500));
+    console.error("[Topics] Parse error:", parseError);
+    // Return a fallback structure
+    return {
+      topics: ["Unable to extract topics"],
+      themes: ["Unknown"],
+      summary: "Topic extraction failed - raw response stored",
+      key_points: [],
+      sentiment: "neutral",
+    };
+  }
+}
+
+async function handleExtractTopics(request: Request, env: Env): Promise<Response> {
+  try {
+    const { episode_id } = await request.json() as { episode_id: string };
+    
+    if (!episode_id) {
+      return json({ error: "episode_id required" }, 400);
+    }
+    
+    const headers = {
+      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+    };
+    
+    // Get transcript from storage
+    const transcriptResponse = await fetch(
+      `${env.SUPABASE_URL}/storage/v1/object/transcripts/${episode_id}/transcript.json`,
+      { headers }
+    );
+    
+    if (!transcriptResponse.ok) {
+      return json({ error: "Transcript not found" }, 404);
+    }
+    
+    const transcript = await transcriptResponse.json() as { text: string };
+    
+    // Extract topics
+    const result = await callClaudeForTopics(transcript.text, env.ANTHROPIC_API_KEY);
+    
+    // Get transcription ID
+    const transcriptionResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episode_id}&select=id`,
+      { headers }
+    );
+    const transcriptions = await transcriptionResponse.json() as { id: string }[];
+    
+    if (!transcriptions.length) {
+      return json({ error: "Transcription record not found" }, 404);
+    }
+    
+    // Insert or update topic extraction
+    const insertResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/topic_extractions`,
+      {
+        method: "POST",
+        headers: { ...headers, "Prefer": "return=representation" },
+        body: JSON.stringify({
+          transcription_id: transcriptions[0].id,
+          topics: result,
+        }),
+      }
+    );
+    
+    if (!insertResponse.ok) {
+      const err = await insertResponse.text();
+      return json({ error: `Failed to save: ${err}` }, 500);
+    }
+    
+    return json({
+      success: true,
+      episode_id,
+      extraction: result,
+    });
+    
+  } catch (error) {
+    console.error("[ExtractTopics] Error:", error);
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
   }
 }
