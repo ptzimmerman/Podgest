@@ -1521,9 +1521,9 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
       <itunes:name>Podgest</itunes:name>
       <itunes:email>podgest@example.com</itunes:email>
     </itunes:owner>
-    <itunes:image href="https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/podcast-cover.png"/>
+    <itunes:image href="https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/cover.png"/>
     <image>
-      <url>https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/podcast-cover.png</url>
+      <url>https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/cover.png</url>
       <title>Podgest Daily Digest</title>
       <link>${feedUrl}</link>
     </image>
