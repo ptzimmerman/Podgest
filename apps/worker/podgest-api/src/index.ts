@@ -1013,7 +1013,7 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
     const cutoffDate = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
     
     const episodesResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/episodes?created_at=gte.${cutoffDate}&select=id,title,description,published_at`,
+      `${env.SUPABASE_URL}/rest/v1/episodes?created_at=gte.${cutoffDate}&select=id,title,description,published_at,feed_url`,
       { headers }
     );
     
@@ -1026,7 +1026,22 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
       title: string;
       description: string;
       published_at: string;
+      feed_url: string;
     }>;
+    
+    // Get podcast names from subscriptions for citation
+    const feedUrls = [...new Set(episodes.map(e => e.feed_url))];
+    const subscriptionsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/subscriptions?feed_url=in.(${feedUrls.map(u => `"${u}"`).join(",")})&select=feed_url,podcast_title`,
+      { headers }
+    );
+    const podcastNames = new Map<string, string>();
+    if (subscriptionsResponse.ok) {
+      const subs = await subscriptionsResponse.json() as Array<{ feed_url: string; podcast_title: string }>;
+      for (const sub of subs) {
+        podcastNames.set(sub.feed_url, sub.podcast_title);
+      }
+    }
     
     // Filter out episodes already covered in recent digests
     const originalCount = episodes.length;
@@ -1071,11 +1086,12 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
       }
     }
     
-    // 3. Build context for Claude
+    // 3. Build context for Claude (including podcast name for citations)
     const episodeSummaries = episodes.map(ep => {
       const topics = episodeTopics.get(ep.id);
       return {
         title: ep.title,
+        podcast_name: podcastNames.get(ep.feed_url) || "Unknown Podcast",
         summary: topics?.summary || ep.description?.substring(0, 200) || "No summary available",
         topics: topics?.topics || [],
         themes: topics?.themes || [],
@@ -1196,6 +1212,7 @@ async function handleGenerateDigest(request: Request, env: Env): Promise<Respons
 async function generateDigestScript(
   episodes: Array<{
     title: string;
+    podcast_name: string;
     summary: string;
     topics: string[];
     themes: string[];
@@ -1227,6 +1244,12 @@ STRUCTURE YOUR SCRIPT EXACTLY LIKE THIS:
 2. MAIN CONTENT - Group stories into 3-5 SECTIONS by theme (e.g., "Markets & Money", "Politics & Policy", "Tech & Innovation", "Culture & Ideas"):
    - Start each section with a transition: "Alright, let's talk about [SECTION NAME]. [PAUSE]"
    - Cover each story with: context, key details, why it matters, brief analysis
+   - CITE YOUR SOURCES naturally like a broadcaster:
+     * "Over on [Podcast Name], they covered..."
+     * "According to a great breakdown on [Podcast Name]..."
+     * "The [Podcast Name] podcast had a fascinating take on this..."
+     * "[Podcast Name] reports that..."
+     * "As discussed on [Podcast Name]..."
    - Be conversational and upbeat - use phrases like "Here's where it gets interesting...", "Now this is fascinating...", "What really caught my attention..."
    - End each section with: "And that wraps up [SECTION NAME]. [PAUSE]"
 
@@ -1253,6 +1276,7 @@ IMPORTANT: Return ONLY the JSON object, no markdown formatting.`;
 
   const episodeContext = episodes.map((ep, i) => 
     `Story ${i + 1}: "${ep.title}"
+Source Podcast: ${ep.podcast_name}
 Summary: ${ep.summary}
 Key Points: ${ep.key_points.join("; ")}
 Topics: ${ep.topics.join(", ")}`
@@ -1438,11 +1462,60 @@ function formatDuration(seconds: number): string {
 async function generateSpeech(text: string, voiceId: string, apiKey: string): Promise<string | null> {
   try {
     // Replace [PAUSE] markers with natural pause indicator
-    // Using "..." creates a natural brief pause in speech synthesis
     let processedText = text.replace(/\[PAUSE\]/g, '...');
     
     console.log(`[TTS] Generating speech for ${processedText.length} chars with voice ${voiceId}`);
     
+    // ElevenLabs works best with chunks under 5000 chars
+    // For longer text, we need to split and concatenate
+    const MAX_CHUNK_SIZE = 4500;
+    
+    if (processedText.length <= MAX_CHUNK_SIZE) {
+      // Short text - single request
+      return await generateSpeechChunk(processedText, voiceId, apiKey);
+    }
+    
+    // Split on paragraph breaks (double newline or section transitions)
+    const sections = processedText.split(/\n\n+/);
+    const chunks: string[] = [];
+    let currentChunk = "";
+    
+    for (const section of sections) {
+      if (currentChunk.length + section.length + 2 > MAX_CHUNK_SIZE) {
+        if (currentChunk) chunks.push(currentChunk.trim());
+        currentChunk = section;
+      } else {
+        currentChunk += (currentChunk ? "\n\n" : "") + section;
+      }
+    }
+    if (currentChunk) chunks.push(currentChunk.trim());
+    
+    console.log(`[TTS] Split into ${chunks.length} chunks`);
+    
+    // Generate audio for each chunk
+    const audioChunks: string[] = [];
+    for (let i = 0; i < chunks.length; i++) {
+      console.log(`[TTS] Processing chunk ${i + 1}/${chunks.length} (${chunks[i].length} chars)`);
+      const chunkAudio = await generateSpeechChunk(chunks[i], voiceId, apiKey);
+      if (!chunkAudio) {
+        console.error(`[TTS] Failed on chunk ${i + 1}`);
+        return null;
+      }
+      audioChunks.push(chunkAudio);
+    }
+    
+    // For now, we'll concatenate the base64 MP3s
+    // This is a simple concatenation that works for MP3s
+    return concatenateBase64Audio(audioChunks);
+    
+  } catch (error) {
+    console.error("[TTS] Exception:", error);
+    return null;
+  }
+}
+
+async function generateSpeechChunk(text: string, voiceId: string, apiKey: string): Promise<string | null> {
+  try {
     const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
       method: "POST",
       headers: {
@@ -1450,13 +1523,11 @@ async function generateSpeech(text: string, voiceId: string, apiKey: string): Pr
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        text: processedText,
+        text: text,
         model_id: "eleven_turbo_v2_5",
         voice_settings: {
-          stability: 0.75,        // Higher = more consistent, fewer random pauses
-          similarity_boost: 0.8,  // Slightly higher for more natural voice
-          style: 0.4,             // Add some expressiveness
-          use_speaker_boost: true // Enhance clarity
+          stability: 0.75,
+          similarity_boost: 0.8,
         },
       }),
     });
@@ -1490,4 +1561,38 @@ async function generateSpeech(text: string, voiceId: string, apiKey: string): Pr
     console.error("[TTS] Exception:", error);
     return null;
   }
+}
+
+// Concatenate multiple base64-encoded MP3 chunks
+function concatenateBase64Audio(chunks: string[]): string {
+  // Decode all chunks to binary
+  const binaryChunks = chunks.map(chunk => {
+    const binary = atob(chunk);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  });
+  
+  // Calculate total length
+  const totalLength = binaryChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  
+  // Concatenate
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of binaryChunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  
+  // Convert back to base64
+  let binary = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < result.length; i += chunkSize) {
+    const chunk = result.slice(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, Array.from(chunk));
+  }
+  
+  return btoa(binary);
 }
