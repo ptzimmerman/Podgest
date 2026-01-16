@@ -983,14 +983,16 @@ podgest/
 - [x] Free Edge TTS endpoint for testing (`test-audio` bucket)
 - [ ] Conversational two-host format (future - requires ElevenLabs enterprise)
 
-### Phase 4: Distribution + MCP
+### Phase 4: Distribution + MCP ✅
 - [x] RSS feed endpoint (`/feed/{userId}`) - Spotify/iTunes compatible
 - [ ] Upload podcast cover art to Supabase Storage
 - [ ] Submit personal feed to Spotify for Podcasters
-- [ ] MCP server implementation (Cloudflare Worker)
-- [ ] SuperMemory query integration in MCP tools
-- [ ] Token authentication flow for MCP
-- [ ] Test with Claude Desktop
+- [x] MCP server implementation (Cloudflare Worker) - `https://podgest-mcp.pztest.workers.dev`
+- [x] SuperMemory query integration in MCP tools (`search_podcasts`, `compare_takes`)
+- [x] Local proxy for Claude Desktop connectivity
+- [x] Cursor project MCP config (`.cursor/mcp.json`)
+- [x] Test with Claude Desktop + Cursor
+- [ ] OAuth authentication flow (currently hardcoded user ID for staging)
 
 ### Phase 5: Resilience & Polish
 - [ ] Deepgram fallback if Modal GPU issues persist
@@ -1036,6 +1038,22 @@ podgest/
 ```
 https://podgest-api.pztest.workers.dev/feed/18f513bd-8ecf-4922-84b7-4ab7c7cc14df
 ```
+
+### MCP Server
+
+**Base URL:** `https://podgest-mcp.pztest.workers.dev`
+
+| Tool | Description |
+|------|-------------|
+| `search_podcasts` | Semantic search across all transcripts (SuperMemory) |
+| `get_episode` | Episode details + signed URL for full transcript |
+| `compare_takes` | Cross-podcast perspectives on a topic |
+| `list_podcasts` | List user's subscriptions |
+| `recent_episodes` | Recent episodes across subscriptions |
+
+**Local Proxy (for Claude Desktop):** `apps/mcp-server/local-proxy/index.js`
+
+**Cursor Config:** `.cursor/mcp.json` (project-specific MCP)
 
 ### Modal Endpoints
 
