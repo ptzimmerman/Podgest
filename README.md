@@ -1366,16 +1366,26 @@ Reduce transcription costs by leveraging existing transcripts before falling bac
 
 **Priority Order:**
 1. **RSS `<podcast:transcript>` tag** — FREE (Podcasting 2.0 standard)
-2. **ListenNotes API** — ~$0.01-0.05/episode (requires API key)
+2. **ListenNotes API** — Transcripts require PRO plan ($99/month)
 3. **Modal transcription** — ~$0.10-0.50/episode (current fallback)
 
+**ListenNotes API Status:**
+- [x] API key obtained (FREE tier: 300 requests/month)
+- [x] Secret added to Cloudflare Worker
+- FREE tier includes: search, episode metadata, audio URLs
+- PRO tier required for: `transcript` field, `rss` field, `listen_score`
+
+**Current Transcript Flow:**
+1. Check RSS `<podcast:transcript>` tag (free, but rare adoption)
+2. Fall back to Modal transcription
+
 **Implementation:**
-- [ ] Request ListenNotes API key (in progress)
-- [ ] Add ListenNotes transcript fetching to ingestion pipeline
-- [ ] Update flow: RSS transcript → ListenNotes API → Modal fallback
+- [x] Request ListenNotes API key
+- [ ] Add ListenNotes search to MCP (enhance episode discovery)
+- [ ] Consider PRO upgrade if transcript savings > $99/month
 - [ ] Log which source provided each transcript for cost tracking
 
-**Potential Savings:** 50-80% reduction in transcription costs for popular podcasts
+**Note:** ListenNotes FREE tier is useful for search/discovery, but transcripts need PRO.
 
 #### 6.2 MCP Enhancements (Completed)
 - [x] iOS deep links for Spotify/Apple Podcasts (open apps directly, no browser)
