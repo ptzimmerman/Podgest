@@ -36,6 +36,226 @@ function extractOriginalPodcastName(description: string): string | null {
   return null;
 }
 
+// Extract original podcast RSS URL from ListenNotes description
+// Format: <strong>Podcast</strong>: <a href="https://www.listennotes.com/podcasts/...">
+function extractOriginalPodcastUrl(description: string): string | null {
+  const match = description.match(/<strong>Podcast<\/strong>:\s*<a\s+href="([^"]+)"/i);
+  if (match) {
+    return match[1];
+  }
+  return null;
+}
+
+// Extract original episode URL from ListenNotes description
+// Format: <strong>Episode</strong>: <a href="https://www.listennotes.com/e/EPISODE_ID/">
+function extractOriginalEpisodeId(description: string): string | null {
+  const match = description.match(/<strong>Episode<\/strong>:\s*<a\s+href="https:\/\/www\.listennotes\.com\/e\/([^\/]+)\//i);
+  if (match) {
+    return match[1];
+  }
+  return null;
+}
+
+// Fetch original RSS feed URL from a ListenNotes podcast page
+async function fetchOriginalRssUrl(listenNotesPodcastUrl: string): Promise<string | null> {
+  try {
+    // ListenNotes podcast pages have RSS feed links
+    // We need to scrape the page or use their pattern
+    // The RSS link is usually in the page source
+    const response = await fetch(listenNotesPodcastUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+      },
+    });
+    
+    if (!response.ok) return null;
+    
+    const html = await response.text();
+    
+    // Look for RSS feed link patterns
+    // ListenNotes pages often have: <a href="https://feeds.simplecast.com/..." ... >RSS</a>
+    const rssMatch = html.match(/href="(https:\/\/feeds\.[^"]+)"/i) ||
+                     html.match(/href="(https:\/\/[^"]+\/feed[^"]*\.xml)"/i) ||
+                     html.match(/href="(https:\/\/[^"]+\/rss[^"]*)"/i);
+    
+    if (rssMatch) {
+      return rssMatch[1];
+    }
+    
+    return null;
+  } catch (error) {
+    console.error(`[Transcript] Failed to fetch original RSS URL:`, error);
+    return null;
+  }
+}
+
+// Check for podcast:transcript in RSS feed and return transcript URL if found
+interface TranscriptInfo {
+  url: string;
+  type: string; // text/plain, text/html, application/json, text/vtt, application/srt
+}
+
+async function findTranscriptInRss(
+  rssUrl: string,
+  episodeGuid: string,
+  episodeTitle: string
+): Promise<TranscriptInfo | null> {
+  try {
+    console.log(`[Transcript] Checking RSS for transcript: ${rssUrl}`);
+    
+    const response = await fetch(rssUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+      },
+    });
+    
+    if (!response.ok) {
+      console.log(`[Transcript] RSS fetch failed: ${response.status}`);
+      return null;
+    }
+    
+    const xml = await response.text();
+    
+    // Find the episode by matching GUID or title
+    // Episodes are in <item> tags
+    const items = xml.split(/<item[^>]*>/i).slice(1);
+    
+    for (const item of items) {
+      // Check if this is the right episode
+      const guidMatch = item.match(/<guid[^>]*>([^<]+)<\/guid>/i);
+      const titleMatch = item.match(/<title>([^<]+)<\/title>/i) ||
+                         item.match(/<itunes:title>([^<]+)<\/itunes:title>/i);
+      
+      const itemGuid = guidMatch?.[1]?.trim();
+      const itemTitle = titleMatch?.[1]?.trim();
+      
+      // Match by GUID (preferred) or by title similarity
+      const guidMatches = itemGuid && (
+        itemGuid === episodeGuid ||
+        itemGuid.includes(episodeGuid) ||
+        episodeGuid.includes(itemGuid)
+      );
+      
+      const titleMatches = itemTitle && (
+        itemTitle.toLowerCase().includes(episodeTitle.toLowerCase().substring(0, 30)) ||
+        episodeTitle.toLowerCase().includes(itemTitle.toLowerCase().substring(0, 30))
+      );
+      
+      if (guidMatches || titleMatches) {
+        // Found the episode! Check for transcript
+        // Podcasting 2.0 format: <podcast:transcript url="..." type="..."/>
+        const transcriptMatch = item.match(
+          /<podcast:transcript[^>]+url="([^"]+)"[^>]*type="([^"]+)"/i
+        ) || item.match(
+          /<podcast:transcript[^>]+type="([^"]+)"[^>]*url="([^"]+)"/i
+        );
+        
+        if (transcriptMatch) {
+          // Handle both attribute orderings
+          const url = transcriptMatch[1].startsWith('http') ? transcriptMatch[1] : transcriptMatch[2];
+          const type = transcriptMatch[1].startsWith('http') ? transcriptMatch[2] : transcriptMatch[1];
+          
+          console.log(`[Transcript] Found transcript: ${url} (${type})`);
+          return { url, type };
+        }
+        
+        // Also check for alternative transcript formats
+        const altTranscriptMatch = item.match(/<transcript[^>]+url="([^"]+)"/i);
+        if (altTranscriptMatch) {
+          console.log(`[Transcript] Found alt transcript: ${altTranscriptMatch[1]}`);
+          return { url: altTranscriptMatch[1], type: "text/plain" };
+        }
+        
+        console.log(`[Transcript] Episode found but no transcript tag`);
+        return null;
+      }
+    }
+    
+    console.log(`[Transcript] Episode not found in RSS`);
+    return null;
+  } catch (error) {
+    console.error(`[Transcript] Error checking RSS:`, error);
+    return null;
+  }
+}
+
+// Download and parse transcript from URL
+async function downloadTranscript(transcriptInfo: TranscriptInfo): Promise<string | null> {
+  try {
+    console.log(`[Transcript] Downloading: ${transcriptInfo.url}`);
+    
+    const response = await fetch(transcriptInfo.url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+      },
+    });
+    
+    if (!response.ok) {
+      console.error(`[Transcript] Download failed: ${response.status}`);
+      return null;
+    }
+    
+    const content = await response.text();
+    
+    // Parse based on type
+    switch (transcriptInfo.type) {
+      case "text/plain":
+        return content;
+        
+      case "text/html":
+        // Strip HTML tags
+        return content.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+        
+      case "application/json":
+        // Try to extract text from JSON (various formats)
+        try {
+          const json = JSON.parse(content);
+          // Common formats: { text: "..." }, { transcript: "..." }, { segments: [...] }
+          if (typeof json.text === "string") return json.text;
+          if (typeof json.transcript === "string") return json.transcript;
+          if (Array.isArray(json.segments)) {
+            return json.segments.map((s: { text?: string }) => s.text || "").join(" ");
+          }
+          if (Array.isArray(json)) {
+            return json.map((s: { text?: string }) => s.text || "").join(" ");
+          }
+        } catch {
+          return content;
+        }
+        return null;
+        
+      case "text/vtt":
+      case "application/x-subrip":
+      case "application/srt":
+        // Parse VTT/SRT - extract just the text lines
+        const lines = content.split("\n");
+        const textLines: string[] = [];
+        for (const line of lines) {
+          // Skip timestamps, cue identifiers, WEBVTT header
+          if (line.match(/^\d+$/) ||                    // Cue number
+              line.match(/-->/) ||                      // Timestamp
+              line.match(/^WEBVTT/i) ||                // VTT header
+              line.match(/^NOTE/i) ||                  // VTT comment
+              line.trim() === "") {
+            continue;
+          }
+          textLines.push(line.trim());
+        }
+        return textLines.join(" ");
+        
+      default:
+        // Try as plain text
+        return content;
+    }
+  } catch (error) {
+    console.error(`[Transcript] Download error:`, error);
+    return null;
+  }
+}
+
+// Cache for original RSS URLs (podcast URL -> RSS URL)
+const rssUrlCache = new Map<string, string | null>();
+
 // ============================================
 // INNGEST CLIENT & FUNCTIONS
 // ============================================
@@ -48,11 +268,19 @@ const inngest = new Inngest({
 const pollSubscriptions = inngest.createFunction(
   { id: "poll-subscriptions" },
   { cron: "*/15 * * * *" },
-  async ({ step }) => {
-    // This function is triggered by cron, but the actual work
-    // happens via HTTP call to our /api/poll endpoint
-    // (Inngest functions in Workers can't access env directly in the function body)
-    return { message: "Use /api/poll endpoint to trigger polling" };
+  async ({ step, logger }) => {
+    logger.info("RSS poll triggered - calling endpoint");
+    
+    const result = await step.run("poll-rss-feeds", async () => {
+      const response = await fetch(
+        "https://podgest-api.pztest.workers.dev/api/poll",
+        { method: "POST", headers: { "Content-Type": "application/json" } }
+      );
+      return response.json();
+    });
+    
+    logger.info(`RSS poll result: ${JSON.stringify(result)}`);
+    return result;
   }
 );
 
@@ -279,46 +507,132 @@ async function pollAllSubscriptions(env: Env): Promise<{
         newEpisodesTotal++;
         console.log(`[Poll] Inserted episode: ${episode.title}`);
 
-        // Create transcription record
-        await fetch(
-          `${env.SUPABASE_URL}/rest/v1/transcriptions`,
-          {
-            method: "POST",
-            headers,
-            body: JSON.stringify({
-              episode_id: insertedEpisode.id,
-              status: "processing",
-            }),
-          }
-        );
-
-        // Trigger Modal transcription
+        // Try to find existing transcript from original podcast RSS first
+        let transcriptFound = false;
+        
         try {
-          const modalResponse = await fetch(
-            "https://ptzimmerman--podgest-transcribe-transcribe-web.modal.run",
+          // Extract original podcast URL from ListenNotes description
+          const podcastUrl = extractOriginalPodcastUrl(episode.description || "");
+          
+          if (podcastUrl) {
+            // Check cache first, then fetch RSS URL
+            let originalRssUrl = rssUrlCache.get(podcastUrl);
+            if (originalRssUrl === undefined) {
+              originalRssUrl = await fetchOriginalRssUrl(podcastUrl);
+              rssUrlCache.set(podcastUrl, originalRssUrl);
+            }
+            
+            if (originalRssUrl) {
+              // Check for transcript in original RSS
+              const transcriptInfo = await findTranscriptInRss(
+                originalRssUrl,
+                episode.guid,
+                episode.title
+              );
+              
+              if (transcriptInfo) {
+                // Download the transcript
+                const transcriptText = await downloadTranscript(transcriptInfo);
+                
+                if (transcriptText && transcriptText.length > 100) {
+                  console.log(`[Poll] Found existing transcript for: ${episode.title} (${transcriptText.length} chars)`);
+                  
+                  // Save transcript to storage
+                  const transcriptPath = `${insertedEpisode.id}/transcript.json`;
+                  const transcriptData = JSON.stringify({ text: transcriptText });
+                  
+                  await fetch(
+                    `${env.SUPABASE_URL}/storage/v1/object/transcripts/${transcriptPath}`,
+                    {
+                      method: "POST",
+                      headers: {
+                        ...headers,
+                        "Content-Type": "application/json",
+                      },
+                      body: transcriptData,
+                    }
+                  );
+                  
+                  // Create completed transcription record
+                  await fetch(
+                    `${env.SUPABASE_URL}/rest/v1/transcriptions`,
+                    {
+                      method: "POST",
+                      headers,
+                      body: JSON.stringify({
+                        episode_id: insertedEpisode.id,
+                        status: "completed",
+                        transcript_storage_path: transcriptPath,
+                        word_count: transcriptText.split(/\s+/).length,
+                        completed_at: new Date().toISOString(),
+                      }),
+                    }
+                  );
+                  
+                  transcriptFound = true;
+                  transcriptionsTriggered++;
+                  console.log(`[Poll] ✅ Used existing transcript (saved Modal cost!): ${episode.title}`);
+                  
+                  // Trigger topic extraction and SuperMemory embedding
+                  // (normally done by Modal webhook, but we need to do it here)
+                  try {
+                    await extractTopicsForEpisode(insertedEpisode.id, transcriptText, env);
+                    await embedInSuperMemory(insertedEpisode.id, transcriptText, env);
+                    console.log(`[Poll] Extracted topics and embedded for: ${episode.title}`);
+                  } catch (processingError) {
+                    console.error(`[Poll] Post-processing error:`, processingError);
+                  }
+                }
+              }
+            }
+          }
+        } catch (transcriptError) {
+          console.log(`[Poll] Transcript lookup failed, will use Modal: ${transcriptError}`);
+        }
+        
+        // Fall back to Modal if no existing transcript found
+        if (!transcriptFound) {
+          // Create transcription record
+          await fetch(
+            `${env.SUPABASE_URL}/rest/v1/transcriptions`,
             {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers,
               body: JSON.stringify({
-                audio_url: episode.audio_url,
-                webhook_url: "https://podgest-api.pztest.workers.dev/api/webhooks/modal",
-                job_id: JSON.stringify({
-                  episode_id: insertedEpisode.id,
-                  transcription_id: insertedEpisode.id, // Will be updated
-                }),
+                episode_id: insertedEpisode.id,
+                status: "processing",
               }),
             }
           );
 
-          if (modalResponse.ok) {
-            transcriptionsTriggered++;
-            console.log(`[Poll] Triggered transcription for: ${episode.title}`);
-          } else {
-            console.error(`[Poll] Modal trigger failed: ${modalResponse.status}`);
+          // Trigger Modal transcription
+          try {
+            const modalResponse = await fetch(
+              "https://ptzimmerman--podgest-transcribe-transcribe-web.modal.run",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  audio_url: episode.audio_url,
+                  webhook_url: "https://podgest-api.pztest.workers.dev/api/webhooks/modal",
+                  job_id: JSON.stringify({
+                    episode_id: insertedEpisode.id,
+                    transcription_id: insertedEpisode.id, // Will be updated
+                  }),
+                }),
+              }
+            );
+
+            if (modalResponse.ok) {
+              transcriptionsTriggered++;
+              console.log(`[Poll] Triggered Modal transcription for: ${episode.title}`);
+            } else {
+              console.error(`[Poll] Modal trigger failed: ${modalResponse.status}`);
+            }
+          } catch (modalError) {
+            console.error(`[Poll] Modal error:`, modalError);
+            errors.push(`Modal error for ${episode.title}: ${modalError}`);
           }
-        } catch (modalError) {
-          console.error(`[Poll] Modal error:`, modalError);
-          errors.push(`Modal error for ${episode.title}: ${modalError}`);
         }
       }
     } catch (subError) {
@@ -409,6 +723,12 @@ export default {
     if (url.pathname.startsWith("/feed/") && request.method === "GET") {
       const userId = url.pathname.replace("/feed/", "").replace(".xml", "");
       return handleRSSFeed(userId, env);
+    }
+    
+    // Re-embed all transcriptions in SuperMemory (admin endpoint)
+    // Use ?offset=N&limit=M to paginate
+    if (url.pathname === "/api/reembed-all" && request.method === "POST") {
+      return handleReembedAll(env, request);
     }
 
     return json({ error: "Not found" }, 404);
@@ -749,9 +1069,9 @@ async function embedInSuperMemory(episodeId: string, transcriptText: string, env
       "Content-Type": "application/json",
     };
     
-    // Get episode metadata
+    // Get episode metadata (including description for original podcast name extraction)
     const episodeResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episodeId}&select=id,title,published_at,feed_url`,
+      `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episodeId}&select=id,title,published_at,feed_url,description`,
       { headers }
     );
     
@@ -765,6 +1085,7 @@ async function embedInSuperMemory(episodeId: string, transcriptText: string, env
       title: string;
       published_at: string;
       feed_url: string;
+      description?: string;
     }>;
     
     if (!episodes.length) {
@@ -782,7 +1103,11 @@ async function embedInSuperMemory(episodeId: string, transcriptText: string, env
     const subs = await subResponse.json() as Array<{ user_id: string; podcast_title: string }>;
     
     const userId = subs[0]?.user_id || "unknown";
-    const podcastTitle = subs[0]?.podcast_title || "Unknown Podcast";
+    
+    // Extract original podcast name from description (for ListenNotes aggregated feeds)
+    const originalPodcastName = extractOriginalPodcastName(episode.description || "");
+    const podcastTitle = originalPodcastName || subs[0]?.podcast_title || "Unknown Podcast";
+    console.log(`[SuperMemory] Using podcast title: ${podcastTitle} (original: ${originalPodcastName}, fallback: ${subs[0]?.podcast_title})`);
     
     // Get transcription ID first
     const transcriptionResponse = await fetch(
@@ -883,6 +1208,124 @@ async function handleEmbedContent(request: Request, env: Env): Promise<Response>
     
   } catch (error) {
     console.error("[EmbedContent] Error:", error);
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+}
+
+async function handleReembedAll(env: Env, request?: Request): Promise<Response> {
+  // Parse offset from query string if request provided
+  let offset = 0;
+  let limit = 6; // Process 6 at a time to stay under subrequest limit
+  
+  if (request) {
+    const url = new URL(request.url);
+    offset = parseInt(url.searchParams.get("offset") || "0");
+    limit = parseInt(url.searchParams.get("limit") || "6");
+  }
+  
+  console.log(`[ReembedAll] Starting re-embedding with offset=${offset}, limit=${limit}`);
+  
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  
+  try {
+    // Get completed transcriptions with pagination
+    const transcriptionsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/transcriptions?status=eq.completed&select=id,episode_id,supermemory_doc_id,transcript_storage_path&order=id&offset=${offset}&limit=${limit}`,
+      { headers }
+    );
+    
+    if (!transcriptionsResponse.ok) {
+      return json({ error: "Failed to fetch transcriptions" }, 500);
+    }
+    
+    const transcriptions = await transcriptionsResponse.json() as Array<{
+      id: string;
+      episode_id: string;
+      supermemory_doc_id: string | null;
+      transcript_storage_path: string;
+    }>;
+    
+    console.log(`[ReembedAll] Found ${transcriptions.length} transcriptions to re-embed`);
+    
+    const results: Array<{ episode_id: string; status: string; error?: string }> = [];
+    
+    for (const t of transcriptions) {
+      try {
+        // Delete old SuperMemory doc if exists
+        if (t.supermemory_doc_id) {
+          console.log(`[ReembedAll] Deleting old doc ${t.supermemory_doc_id} for episode ${t.episode_id}`);
+          const deleteResponse = await fetch(
+            `https://api.supermemory.ai/v3/documents/${t.supermemory_doc_id}`,
+            {
+              method: "DELETE",
+              headers: {
+                "Authorization": `Bearer ${env.SUPERMEMORY_API_KEY}`,
+              },
+            }
+          );
+          
+          if (!deleteResponse.ok) {
+            console.warn(`[ReembedAll] Failed to delete old doc: ${deleteResponse.status}`);
+          }
+        }
+        
+        // Download transcript from storage
+        const transcriptUrl = `${env.SUPABASE_URL}/storage/v1/object/transcripts/${t.transcript_storage_path}`;
+        const transcriptResponse = await fetch(transcriptUrl, {
+          headers: {
+            "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          },
+        });
+        
+        if (!transcriptResponse.ok) {
+          results.push({ episode_id: t.episode_id, status: "error", error: "Transcript not found" });
+          continue;
+        }
+        
+        const transcript = await transcriptResponse.json() as { text: string };
+        
+        // Re-embed with correct metadata
+        await embedInSuperMemory(t.episode_id, transcript.text, env);
+        
+        results.push({ episode_id: t.episode_id, status: "success" });
+        console.log(`[ReembedAll] Re-embedded episode ${t.episode_id}`);
+        
+        // Small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+      } catch (error) {
+        results.push({ 
+          episode_id: t.episode_id, 
+          status: "error", 
+          error: error instanceof Error ? error.message : String(error) 
+        });
+      }
+    }
+    
+    const successful = results.filter(r => r.status === "success").length;
+    const failed = results.filter(r => r.status === "error").length;
+    
+    console.log(`[ReembedAll] Complete: ${successful} successful, ${failed} failed`);
+    
+    const hasMore = transcriptions.length === limit;
+    const nextOffset = hasMore ? offset + limit : null;
+    
+    return json({
+      batch_size: transcriptions.length,
+      offset,
+      successful,
+      failed,
+      next_offset: nextOffset,
+      results,
+    });
+    
+  } catch (error) {
+    console.error("[ReembedAll] Error:", error);
     return json({ error: error instanceof Error ? error.message : String(error) }, 500);
   }
 }
