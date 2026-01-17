@@ -730,6 +730,11 @@ export default {
     if (url.pathname === "/api/reembed-all" && request.method === "POST") {
       return handleReembedAll(env, request);
     }
+    
+    // Admin endpoint to update user profile settings
+    if (url.pathname === "/api/admin/update-profile" && request.method === "POST") {
+      return handleUpdateProfile(request, env);
+    }
 
     return json({ error: "Not found" }, 404);
   },
@@ -1208,6 +1213,57 @@ async function handleEmbedContent(request: Request, env: Env): Promise<Response>
     
   } catch (error) {
     console.error("[EmbedContent] Error:", error);
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+}
+
+// Admin endpoint to update user profile settings (timezone, digest_time)
+async function handleUpdateProfile(request: Request, env: Env): Promise<Response> {
+  try {
+    const body = await request.json() as {
+      user_id: string;
+      timezone?: string;
+      digest_time?: string;
+      digest_length_minutes?: number;
+    };
+    
+    if (!body.user_id) {
+      return json({ error: "user_id required" }, 400);
+    }
+    
+    const updates: Record<string, unknown> = {};
+    if (body.timezone) updates.timezone = body.timezone;
+    if (body.digest_time) updates.digest_time = body.digest_time;
+    if (body.digest_length_minutes) updates.digest_length_minutes = body.digest_length_minutes;
+    
+    if (Object.keys(updates).length === 0) {
+      return json({ error: "No updates provided" }, 400);
+    }
+    
+    const response = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${body.user_id}`,
+      {
+        method: "PATCH",
+        headers: {
+          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          "Content-Type": "application/json",
+          "Prefer": "return=representation",
+        },
+        body: JSON.stringify(updates),
+      }
+    );
+    
+    if (!response.ok) {
+      const error = await response.text();
+      return json({ error: "Failed to update profile", details: error }, 500);
+    }
+    
+    const updated = await response.json();
+    return json({ success: true, profile: updated });
+    
+  } catch (error) {
+    console.error("[UpdateProfile] Error:", error);
     return json({ error: error instanceof Error ? error.message : String(error) }, 500);
   }
 }
