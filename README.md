@@ -1361,31 +1361,24 @@ CREATE INDEX idx_costs_user_date ON public.operation_costs(user_id, created_at);
 
 ### Phase 6: Future Enhancements
 
-#### 6.1 Cost Optimization: Transcript-First Strategy
-Reduce transcription costs by leveraging existing transcripts before falling back to Modal.
+#### 6.1 Transcription Strategy
+Modal-based transcription is the primary (and only) transcription method.
 
-**Priority Order:**
-1. **RSS `<podcast:transcript>` tag** — FREE (Podcasting 2.0 standard)
-2. **ListenNotes API** — Transcripts require PRO plan ($99/month)
-3. **Modal transcription** — ~$0.10-0.50/episode (current fallback)
+**Cost:** ~$0.05-0.15/episode (GPU time on Modal A10G)
 
-**ListenNotes API Status:**
-- [x] API key obtained (FREE tier: 300 requests/month)
-- [x] Secret added to Cloudflare Worker
-- FREE tier includes: search, episode metadata, audio URLs
-- PRO tier required for: `transcript` field, `rss` field, `listen_score`
+**Why not ListenNotes?**
+- PRO tier costs $200/month just for transcript access
+- Not cost-effective for personal use (<100 episodes/month)
+- Modal is pay-per-use with no monthly commitment
 
-**Current Transcript Flow:**
-1. Check RSS `<podcast:transcript>` tag (free, but rare adoption)
-2. Fall back to Modal transcription
+**Optional Future Optimization:**
+- Check RSS `<podcast:transcript>` tag first (Podcasting 2.0 standard, ~5% adoption)
+- Only fall back to Modal if no transcript in RSS
 
-**Implementation:**
-- [x] Request ListenNotes API key
-- [ ] Add ListenNotes search to MCP (enhance episode discovery)
-- [ ] Consider PRO upgrade if transcript savings > $99/month
-- [ ] Log which source provided each transcript for cost tracking
-
-**Note:** ListenNotes FREE tier is useful for search/discovery, but transcripts need PRO.
+**ListenNotes FREE tier** (300 req/month) available for:
+- Episode search/discovery (enhance MCP)
+- Podcast metadata enrichment
+- Not used for transcripts
 
 #### 6.2 MCP Enhancements (Completed)
 - [x] iOS deep links for Spotify/Apple Podcasts (open apps directly, no browser)
