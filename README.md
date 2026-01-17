@@ -2,7 +2,7 @@
 
 > **Daily podcast digest + AI-powered Q&A for podcast content**
 
-Transform hours of daily podcasts into a 5-minute professional news recap, and query all your podcast knowledge via Claude Desktop.
+Transform hours of daily podcasts into a 5-minute professional news recap, and query all your podcast knowledge via Claude or ChatGPT (desktop & mobile).
 
 ---
 
@@ -43,8 +43,9 @@ You subscribe to many podcasts but don't have time to listen to them all. Hours 
 | **Daily Digest** | 5-min professional news recap via ElevenLabs (expandable later) |
 | **Smart Citations** | Host cites original source podcasts naturally |
 | **Spotify Distribution** | Listen in your existing podcast app |
-| **MCP Q&A** | Ask questions about any podcast content via Claude Desktop |
+| **MCP Q&A** | Ask questions about any podcast content via Claude or ChatGPT |
 | **Multi-tenant** | Supports multiple users with isolated data |
+| **Cross-Platform** | Works on desktop and mobile (Claude, ChatGPT, Cursor) |
 
 ---
 
@@ -285,9 +286,21 @@ https://podgest.yourdomain.com/feed/a8f3b2c9-7d4e-4f1a-9b2c-8e5f3a1d7c6b
 | Component | Technology | Purpose |
 |-----------|------------|---------|
 | **Runtime** | Cloudflare Workers | Edge-deployed MCP server |
-| **Protocol** | MCP over SSE | Claude Desktop connection |
+| **Protocol** | MCP over HTTP/SSE | Universal client support |
 | **Memory Backend** | SuperMemory API | Semantic search across transcripts |
-| **Auth** | Supabase JWT validation | User isolation |
+| **Auth** | OAuth 2.1 + Google | User isolation via Supabase |
+
+### Supported Clients
+
+| Client | Platform | Setup Method |
+|--------|----------|--------------|
+| **Claude Desktop** | macOS, Windows | `mcp-remote` in config file |
+| **Claude Mobile** | iOS, Android | MCP settings in claude.ai account |
+| **ChatGPT Desktop** | macOS, Windows | Add connector in Developer Mode |
+| **ChatGPT Mobile** | iOS, Android | MCP settings in chatgpt.com account |
+| **Cursor** | macOS, Windows, Linux | `.cursor/mcp.json` in project |
+
+**Note:** Mobile apps require configuring MCP servers through the web browser in your account settings (claude.ai or chatgpt.com), then the servers sync to the mobile app.
 
 ### 2.2 MCP Tools
 
@@ -1017,6 +1030,7 @@ podgest/
 - [x] Test with Claude Desktop + Cursor
 - [x] OAuth authentication flow (see Phase 4.1 below)
 - [x] One-time auth CLI for API key generation
+- [x] ChatGPT support (desktop + mobile via OAuth 2.1 discovery)
 
 ### Phase 4.1: OAuth Authentication (Multi-User Support) ✅
 
