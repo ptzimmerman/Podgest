@@ -6,7 +6,14 @@
   "compatibility_flags": ["nodejs_compat"],
   
   // Environment variables (set via wrangler secret)
-  // SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPERMEMORY_API_KEY
+  // SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPERMEMORY_API_KEY, SUPABASE_ANON_KEY
+  
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "8dba0fed9c8544f8b6cbc93846695d8c"
+    }
+  ],
   
   "observability": {
     "enabled": true

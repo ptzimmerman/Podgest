@@ -347,6 +347,28 @@ https://podgest.yourdomain.com/feed/a8f3b2c9-7d4e-4f1a-9b2c-8e5f3a1d7c6b
     ]
   }
 }
+
+// Tool 4: Get links to listen to full episode
+{
+  name: "listen_to_episode",
+  description: "Get iOS app deep links + web fallbacks to listen to episode",
+  parameters: {
+    episode_id: "string"
+  },
+  returns: {
+    episode_id: "abc123",
+    podcast_name: "Acquired",
+    title: "NVIDIA Part III",
+    links: {
+      audio_url: "https://...",           // Direct MP3 playback
+      spotify_app: "spotify:search:...",  // Opens Spotify app directly (iOS)
+      apple_app: "podcasts://search?...", // Opens Apple Podcasts app (iOS)
+      spotify_web: "https://open.spotify.com/search/...",  // Web fallback
+      apple_web: "https://podcasts.apple.com/search?...",  // Web fallback
+      listennotes_url: "https://..."      // ListenNotes page (optional)
+    }
+  }
+}
 ```
 
 ### 2.3 Authentication Flow (Browser-Based OAuth)
@@ -390,6 +412,7 @@ MCP supports OAuth 2.0 — **no token copy/paste needed**:
 | `search_podcasts` | SuperMemory chunks (excerpts) | ~500 words each | <1s |
 | `get_episode` | Metadata + summary + signed URL | Small | <1s |
 | `compare_takes` | Summarized perspectives | Small | <2s |
+| `listen_to_episode` | iOS deep links + web URLs | Small | <1s |
 
 **Full transcripts are NOT returned through MCP.** Instead:
 
@@ -1322,6 +1345,37 @@ CREATE INDEX idx_costs_user_date ON public.operation_costs(user_id, created_at);
 - [ ] Adding new podcast subscriptions
 - [ ] Troubleshooting guide
 
+### Phase 6: Future Enhancements
+
+#### 6.1 Cost Optimization: Transcript-First Strategy
+Reduce transcription costs by leveraging existing transcripts before falling back to Modal.
+
+**Priority Order:**
+1. **RSS `<podcast:transcript>` tag** — FREE (Podcasting 2.0 standard)
+2. **ListenNotes API** — ~$0.01-0.05/episode (requires API key)
+3. **Modal transcription** — ~$0.10-0.50/episode (current fallback)
+
+**Implementation:**
+- [ ] Request ListenNotes API key (in progress)
+- [ ] Add ListenNotes transcript fetching to ingestion pipeline
+- [ ] Update flow: RSS transcript → ListenNotes API → Modal fallback
+- [ ] Log which source provided each transcript for cost tracking
+
+**Potential Savings:** 50-80% reduction in transcription costs for popular podcasts
+
+#### 6.2 MCP Enhancements (Completed)
+- [x] iOS deep links for Spotify/Apple Podcasts (open apps directly, no browser)
+- [x] Accurate podcast name extraction from ListenNotes aggregated feeds
+- [x] Direct audio playback URLs
+- [ ] Episode chapter markers (if available in RSS)
+- [ ] Speaker diarization data (who said what)
+
+#### 6.3 Digest Improvements
+- [ ] Configurable digest lengths (5/10/15/30 min presets)
+- [ ] Conversational two-host format (requires ElevenLabs enterprise)
+- [ ] Topic filtering (e.g., "skip politics today")
+- [ ] Priority podcasts get more airtime
+
 ---
 
 ## Spotify Submission Guide
@@ -1423,6 +1477,7 @@ https://podgest-api.pztest.workers.dev/feed/18f513bd-8ecf-4922-84b7-4ab7c7cc14df
 | `compare_takes` | Cross-podcast perspectives on a topic |
 | `list_podcasts` | List user's subscriptions |
 | `recent_episodes` | Recent episodes across subscriptions |
+| `listen_to_episode` | Get iOS deep links (Spotify/Apple Podcasts apps) + direct audio URL |
 
 **Auth Setup (one-time):**
 ```bash

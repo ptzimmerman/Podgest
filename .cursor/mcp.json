@@ -1,10 +1,11 @@
 {
   "mcpServers": {
     "podgest": {
-      "url": "https://podgest-mcp.pztest.workers.dev/sse",
-      "headers": {
-        "Authorization": "Bearer pk_f6917a9ed48e492cbe323cc6a96429b7"
-      }
+      "command": "/bin/bash",
+      "args": [
+        "-c",
+        "export PATH=/Users/pete/.nvm/versions/node/v20.19.3/bin:$PATH && npx -y mcp-remote https://podgest-mcp.pztest.workers.dev/sse"
+      ]
     }
   }
 }

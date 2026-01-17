@@ -2,7 +2,7 @@
  * Podgest MCP Server
  * 
  * Model Context Protocol server for querying podcast transcripts via Claude Desktop.
- * Uses Cloudflare Workers with OAuth authentication.
+ * Uses Cloudflare Workers OAuth Provider for authentication.
  * 
  * Tools:
  * - search_podcasts: Semantic search across all transcripts
@@ -12,11 +12,88 @@
  * - recent_episodes: Get recent episodes
  */
 
+import { OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+
+// Env interface with OAuth Provider bindings
 export interface Env {
   SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
   SUPABASE_ANON_KEY: string;
   SUPERMEMORY_API_KEY: string;
+  OAUTH_KV: KVNamespace;
+  OAUTH_PROVIDER: OAuthHelpers;
+}
+
+const MCP_SERVER_URL = "https://podgest-mcp.pztest.workers.dev";
+
+// Extract original podcast name from ListenNotes episode description
+function extractOriginalPodcastName(description: string): string | null {
+  // Try ListenNotes format: <strong>Podcast</strong>: <a href="...">Podcast Name</a>
+  const listenNotesMatch = description.match(/<strong>Podcast<\/strong>:\s*<a[^>]*>([^<]+)<\/a>/i);
+  if (listenNotesMatch) {
+    return listenNotesMatch[1].trim();
+  }
+  return null;
+}
+
+// Extract ListenNotes episode URL from description
+function extractListenNotesUrl(description: string): string | null {
+  // Format: <strong>Episode</strong>: <a href="https://www.listennotes.com/e/...">
+  const match = description.match(/<strong>Episode<\/strong>:\s*<a\s+href="([^"]+)"/i);
+  if (match) {
+    return match[1];
+  }
+  return null;
+}
+
+// Build listen links object for an episode
+interface ListenLinks {
+  audio_url: string;              // Direct MP3 playback
+  // iOS app deep links - open app DIRECTLY (no browser)
+  spotify_app: string;            // spotify:search:query - opens Spotify app
+  apple_app: string;              // podcasts://search?term=query - opens Podcasts app
+  // Web fallbacks (for desktop or if app not installed)
+  spotify_web: string;            // https://open.spotify.com/search/...
+  apple_web: string;              // https://podcasts.apple.com/search?term=...
+  listennotes_url?: string;       // Fallback: ListenNotes page
+}
+
+function buildListenLinks(
+  audioUrl: string, 
+  podcastName: string, 
+  episodeTitle: string,
+  description?: string
+): ListenLinks {
+  // Clean up title (remove HTML entities)
+  const cleanTitle = episodeTitle
+    .replace(/&#x27;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/<[^>]*>/g, "");
+  
+  // Create search query: "podcast name episode title"
+  const searchQuery = `${podcastName} ${cleanTitle}`;
+  const encodedQuery = encodeURIComponent(searchQuery);
+  
+  const links: ListenLinks = {
+    audio_url: audioUrl,
+    // iOS deep links - open apps DIRECTLY without browser intermediate
+    spotify_app: `spotify:search:${encodedQuery}`,
+    apple_app: `podcasts://search?term=${encodedQuery}`,
+    // Web fallbacks for desktop or if app not installed
+    spotify_web: `https://open.spotify.com/search/${encodedQuery}`,
+    apple_web: `https://podcasts.apple.com/search?term=${encodedQuery}`,
+  };
+  
+  if (description) {
+    const listenNotesUrl = extractListenNotesUrl(description);
+    if (listenNotesUrl) {
+      links.listennotes_url = listenNotesUrl;
+    }
+  }
+  
+  return links;
 }
 
 // MCP Protocol Types
@@ -129,6 +206,20 @@ const TOOLS: MCPTool[] = [
       },
     },
   },
+  {
+    name: "listen_to_episode",
+    description: "Get links to listen to a full podcast episode. Returns iOS app deep links (open Spotify/Apple Podcasts directly without browser) plus web fallbacks and direct audio URL.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        episode_id: {
+          type: "string",
+          description: "The episode UUID",
+        },
+      },
+      required: ["episode_id"],
+    },
+  },
 ];
 
 // ============================================
@@ -136,353 +227,489 @@ const TOOLS: MCPTool[] = [
 // ============================================
 
 async function searchPodcasts(
-  params: { query: string; limit?: number; days_back?: number },
-  env: Env,
-  userId: string
-): Promise<unknown> {
-  const limit = Math.min(params.limit || 5, 20);
-  
+  query: string,
+  limit: number = 5,
+  daysBack: number | undefined,
+  userId: string,
+  env: Env
+): Promise<{ results: Array<{ episode_id: string; podcast_name: string; title: string; excerpt: string; published_at: string }> }> {
   // Search SuperMemory with user's container tag
+  const searchParams: Record<string, unknown> = {
+    q: query,
+    limit: Math.min(limit, 20),
+    containerTags: [userId],
+  };
+
+  if (daysBack) {
+    // TODO: Date filtering doesn't seem to work with SuperMemory's filter syntax
+    // For now, just log the date we would have filtered by
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - daysBack);
+    console.log(`[searchPodcasts] Would filter by date >= ${cutoffDate.toISOString()} (${cutoffDate.getTime()})`)
+  }
+
   const searchResponse = await fetch("https://api.supermemory.ai/v3/search", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${env.SUPERMEMORY_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      q: params.query, // SuperMemory uses 'q' not 'query'
-      limit,
-      containerTags: [userId], // Multi-tenancy filter
-    }),
+    body: JSON.stringify(searchParams),
   });
 
   if (!searchResponse.ok) {
-    const errorText = await searchResponse.text();
-    throw new Error(`SuperMemory search failed: ${searchResponse.status} - ${errorText}`);
+    console.error("SuperMemory search failed:", await searchResponse.text());
+    return { results: [] };
   }
 
-  const searchData = await searchResponse.json() as {
+  const searchResults = await searchResponse.json() as {
     results: Array<{
-      chunks: Array<{
-        content: string;
-        score: number;
-      }>;
-      metadata: {
-        episode_id: string;
-        episode_title: string;
-        podcast_title: string;
-        published_at: number;
-        summary?: string;
+      id: string;
+      content?: string;
+      chunks?: Array<{ content: string }>;
+      metadata?: {
+        episode_id?: string;
+        podcast_title?: string;
+        episode_title?: string;
+        published_at?: number;
       };
-      score: number;
-      title: string;
     }>;
-    total: number;
   };
 
   return {
-    query: params.query,
-    results: searchData.results.map(r => {
-      // Get the best chunk content
-      const bestChunk = r.chunks?.[0]?.content || "";
-      return {
-        podcast: r.metadata?.podcast_title || "Unknown",
-        episode: r.metadata?.episode_title || r.title || "Unknown",
-        episode_id: r.metadata?.episode_id,
-        published: r.metadata?.published_at 
-          ? new Date(r.metadata.published_at).toISOString().split('T')[0]
-          : "Unknown",
-        excerpt: bestChunk.substring(0, 500) + (bestChunk.length > 500 ? "..." : ""),
-        relevance: Math.round(r.score * 100) / 100,
-      };
-    }),
-    total_results: searchData.total,
+    results: (searchResults.results || []).map((r) => ({
+      episode_id: r.metadata?.episode_id || r.id,
+      podcast_name: r.metadata?.podcast_title || "Unknown",
+      title: r.metadata?.episode_title || "Unknown",
+      excerpt: r.chunks?.[0]?.content?.substring(0, 500) || r.content?.substring(0, 500) || "No content available",
+      published_at: r.metadata?.published_at ? new Date(r.metadata.published_at).toISOString() : "",
+    })),
   };
 }
 
 async function getEpisode(
-  params: { episode_id: string },
-  env: Env,
-  userId: string
-): Promise<unknown> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-
-  // Get episode with subscription info (to verify user access)
+  episodeId: string,
+  userId: string,
+  env: Env
+): Promise<{
+  episode_id: string;
+  podcast_name: string;
+  title: string;
+  published_at: string;
+  summary?: string;
+  topics?: string[];
+  transcript_url?: string;
+  listen_links?: ListenLinks;
+} | { error: string }> {
+  // Fetch episode with description and audio_url
   const episodeResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${params.episode_id}&select=*`,
-    { headers }
+    `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episodeId}&select=id,title,published_at,feed_url,description,audio_url`,
+    {
+      headers: {
+        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
   );
-
-  if (!episodeResponse.ok) {
-    throw new Error("Failed to fetch episode");
-  }
 
   const episodes = await episodeResponse.json() as Array<{
     id: string;
     title: string;
-    description: string;
-    audio_url: string;
     published_at: string;
-    duration_seconds: number;
     feed_url: string;
+    description?: string;
+    audio_url: string;
   }>;
 
   if (!episodes.length) {
-    throw new Error("Episode not found");
+    return { error: "Episode not found" };
   }
 
   const episode = episodes[0];
-
-  // Get subscription to verify user access and get podcast title
+  
+  // Verify user has a subscription for this episode's feed
   const subResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/subscriptions?feed_url=eq.${encodeURIComponent(episode.feed_url)}&user_id=eq.${userId}&select=podcast_title`,
-    { headers }
-  );
-
-  const subs = await subResponse.json() as Array<{ podcast_title: string }>;
-  if (!subs.length) {
-    throw new Error("You don't have access to this episode");
-  }
-
-  // Get transcription and topic extraction
-  const transcriptionResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${params.episode_id}&select=id,transcript_storage_path,word_count,language`,
-    { headers }
-  );
-
-  const transcriptions = await transcriptionResponse.json() as Array<{
-    id: string;
-    transcript_storage_path: string;
-    word_count: number;
-    language: string;
-  }>;
-
-  let topics = null;
-  let summary = null;
-
-  if (transcriptions.length) {
-    const topicsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/topic_extractions?transcription_id=eq.${transcriptions[0].id}&select=topics`,
-      { headers }
-    );
-
-    const topicData = await topicsResponse.json() as Array<{ topics: { summary: string; topics: string[]; key_points: string[] } }>;
-    if (topicData.length) {
-      topics = topicData[0].topics.topics;
-      summary = topicData[0].topics.summary;
+    `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&feed_url=eq.${encodeURIComponent(episode.feed_url)}&select=podcast_title`,
+    {
+      headers: {
+        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
     }
+  );
+  
+  const subs = await subResponse.json() as Array<{ podcast_title: string }>;
+  
+  if (!subs.length) {
+    return { error: "Episode not found" };
+  }
+  
+  // Extract original podcast name from description (for ListenNotes aggregated feeds)
+  const originalName = extractOriginalPodcastName(episode.description || "");
+  const podcastTitle = originalName || subs[0].podcast_title;
+
+  // Get transcription
+  const transcriptionResponse = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episodeId}&select=transcript_storage_path`,
+    {
+      headers: {
+        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+
+  const transcriptions = await transcriptionResponse.json() as Array<{ transcript_storage_path?: string }>;
+  
+  // Get topic extraction
+  let summary: string | undefined;
+  let topics: string[] | undefined;
+  
+  const topicsResponse = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/topic_extractions?transcription_id=eq.${episodeId}&select=topics,summary`,
+    {
+      headers: {
+        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+
+  const topicData = await topicsResponse.json() as Array<{ topics?: string[]; summary?: string }>;
+  if (topicData.length) {
+    summary = topicData[0].summary;
+    topics = topicData[0].topics;
   }
 
-  // Generate signed URL for transcript (valid 1 hour)
-  let transcriptUrl = null;
+  // Generate signed URL for transcript if available
+  let transcriptUrl: string | undefined;
   if (transcriptions.length && transcriptions[0].transcript_storage_path) {
     const signResponse = await fetch(
       `${env.SUPABASE_URL}/storage/v1/object/sign/transcripts/${transcriptions[0].transcript_storage_path}`,
       {
         method: "POST",
-        headers,
+        headers: {
+          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({ expiresIn: 3600 }),
       }
     );
-
-    if (signResponse.ok) {
-      const signData = await signResponse.json() as { signedURL: string };
+    const signData = await signResponse.json() as { signedURL?: string };
+    if (signData.signedURL) {
       transcriptUrl = `${env.SUPABASE_URL}/storage/v1${signData.signedURL}`;
     }
   }
 
   return {
-    id: episode.id,
+    episode_id: episode.id,
+    podcast_name: podcastTitle,
     title: episode.title,
-    podcast: subs[0].podcast_title,
-    published: episode.published_at,
-    duration_minutes: Math.round((episode.duration_seconds || 0) / 60),
-    description: episode.description?.substring(0, 300),
+    published_at: episode.published_at,
     summary,
     topics,
-    word_count: transcriptions[0]?.word_count,
-    language: transcriptions[0]?.language,
     transcript_url: transcriptUrl,
-    audio_url: episode.audio_url,
   };
 }
 
 async function compareTakes(
-  params: { topic: string; days_back?: number },
-  env: Env,
-  userId: string
-): Promise<unknown> {
-  const daysBack = params.days_back || 30;
+  topic: string,
+  daysBack: number = 30,
+  userId: string,
+  env: Env
+): Promise<{ perspectives: Array<{ podcast_name: string; episode_title: string; take: string; published_at: string }> }> {
+  // Search for the topic across all podcasts
+  const searchParams: Record<string, unknown> = {
+    q: topic,
+    limit: 10,
+    containerTags: [userId],
+  };
 
-  // Search for the topic across all user's podcasts
+  // TODO: Date filtering doesn't seem to work with SuperMemory's filter syntax
+  // For now, just log the date we would have filtered by
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - daysBack);
+  console.log(`[compareTakes] Would filter by date >= ${cutoffDate.toISOString()} (${cutoffDate.getTime()})`);
+
   const searchResponse = await fetch("https://api.supermemory.ai/v3/search", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${env.SUPERMEMORY_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      q: params.topic, // SuperMemory uses 'q' not 'query'
-      limit: 20,
-      containerTags: [userId],
-    }),
+    body: JSON.stringify(searchParams),
   });
 
   if (!searchResponse.ok) {
-    const errorText = await searchResponse.text();
-    throw new Error(`SuperMemory search failed: ${searchResponse.status} - ${errorText}`);
+    return { perspectives: [] };
   }
 
-  const searchData = await searchResponse.json() as {
+  const searchResults = await searchResponse.json() as {
     results: Array<{
-      chunks: Array<{
-        content: string;
-        score: number;
-      }>;
-      metadata: {
-        episode_id: string;
-        episode_title: string;
-        podcast_title: string;
-        published_at: number;
-        summary?: string;
+      content?: string;
+      chunks?: Array<{ content: string }>;
+      metadata?: {
+        podcast_title?: string;
+        episode_title?: string;
+        published_at?: number;
       };
-      score: number;
-      title: string;
     }>;
-    total: number;
   };
 
-  // Group by podcast and take best result per podcast
-  const byPodcast = new Map<string, typeof searchData.results[0]>();
-  for (const result of searchData.results) {
-    const podcast = result.metadata?.podcast_title || "Unknown";
-    if (!byPodcast.has(podcast) || byPodcast.get(podcast)!.score < result.score) {
-      byPodcast.set(podcast, result);
+  // Group by podcast and take best result from each
+  const byPodcast = new Map<string, typeof searchResults.results[0]>();
+  for (const result of searchResults.results || []) {
+    const podcastName = result.metadata?.podcast_title || "Unknown";
+    if (!byPodcast.has(podcastName)) {
+      byPodcast.set(podcastName, result);
     }
   }
 
-  const perspectives = Array.from(byPodcast.values()).map(r => {
-    const bestChunk = r.chunks?.[0]?.content || "";
-    return {
-      podcast: r.metadata?.podcast_title || "Unknown",
-      episode: r.metadata?.episode_title || r.title || "Unknown",
-      episode_id: r.metadata?.episode_id,
-      published: r.metadata?.published_at 
-        ? new Date(r.metadata.published_at).toISOString().split('T')[0]
-        : "Unknown",
-      excerpt: bestChunk.substring(0, 400) + (bestChunk.length > 400 ? "..." : ""),
-      relevance: Math.round(r.score * 100) / 100,
-    };
-  });
-
   return {
-    topic: params.topic,
-    days_searched: daysBack,
-    podcasts_found: perspectives.length,
-    perspectives: perspectives.sort((a, b) => b.relevance - a.relevance),
+    perspectives: Array.from(byPodcast.values()).map((r) => ({
+      podcast_name: r.metadata?.podcast_title || "Unknown",
+      episode_title: r.metadata?.episode_title || "Unknown",
+      take: r.chunks?.[0]?.content?.substring(0, 800) || r.content?.substring(0, 800) || "No content",
+      published_at: r.metadata?.published_at ? new Date(r.metadata.published_at).toISOString() : "",
+    })),
   };
 }
 
 async function listPodcasts(
-  env: Env,
-  userId: string
-): Promise<unknown> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-
+  userId: string,
+  env: Env
+): Promise<{ podcasts: Array<{ id: string; name: string; feed_url: string; episode_count: number }> }> {
+  console.log(`[listPodcasts] Fetching for user: ${userId}`);
+  
   const response = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&is_active=eq.true&select=id,podcast_title,feed_url,priority,last_polled_at`,
-    { headers }
+    `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&select=id,podcast_title,feed_url`,
+    {
+      headers: {
+        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
   );
 
   if (!response.ok) {
-    throw new Error("Failed to fetch subscriptions");
+    console.error(`[listPodcasts] Supabase error: ${response.status} ${await response.text()}`);
+    return { podcasts: [] };
   }
 
-  const subs = await response.json() as Array<{
-    id: string;
-    podcast_title: string;
-    feed_url: string;
-    priority: number;
-    last_polled_at: string;
-  }>;
+  const subscriptions = await response.json();
+  console.log(`[listPodcasts] Got subscriptions:`, JSON.stringify(subscriptions));
+  
+  if (!Array.isArray(subscriptions)) {
+    console.error(`[listPodcasts] Expected array, got:`, typeof subscriptions);
+    return { podcasts: [] };
+  }
 
-  return {
-    total: subs.length,
-    podcasts: subs.map(s => ({
-      id: s.id,
-      title: s.podcast_title,
-      priority: s.priority,
-      last_checked: s.last_polled_at,
-    })),
-  };
+  // Get episode counts for each subscription (episodes link by feed_url)
+  const podcastsWithCounts = await Promise.all(
+    subscriptions.map(async (sub: { id: string; podcast_title: string; feed_url: string }) => {
+      const countResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/episodes?feed_url=eq.${encodeURIComponent(sub.feed_url)}&select=id`,
+        {
+          headers: {
+            "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            "Prefer": "count=exact",
+          },
+        }
+      );
+      const count = parseInt(countResponse.headers.get("content-range")?.split("/")[1] || "0");
+      return { 
+        id: sub.id, 
+        name: sub.podcast_title, 
+        feed_url: sub.feed_url, 
+        episode_count: count 
+      };
+    })
+  );
+
+  return { podcasts: podcastsWithCounts };
 }
 
 async function recentEpisodes(
-  params: { limit?: number; days_back?: number },
-  env: Env,
-  userId: string
-): Promise<unknown> {
-  const limit = Math.min(params.limit || 10, 50);
-  const daysBack = params.days_back || 7;
-  const cutoff = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString();
+  limit: number = 10,
+  daysBack: number = 7,
+  userId: string,
+  env: Env
+): Promise<{ episodes: Array<{ id: string; podcast_name: string; title: string; published_at: string; has_transcript: boolean }> }> {
+  console.log(`[recentEpisodes] Fetching for user: ${userId}`);
+  
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - daysBack);
 
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-
-  // Get user's subscribed feed URLs
+  // Get user's subscriptions with feed_url
   const subsResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&is_active=eq.true&select=feed_url,podcast_title`,
-    { headers }
+    `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&select=feed_url,podcast_title`,
+    {
+      headers: {
+        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
   );
 
-  const subs = await subsResponse.json() as Array<{ feed_url: string; podcast_title: string }>;
-  if (!subs.length) {
-    return { episodes: [], total: 0 };
+  if (!subsResponse.ok) {
+    console.error(`[recentEpisodes] Supabase error: ${subsResponse.status} ${await subsResponse.text()}`);
+    return { episodes: [] };
   }
 
-  const feedUrls = subs.map(s => s.feed_url);
-  const feedToTitle = new Map(subs.map(s => [s.feed_url, s.podcast_title]));
+  const subscriptions = await subsResponse.json();
+  console.log(`[recentEpisodes] Got subscriptions:`, JSON.stringify(subscriptions));
+  
+  if (!Array.isArray(subscriptions)) {
+    console.error(`[recentEpisodes] Expected array, got:`, typeof subscriptions);
+    return { episodes: [] };
+  }
+  
+  const feedUrls = subscriptions.map((s: { feed_url: string }) => s.feed_url);
+  const feedNameMap = new Map(subscriptions.map((s: { feed_url: string; podcast_title: string }) => [s.feed_url, s.podcast_title]));
 
-  // Get recent episodes from those feeds
+  if (feedUrls.length === 0) {
+    return { episodes: [] };
+  }
+
+  // Episodes link by feed_url, not subscription_id
+  // Also fetch description to extract original podcast name
   const episodesResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/episodes?feed_url=in.(${feedUrls.map(u => `"${u}"`).join(",")})&published_at=gte.${cutoff}&order=published_at.desc&limit=${limit}&select=id,title,published_at,duration_seconds,feed_url`,
-    { headers }
+    `${env.SUPABASE_URL}/rest/v1/episodes?feed_url=in.(${feedUrls.map(u => encodeURIComponent(u)).join(",")})&published_at=gte.${cutoffDate.toISOString()}&order=published_at.desc&limit=${Math.min(limit, 50)}&select=id,title,published_at,feed_url,description`,
+    {
+      headers: {
+        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
   );
 
-  const episodes = await episodesResponse.json() as Array<{
-    id: string;
-    title: string;
-    published_at: string;
-    duration_seconds: number;
-    feed_url: string;
-  }>;
+  if (!episodesResponse.ok) {
+    console.error(`[recentEpisodes] Episodes query failed: ${episodesResponse.status} ${await episodesResponse.text()}`);
+    return { episodes: [] };
+  }
+
+  const episodes = await episodesResponse.json();
+  console.log(`[recentEpisodes] Got episodes:`, JSON.stringify(episodes).substring(0, 200));
+  
+  if (!Array.isArray(episodes)) {
+    console.error(`[recentEpisodes] Expected array, got:`, typeof episodes);
+    return { episodes: [] };
+  }
+
+  if (episodes.length === 0) {
+    return { episodes: [] };
+  }
+
+  // Check which episodes have transcripts
+  const episodeIds = episodes.map((e: { id: string }) => e.id);
+  const transcriptsResponse = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=in.(${episodeIds.join(",")})&select=episode_id`,
+    {
+      headers: {
+        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+
+  const transcripts = await transcriptsResponse.json();
+  const hasTranscript = new Set(
+    Array.isArray(transcripts) 
+      ? transcripts.map((t: { episode_id: string }) => t.episode_id)
+      : []
+  );
 
   return {
-    days_back: daysBack,
-    total: episodes.length,
-    episodes: episodes.map(e => ({
-      id: e.id,
-      title: e.title,
-      podcast: feedToTitle.get(e.feed_url) || "Unknown",
-      published: e.published_at,
-      duration_minutes: Math.round((e.duration_seconds || 0) / 60),
-    })),
+    episodes: episodes.map((e: { id: string; feed_url: string; title: string; published_at: string; description?: string }) => {
+      // Extract original podcast name from description (for ListenNotes aggregated feeds)
+      const originalName = extractOriginalPodcastName(e.description || "");
+      return {
+        id: e.id,
+        podcast_name: originalName || feedNameMap.get(e.feed_url) || "Unknown",
+        title: e.title,
+        published_at: e.published_at,
+        has_transcript: hasTranscript.has(e.id),
+      };
+    }),
+  };
+}
+
+async function listenToEpisode(
+  episodeId: string,
+  userId: string,
+  env: Env
+): Promise<{
+  episode_id: string;
+  podcast_name: string;
+  title: string;
+  links: ListenLinks;
+} | { error: string }> {
+  // Fetch episode with audio_url and description
+  const episodeResponse = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episodeId}&select=id,title,feed_url,audio_url,description`,
+    {
+      headers: {
+        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+
+  const episodes = await episodeResponse.json() as Array<{
+    id: string;
+    title: string;
+    feed_url: string;
+    audio_url: string;
+    description?: string;
+  }>;
+
+  if (!episodes.length) {
+    return { error: "Episode not found" };
+  }
+
+  const episode = episodes[0];
+
+  // Verify user has access to this episode's feed
+  const subResponse = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&feed_url=eq.${encodeURIComponent(episode.feed_url)}&select=podcast_title`,
+    {
+      headers: {
+        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+
+  const subs = await subResponse.json() as Array<{ podcast_title: string }>;
+
+  if (!subs.length) {
+    return { error: "Episode not found" };
+  }
+
+  // Extract original podcast name from description
+  const originalName = extractOriginalPodcastName(episode.description || "");
+  const podcastName = originalName || subs[0].podcast_title;
+
+  // Build all listen links (Spotify, Apple, direct audio)
+  const links = buildListenLinks(
+    episode.audio_url,
+    podcastName,
+    episode.title,
+    episode.description
+  );
+
+  return {
+    episode_id: episode.id,
+    podcast_name: podcastName,
+    title: episode.title,
+    links,
   };
 }
 
 // ============================================
-// MCP PROTOCOL HANDLER
+// MCP REQUEST HANDLER
 // ============================================
 
 async function handleMCPRequest(
@@ -490,7 +717,7 @@ async function handleMCPRequest(
   env: Env,
   userId: string
 ): Promise<MCPResponse> {
-  const { id, method, params } = request;
+  const { method, params, id } = request;
 
   try {
     switch (method) {
@@ -514,586 +741,139 @@ async function handleMCPRequest(
         return {
           jsonrpc: "2.0",
           id,
-          result: {
-            tools: TOOLS,
-          },
+          result: { tools: TOOLS },
         };
 
       case "tools/call": {
-        const toolParams = params as { name: string; arguments: Record<string, unknown> };
-        const toolName = toolParams.name;
-        const toolArgs = toolParams.arguments || {};
+        const toolName = (params as { name: string }).name;
+        const toolArgs = (params as { arguments?: Record<string, unknown> }).arguments || {};
 
         let result: unknown;
 
         switch (toolName) {
           case "search_podcasts":
-            result = await searchPodcasts(toolArgs as { query: string; limit?: number; days_back?: number }, env, userId);
+            result = await searchPodcasts(
+              toolArgs.query as string,
+              toolArgs.limit as number | undefined,
+              toolArgs.days_back as number | undefined,
+              userId,
+              env
+            );
             break;
+
           case "get_episode":
-            result = await getEpisode(toolArgs as { episode_id: string }, env, userId);
+            result = await getEpisode(toolArgs.episode_id as string, userId, env);
             break;
+
           case "compare_takes":
-            result = await compareTakes(toolArgs as { topic: string; days_back?: number }, env, userId);
+            result = await compareTakes(
+              toolArgs.topic as string,
+              toolArgs.days_back as number | undefined,
+              userId,
+              env
+            );
             break;
+
           case "list_podcasts":
-            result = await listPodcasts(env, userId);
+            result = await listPodcasts(userId, env);
             break;
+
           case "recent_episodes":
-            result = await recentEpisodes(toolArgs as { limit?: number; days_back?: number }, env, userId);
+            result = await recentEpisodes(
+              toolArgs.limit as number | undefined,
+              toolArgs.days_back as number | undefined,
+              userId,
+              env
+            );
             break;
+
+          case "listen_to_episode":
+            result = await listenToEpisode(toolArgs.episode_id as string, userId, env);
+            break;
+
           default:
-            throw new Error(`Unknown tool: ${toolName}`);
+            return {
+              jsonrpc: "2.0",
+              id,
+              error: { code: -32601, message: `Unknown tool: ${toolName}` },
+            };
         }
 
         return {
           jsonrpc: "2.0",
           id,
           result: {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify(result, null, 2),
-              },
-            ],
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
           },
         };
       }
-
-      case "notifications/initialized":
-        // Client notification, no response needed
-        return { jsonrpc: "2.0", id, result: {} };
 
       default:
         return {
           jsonrpc: "2.0",
           id,
-          error: {
-            code: -32601,
-            message: `Method not found: ${method}`,
-          },
+          error: { code: -32601, message: `Method not found: ${method}` },
         };
     }
   } catch (error) {
+    console.error("MCP request error:", error);
     return {
       jsonrpc: "2.0",
       id,
       error: {
-        code: -32000,
-        message: error instanceof Error ? error.message : String(error),
+        code: -32603,
+        message: error instanceof Error ? error.message : "Internal error",
       },
     };
   }
 }
 
 // ============================================
-// AUTHENTICATION
+// OAUTH + MCP HANDLERS
 // ============================================
 
-interface SupabaseUser {
-  id: string;
-  email: string;
-  user_metadata: {
-    full_name?: string;
-    name?: string;
-  };
-}
-
-// Validate Supabase JWT token
-async function validateJWT(token: string, env: Env): Promise<SupabaseUser | null> {
-  try {
-    const response = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
-      headers: {
-        "Authorization": `Bearer ${token}`,
-        "apikey": env.SUPABASE_ANON_KEY,
-      },
-    });
-
-    if (!response.ok) {
-      return null;
-    }
-
-    return await response.json() as SupabaseUser;
-  } catch {
-    return null;
-  }
-}
-
-// Validate API key from mcp_tokens table
-async function validateAPIKey(apiKey: string, env: Env): Promise<string | null> {
-  try {
-    // API keys are stored as "pk_" + random string
-    // We look up the token_hash (which is the full key for simplicity)
-    const response = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/mcp_tokens?token_hash=eq.${encodeURIComponent(apiKey)}&select=user_id,expires_at`,
-      {
-        headers: {
-          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        },
-      }
-    );
-
-    if (!response.ok) return null;
-
-    const tokens = await response.json() as Array<{ user_id: string; expires_at: string | null }>;
-    if (!tokens.length) return null;
-
-    const token = tokens[0];
-    
-    // Check expiry
-    if (token.expires_at && new Date(token.expires_at) < new Date()) {
-      return null;
-    }
-
-    // Update last_used_at
-    fetch(
-      `${env.SUPABASE_URL}/rest/v1/mcp_tokens?token_hash=eq.${encodeURIComponent(apiKey)}`,
-      {
-        method: "PATCH",
-        headers: {
-          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ last_used_at: new Date().toISOString() }),
-      }
-    ); // Fire and forget
-
-    return token.user_id;
-  } catch {
-    return null;
-  }
-}
-
-// Generate a new API key for a user
-async function generateAPIKey(userId: string, email: string, env: Env): Promise<string> {
-  const apiKey = `pk_${crypto.randomUUID().replace(/-/g, "")}`;
-  
-  await fetch(
-    `${env.SUPABASE_URL}/rest/v1/mcp_tokens`,
-    {
-      method: "POST",
-      headers: {
-        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal",
-      },
-      body: JSON.stringify({
-        user_id: userId,
-        token_hash: apiKey,
-        name: `API Key for ${email}`,
-        created_at: new Date().toISOString(),
-      }),
-    }
-  );
-
-  return apiKey;
-}
-
-// Authenticate request - supports both JWT and API key
-async function authenticateRequest(request: Request, env: Env): Promise<{ userId: string } | { error: string }> {
-  const authHeader = request.headers.get("Authorization");
-  
-  if (!authHeader?.startsWith("Bearer ")) {
-    return { error: "Missing Authorization header" };
-  }
-
-  const token = authHeader.slice(7);
-
-  // Check if it's an API key (starts with pk_)
-  if (token.startsWith("pk_")) {
-    const userId = await validateAPIKey(token, env);
-    if (userId) {
-      return { userId };
-    }
-    return { error: "Invalid API key" };
-  }
-
-  // Otherwise treat as Supabase JWT
-  const user = await validateJWT(token, env);
-  if (user) {
-    return { userId: user.id };
-  }
-
-  return { error: "Invalid token" };
-}
-
-// ============================================
-// HTTP HANDLER
-// ============================================
-
-const MCP_SERVER_URL = "https://podgest-mcp.pztest.workers.dev";
-
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+// API Handler - receives authenticated requests
+const mcpApiHandler = {
+  async fetch(request: Request, env: unknown, ctx: unknown): Promise<Response> {
+    const typedEnv = env as Env;
+    const typedCtx = ctx as ExecutionContext & { props?: { userId: string; email?: string } };
     const url = new URL(request.url);
-
-    // CORS headers for all responses
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    };
-
-    // Handle CORS preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
-    }
-
-    // Health check
-    if (url.pathname === "/health" || url.pathname === "/") {
-      return new Response(JSON.stringify({
-        status: "ok",
-        service: "podgest-mcp",
-        version: "2.0.0",
-        auth_url: `${MCP_SERVER_URL}/auth`,
-      }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    // ========== AUTH PAGES ==========
     
-    // Auth landing page - "Sign in with Google"
-    if (url.pathname === "/auth" && request.method === "GET") {
-      const redirectUri = `${MCP_SERVER_URL}/auth/callback`;
-      const authUrl = `${env.SUPABASE_URL}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(redirectUri)}`;
-      
-      return new Response(renderAuthPage(authUrl), {
-        headers: { "Content-Type": "text/html" },
-      });
-    }
-
-    // OAuth callback - receives token, generates API key
-    if (url.pathname === "/auth/callback" && request.method === "GET") {
-      // Supabase redirects with token in fragment, so we need JS to extract it
-      return new Response(renderCallbackPage(), {
-        headers: { "Content-Type": "text/html" },
-      });
-    }
-
-    // Token exchange - called by callback page JS
-    if (url.pathname === "/auth/token" && request.method === "POST") {
-      try {
-        const { access_token } = await request.json() as { access_token: string };
-        
-        // Validate the Supabase JWT
-        const user = await validateJWT(access_token, env);
-        if (!user) {
-          return new Response(JSON.stringify({ error: "Invalid token" }), {
-            status: 401,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          });
-        }
-
-        // Generate API key for this user
-        const apiKey = await generateAPIKey(user.id, user.email, env);
-
-        return new Response(JSON.stringify({
-          api_key: apiKey,
-          user_id: user.id,
-          email: user.email,
-        }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      } catch (error) {
-        return new Response(JSON.stringify({ error: "Invalid request" }), {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    // ========== MCP ENDPOINT ==========
+    // Log the full context to debug
+    console.log(`[mcpApiHandler] ctx type: ${typeof ctx}`);
+    console.log(`[mcpApiHandler] ctx.props:`, JSON.stringify(typedCtx.props));
     
-    if (url.pathname === "/mcp" || url.pathname === "/sse") {
-      // Authenticate request
-      const auth = await authenticateRequest(request, env);
-      
-      if ("error" in auth) {
-        return new Response(JSON.stringify({
-          error: "auth_required",
-          message: auth.error,
-          auth_url: `${MCP_SERVER_URL}/auth`,
-        }), {
-          status: 401,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
+    const userId = typedCtx.props?.userId;
+    console.log(`[mcpApiHandler] userId: ${userId}`);
 
-      const userId = auth.userId;
-
-      // Handle SSE connection for streaming
-      if (request.headers.get("Accept") === "text/event-stream") {
-        return handleSSE(request, env, userId);
-      }
-
-      // Handle simple POST request
-      if (request.method === "POST") {
-        const mcpRequest = await request.json() as MCPRequest;
-        const response = await handleMCPRequest(mcpRequest, env, userId);
-        return new Response(JSON.stringify(response), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-
-      return new Response("Method not allowed", { status: 405, headers: corsHeaders });
+    if (!userId) {
+      console.error(`[mcpApiHandler] No userId in props`);
+      return new Response(JSON.stringify({ error: "Not authenticated" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
-    return new Response("Not found", { status: 404, headers: corsHeaders });
+    // Handle SSE for MCP streaming
+    if (request.headers.get("Accept") === "text/event-stream") {
+      return handleSSE(request, typedEnv, userId);
+    }
+
+    // Handle MCP POST requests
+    if (request.method === "POST") {
+      const mcpRequest = await request.json() as MCPRequest;
+      const response = await handleMCPRequest(mcpRequest, typedEnv, userId);
+      return new Response(JSON.stringify(response), {
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
+    return new Response("Method not allowed", { status: 405 });
   },
 };
-
-// ============================================
-// AUTH PAGE TEMPLATES
-// ============================================
-
-function renderAuthPage(authUrl: string): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Podgest - Sign In</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: linear-gradient(135deg, #0f0f23 0%, #1a1a3e 50%, #0f0f23 100%);
-      color: #fff;
-    }
-    .container {
-      text-align: center;
-      padding: 48px;
-      max-width: 420px;
-    }
-    .logo {
-      font-size: 48px;
-      margin-bottom: 8px;
-    }
-    h1 {
-      font-size: 32px;
-      font-weight: 600;
-      margin-bottom: 12px;
-      background: linear-gradient(135deg, #60a5fa, #a78bfa);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }
-    p {
-      color: #94a3b8;
-      font-size: 16px;
-      line-height: 1.6;
-      margin-bottom: 32px;
-    }
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 12px;
-      padding: 14px 32px;
-      font-size: 16px;
-      font-weight: 500;
-      color: #1f2937;
-      background: #fff;
-      border: none;
-      border-radius: 12px;
-      cursor: pointer;
-      text-decoration: none;
-      transition: transform 0.2s, box-shadow 0.2s;
-    }
-    .btn:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 8px 24px rgba(255,255,255,0.15);
-    }
-    .btn svg { width: 20px; height: 20px; }
-    .features {
-      margin-top: 48px;
-      text-align: left;
-      background: rgba(255,255,255,0.05);
-      border-radius: 16px;
-      padding: 24px;
-    }
-    .features h3 {
-      font-size: 14px;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      color: #64748b;
-      margin-bottom: 16px;
-    }
-    .feature {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 8px 0;
-      color: #cbd5e1;
-      font-size: 14px;
-    }
-    .feature span { font-size: 18px; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="logo">🎙️</div>
-    <h1>Podgest</h1>
-    <p>Sign in to connect your podcast intelligence to Claude, Cursor, and other AI tools.</p>
-    
-    <a href="${authUrl}" class="btn">
-      <svg viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
-      Sign in with Google
-    </a>
-
-    <div class="features">
-      <h3>What you'll get</h3>
-      <div class="feature"><span>🔍</span> Search across all your podcast transcripts</div>
-      <div class="feature"><span>📊</span> Compare perspectives from different shows</div>
-      <div class="feature"><span>🎧</span> Daily AI-generated digest of your podcasts</div>
-      <div class="feature"><span>🔐</span> Your data stays private and secure</div>
-    </div>
-  </div>
-</body>
-</html>`;
-}
-
-function renderCallbackPage(): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Podgest - Authentication</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: linear-gradient(135deg, #0f0f23 0%, #1a1a3e 50%, #0f0f23 100%);
-      color: #fff;
-    }
-    .container {
-      text-align: center;
-      padding: 48px;
-      max-width: 560px;
-    }
-    .spinner {
-      width: 48px;
-      height: 48px;
-      border: 3px solid rgba(255,255,255,0.1);
-      border-top-color: #60a5fa;
-      border-radius: 50%;
-      animation: spin 1s linear infinite;
-      margin: 0 auto 24px;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    h1 { font-size: 24px; margin-bottom: 8px; }
-    .status { color: #94a3b8; margin-bottom: 32px; }
-    
-    .success { display: none; }
-    .success h1 { color: #4ade80; }
-    
-    .saving { display: none; }
-    .saving h1 { color: #60a5fa; }
-    
-    .done { display: none; }
-    .done h1 { color: #4ade80; }
-    
-    .error { display: none; }
-    .error h1 { color: #f87171; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="loading">
-      <div class="spinner"></div>
-      <h1>Authenticating...</h1>
-      <p class="status">Please wait while we set up your account.</p>
-    </div>
-    
-    <div class="saving">
-      <div class="spinner"></div>
-      <h1>Saving credentials...</h1>
-      <p class="status">Storing your API key locally.</p>
-    </div>
-    
-    <div class="done">
-      <h1>✓ You're all set!</h1>
-      <p class="status">Your API key has been saved. You can close this window and reload Cursor.</p>
-      <p style="color: #64748b; font-size: 14px; margin-top: 24px;">
-        API key saved to: <code style="color: #a78bfa;">~/.podgest/api_key</code>
-      </p>
-    </div>
-    
-    <div class="error">
-      <h1>Authentication Failed</h1>
-      <p class="status error-message">Something went wrong. Please try again.</p>
-      <a href="/auth" style="color: #60a5fa;">← Back to sign in</a>
-    </div>
-  </div>
-
-  <script>
-    async function init() {
-      // Extract token from URL fragment
-      const hash = window.location.hash.substring(1);
-      const params = new URLSearchParams(hash);
-      const accessToken = params.get('access_token');
-      
-      if (!accessToken) {
-        showError('No access token received');
-        return;
-      }
-      
-      try {
-        // Exchange for API key
-        const response = await fetch('/auth/token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ access_token: accessToken })
-        });
-        
-        if (!response.ok) {
-          const data = await response.json();
-          showError(data.error || 'Authentication failed');
-          return;
-        }
-        
-        const data = await response.json();
-        
-        // Now save the API key locally via localhost redirect
-        document.querySelector('.loading').style.display = 'none';
-        document.querySelector('.saving').style.display = 'block';
-        
-        // Redirect to localhost to save the key
-        window.location.href = 'http://localhost:9876/save?key=' + encodeURIComponent(data.api_key);
-        
-      } catch (err) {
-        showError('Network error: ' + err.message);
-      }
-    }
-    
-    function showError(message) {
-      document.querySelector('.loading').style.display = 'none';
-      document.querySelector('.error').style.display = 'block';
-      document.querySelector('.error-message').textContent = message;
-    }
-    
-    // Check if we're on the success page (redirected back from localhost)
-    if (window.location.search.includes('success=true')) {
-      document.querySelector('.loading').style.display = 'none';
-      document.querySelector('.done').style.display = 'block';
-    } else {
-      init();
-    }
-  </script>
-</body>
-</html>`;
-}
 
 // SSE handler for streaming MCP
 async function handleSSE(request: Request, env: Env, userId: string): Promise<Response> {
@@ -1101,13 +881,8 @@ async function handleSSE(request: Request, env: Env, userId: string): Promise<Re
 
   const stream = new ReadableStream({
     async start(controller) {
-      // Send initial connection event
       controller.enqueue(encoder.encode(`event: open\ndata: {"status":"connected"}\n\n`));
-
-      // For SSE, we need to handle incoming messages differently
-      // This is a simplified implementation - full SSE would use WebSockets or long-polling
       
-      // Send server info
       const serverInfo = {
         jsonrpc: "2.0",
         method: "notifications/initialized",
@@ -1131,3 +906,253 @@ async function handleSSE(request: Request, env: Env, userId: string): Promise<Re
     },
   });
 }
+
+// Default Handler - handles auth pages and non-API requests
+const defaultHandler = {
+  async fetch(request: Request, env: unknown, ctx: ExecutionContext): Promise<Response> {
+    const typedEnv = env as Env;
+    const url = new URL(request.url);
+    
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    // Health check
+    if (url.pathname === "/health" || url.pathname === "/") {
+      return new Response(JSON.stringify({
+        status: "ok",
+        service: "podgest-mcp",
+        version: "2.0.0",
+      }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // OAuth authorize page - show Google sign-in
+    if (url.pathname === "/authorize") {
+      // Parse the OAuth request
+      const oauthReqInfo = await typedEnv.OAUTH_PROVIDER.parseAuthRequest(request);
+      
+      // Store OAuth params in session and redirect to Supabase Google auth
+      const state = crypto.randomUUID();
+      await typedEnv.OAUTH_KV.put(`oauth_state:${state}`, JSON.stringify(oauthReqInfo), { expirationTtl: 600 });
+      
+      const callbackUrl = `${MCP_SERVER_URL}/oauth/callback?state=${encodeURIComponent(state)}`;
+      const supabaseAuthUrl = `${typedEnv.SUPABASE_URL}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(callbackUrl)}`;
+      
+      return Response.redirect(supabaseAuthUrl, 302);
+    }
+
+    // OAuth callback - receive Google auth result
+    if (url.pathname === "/oauth/callback") {
+      const state = url.searchParams.get("state");
+      
+      if (!state) {
+        return new Response(renderErrorPage("Missing state parameter"), {
+          status: 400,
+          headers: { "Content-Type": "text/html" },
+        });
+      }
+
+      // Supabase returns token in fragment, need JS to extract
+      return new Response(renderOAuthCallbackPage(state), {
+        headers: { "Content-Type": "text/html" },
+      });
+    }
+
+    // Process Supabase token and complete OAuth flow
+    if (url.pathname === "/oauth/complete" && request.method === "POST") {
+      try {
+        const { access_token, state } = await request.json() as { access_token: string; state: string };
+        
+        // Retrieve stored OAuth request
+        const oauthReqStr = await typedEnv.OAUTH_KV.get(`oauth_state:${state}`);
+        if (!oauthReqStr) {
+          return new Response(JSON.stringify({ error: "Invalid or expired state" }), {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+        
+        const oauthReqInfo = JSON.parse(oauthReqStr);
+        await typedEnv.OAUTH_KV.delete(`oauth_state:${state}`);
+
+        // Validate Supabase JWT and get user
+        const userResponse = await fetch(`${typedEnv.SUPABASE_URL}/auth/v1/user`, {
+          headers: {
+            "apikey": typedEnv.SUPABASE_ANON_KEY,
+            "Authorization": `Bearer ${access_token}`,
+          },
+        });
+
+        if (!userResponse.ok) {
+          return new Response(JSON.stringify({ error: "Invalid Supabase token" }), {
+            status: 401,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+
+        const user = await userResponse.json() as { id: string; email: string };
+
+        // Complete OAuth authorization
+        const { redirectTo } = await typedEnv.OAUTH_PROVIDER.completeAuthorization({
+          request: oauthReqInfo,
+          userId: user.id,
+          metadata: { email: user.email },
+          scope: oauthReqInfo.scope || ["openid", "profile"],
+          props: {
+            userId: user.id,
+            email: user.email,
+          },
+        });
+
+        return new Response(JSON.stringify({ redirect_url: redirectTo }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      } catch (error) {
+        console.error("OAuth complete error:", error);
+        return new Response(JSON.stringify({ error: "Authentication failed" }), {
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    return new Response("Not found", { status: 404, headers: corsHeaders });
+  },
+};
+
+// ============================================
+// PAGE TEMPLATES
+// ============================================
+
+function renderOAuthCallbackPage(state: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Podgest - Authenticating</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, #0f0f23 0%, #1a1a3e 50%, #0f0f23 100%);
+      color: #fff;
+    }
+    .container { text-align: center; padding: 48px; }
+    .spinner {
+      width: 48px;
+      height: 48px;
+      border: 3px solid rgba(255,255,255,0.1);
+      border-top-color: #60a5fa;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin: 0 auto 24px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    h1 { font-size: 24px; margin-bottom: 8px; }
+    .status { color: #94a3b8; }
+    .error { color: #f87171; display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="spinner" id="spinner"></div>
+    <h1>Completing sign-in...</h1>
+    <p class="status" id="status">Redirecting back to your app.</p>
+    <p class="error" id="error"></p>
+  </div>
+  <script>
+    (async function() {
+      const hash = window.location.hash.substring(1);
+      const params = new URLSearchParams(hash);
+      const accessToken = params.get('access_token');
+      
+      if (!accessToken) {
+        document.getElementById('spinner').style.display = 'none';
+        document.getElementById('status').style.display = 'none';
+        document.getElementById('error').style.display = 'block';
+        document.getElementById('error').textContent = 'No access token received. Please try again.';
+        return;
+      }
+      
+      try {
+        const response = await fetch('/oauth/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            access_token: accessToken,
+            state: ${JSON.stringify(state)}
+          })
+        });
+        
+        if (!response.ok) {
+          const data = await response.json();
+          throw new Error(data.error || 'Authentication failed');
+        }
+        
+        const data = await response.json();
+        window.location.href = data.redirect_url;
+      } catch (err) {
+        document.getElementById('spinner').style.display = 'none';
+        document.getElementById('status').style.display = 'none';
+        document.getElementById('error').style.display = 'block';
+        document.getElementById('error').textContent = err.message;
+      }
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function renderErrorPage(message: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Error - Podgest</title>
+  <style>
+    body {
+      font-family: -apple-system, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      background: #0f0f23;
+      color: #fff;
+    }
+    .error { color: #f87171; font-size: 18px; }
+  </style>
+</head>
+<body>
+  <div class="error">${message}</div>
+</body>
+</html>`;
+}
+
+// ============================================
+// EXPORT OAUTH PROVIDER
+// ============================================
+
+export default new OAuthProvider({
+  apiRoute: ["/mcp", "/sse"],
+  apiHandler: mcpApiHandler,
+  defaultHandler: defaultHandler,
+  authorizeEndpoint: "/authorize",
+  tokenEndpoint: "/oauth/token",
+  clientRegistrationEndpoint: "/oauth/register",
+  scopesSupported: ["openid", "profile", "email"],
+  // Refresh tokens valid for 1 year
+  refreshTokenTTL: 31536000,
+});
