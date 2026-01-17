@@ -832,116 +832,46 @@ async function handleMCPRequest(
 // OAUTH + MCP HANDLERS
 // ============================================
 
-// API Handler - receives authenticated requests (from OAuth or API key)
+// API Handler - receives authenticated requests
 const mcpApiHandler = {
   async fetch(request: Request, env: unknown, ctx: unknown): Promise<Response> {
     const typedEnv = env as Env;
     const typedCtx = ctx as ExecutionContext & { props?: { userId: string; email?: string } };
     const url = new URL(request.url);
     
-    // Log the full context to debug
-    console.log(`[mcpApiHandler] Request: ${request.method} ${url.pathname}`);
+    // Log context for debugging
+    console.log(`[mcpApiHandler] ${request.method} ${url.pathname}`);
     console.log(`[mcpApiHandler] ctx.props:`, JSON.stringify(typedCtx.props));
     
-    // Try to get userId from OAuth props first
-    let userId = typedCtx.props?.userId;
-    
-    // If no OAuth props, check for direct API key auth (for ChatGPT)
-    if (!userId) {
-      const authHeader = request.headers.get("Authorization");
-      console.log(`[mcpApiHandler] Auth header: ${authHeader ? 'present' : 'missing'}`);
-      
-      if (authHeader?.startsWith("Bearer pk_")) {
-        // Direct API key auth - lookup user from mcp_tokens table
-        const apiKey = authHeader.replace("Bearer ", "");
-        console.log(`[mcpApiHandler] Looking up API key: ${apiKey.substring(0, 10)}...`);
-        
-        const tokenResponse = await fetch(
-          `${typedEnv.SUPABASE_URL}/rest/v1/mcp_tokens?api_key=eq.${apiKey}&select=user_id`,
-          {
-            headers: {
-              "apikey": typedEnv.SUPABASE_SERVICE_ROLE_KEY,
-              "Authorization": `Bearer ${typedEnv.SUPABASE_SERVICE_ROLE_KEY}`,
-            },
-          }
-        );
-        
-        if (tokenResponse.ok) {
-          const tokens = await tokenResponse.json() as Array<{ user_id: string }>;
-          if (tokens.length > 0) {
-            userId = tokens[0].user_id;
-            console.log(`[mcpApiHandler] API key resolved to user: ${userId}`);
-          }
-        }
-      }
-    }
-    
-    console.log(`[mcpApiHandler] Final userId: ${userId}`);
+    const userId = typedCtx.props?.userId;
+    console.log(`[mcpApiHandler] userId: ${userId}`);
 
     if (!userId) {
-      console.error(`[mcpApiHandler] No userId - not authenticated`);
-      return new Response(JSON.stringify({ 
-        jsonrpc: "2.0",
-        error: { 
-          code: -32600, 
-          message: "Not authenticated. Use OAuth or Bearer API key." 
-        }
-      }), {
+      console.error(`[mcpApiHandler] No userId in props - not authenticated`);
+      return new Response(JSON.stringify({ error: "Not authenticated" }), {
         status: 401,
-        headers: { 
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // Handle SSE for MCP streaming
+    if (request.headers.get("Accept") === "text/event-stream") {
+      return handleSSE(request, typedEnv, userId);
+    }
+
+    // Handle MCP POST requests
+    if (request.method === "POST") {
+      const mcpRequest = await request.json() as MCPRequest;
+      const response = await handleMCPRequest(mcpRequest, typedEnv, userId);
+      return new Response(JSON.stringify(response), {
+        headers: {
           "Content-Type": "application/json",
           "Access-Control-Allow-Origin": "*",
         },
       });
     }
 
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
-    };
-
-    // Handle CORS preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
-    }
-
-    // Handle SSE for MCP streaming (Claude Desktop via mcp-remote)
-    if (request.headers.get("Accept") === "text/event-stream") {
-      return handleSSE(request, typedEnv, userId);
-    }
-
-    // Handle MCP POST requests (ChatGPT and other clients)
-    if (request.method === "POST") {
-      try {
-        const mcpRequest = await request.json() as MCPRequest;
-        console.log(`[mcpApiHandler] MCP method: ${mcpRequest.method}`);
-        const response = await handleMCPRequest(mcpRequest, typedEnv, userId);
-        return new Response(JSON.stringify(response), {
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "application/json",
-          },
-        });
-      } catch (error) {
-        console.error(`[mcpApiHandler] Error parsing request:`, error);
-        return new Response(JSON.stringify({
-          jsonrpc: "2.0",
-          error: { code: -32700, message: "Parse error" }
-        }), {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    return new Response(JSON.stringify({
-      jsonrpc: "2.0",
-      error: { code: -32600, message: "Method not allowed" }
-    }), { 
-      status: 405,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return new Response("Method not allowed", { status: 405 });
   },
 };
 
@@ -1004,50 +934,14 @@ const defaultHandler = {
       });
     }
 
-    // OAuth Authorization Server Metadata (RFC 8414) - required for ChatGPT
-    if (url.pathname === "/.well-known/oauth-authorization-server") {
-      return new Response(JSON.stringify({
-        issuer: MCP_SERVER_URL,
-        authorization_endpoint: `${MCP_SERVER_URL}/authorize`,
-        token_endpoint: `${MCP_SERVER_URL}/oauth/token`,
-        registration_endpoint: `${MCP_SERVER_URL}/oauth/register`,
-        scopes_supported: ["openid", "profile", "email"],
-        response_types_supported: ["code"],
-        response_modes_supported: ["query"],
-        grant_types_supported: ["authorization_code", "refresh_token"],
-        token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post", "none"],
-        code_challenge_methods_supported: ["S256"],
-        service_documentation: "https://github.com/ptzimmerman/Podgest",
-      }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    // OpenID Connect Discovery (alternative discovery endpoint)
-    if (url.pathname === "/.well-known/openid-configuration") {
-      return new Response(JSON.stringify({
-        issuer: MCP_SERVER_URL,
-        authorization_endpoint: `${MCP_SERVER_URL}/authorize`,
-        token_endpoint: `${MCP_SERVER_URL}/oauth/token`,
-        registration_endpoint: `${MCP_SERVER_URL}/oauth/register`,
-        scopes_supported: ["openid", "profile", "email"],
-        response_types_supported: ["code"],
-        grant_types_supported: ["authorization_code", "refresh_token"],
-        token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post", "none"],
-        code_challenge_methods_supported: ["S256"],
-      }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    // OAuth Protected Resource Metadata (RFC 9728) - tells clients about MCP server
+    // OAuth Protected Resource Metadata (RFC 9728) - required for mcp-remote
+    // NOTE: URL must NOT have trailing slash to match token audience
     if (url.pathname === "/.well-known/oauth-protected-resource") {
       return new Response(JSON.stringify({
-        resource: MCP_SERVER_URL,
-        authorization_servers: [MCP_SERVER_URL],
+        resource: "https://podgest-mcp.pztest.workers.dev",
+        authorization_servers: ["https://podgest-mcp.pztest.workers.dev"],
         scopes_supported: ["openid", "profile", "email"],
         bearer_methods_supported: ["header"],
-        resource_documentation: "https://github.com/ptzimmerman/Podgest",
       }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
@@ -1118,6 +1012,7 @@ const defaultHandler = {
         }
 
         const user = await userResponse.json() as { id: string; email: string };
+        console.log(`[OAuth] User authenticated: ${user.id} (${user.email})`);
 
         // Complete OAuth authorization
         const { redirectTo } = await typedEnv.OAUTH_PROVIDER.completeAuthorization({
@@ -1130,6 +1025,8 @@ const defaultHandler = {
             email: user.email,
           },
         });
+        
+        console.log(`[OAuth] Authorization complete, redirecting to: ${redirectTo}`);
 
         return new Response(JSON.stringify({ redirect_url: redirectTo }), {
           headers: { ...corsHeaders, "Content-Type": "application/json" },
