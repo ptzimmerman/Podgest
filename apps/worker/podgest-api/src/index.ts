@@ -681,6 +681,9 @@ export default {
           client: inngest,
           functions: [pollSubscriptions, scheduledDigestGeneration],
           signingKey: env.INNGEST_SIGNING_KEY,
+          // Explicitly set the URL so Inngest knows where to call back for crons
+          serveHost: "https://podgest-api.pztest.workers.dev",
+          servePath: "/api/inngest",
         });
         return await handler(request, env, ctx);
       } catch (error) {
@@ -1494,21 +1497,44 @@ async function handleScheduledDigest(env: Env): Promise<Response> {
     
     const now = new Date();
     const generatedFor: string[] = [];
+    const debugInfo: Array<{
+      user_id: string;
+      timezone: string;
+      digest_time: string;
+      current_user_hour: number;
+      current_user_minute: number;
+      target_hour: number;
+      hour_matches: boolean;
+      would_generate: boolean;
+      reason: string;
+    }> = [];
     
     for (const profile of profiles) {
-      // Get current time in user's timezone
-      const userTime = new Date(now.toLocaleString("en-US", { timeZone: profile.timezone }));
-      const userHour = userTime.getHours();
-      const userMinute = userTime.getMinutes();
+      // Get current time in user's timezone using Intl API (more reliable)
+      const formatter = new Intl.DateTimeFormat('en-US', {
+        timeZone: profile.timezone,
+        hour: 'numeric',
+        minute: 'numeric',
+        hour12: false,
+      });
+      const parts = formatter.formatToParts(now);
+      const userHour = parseInt(parts.find(p => p.type === 'hour')?.value || '0');
+      const userMinute = parseInt(parts.find(p => p.type === 'minute')?.value || '0');
       
       // Parse digest_time (e.g., "06:00:00")
-      const [targetHour, targetMinute] = (profile.digest_time || "06:00:00").split(":").map(Number);
+      const [targetHour] = (profile.digest_time || "06:00:00").split(":").map(Number);
+      
+      const hourMatches = userHour === targetHour;
+      const inWindow = userMinute < 30;
+      
+      let reason = "";
+      let wouldGenerate = false;
       
       // Check if current hour matches digest time (within the hour window)
-      // We run hourly, so check if we're in the right hour
-      if (userHour === targetHour && userMinute < 30) {
+      if (hourMatches && inWindow) {
         // Check if we already generated a digest today for this user
-        const today = new Date(userTime).toISOString().split('T')[0];
+        const dateFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: profile.timezone });
+        const today = dateFormatter.format(now); // Returns YYYY-MM-DD format
         
         const existingResponse = await fetch(
           `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${profile.id}&digest_date=eq.${today}&select=id`,
@@ -1536,19 +1562,38 @@ async function handleScheduledDigest(env: Env): Promise<Response> {
           
           if (generateResponse.ok) {
             generatedFor.push(profile.id);
+            wouldGenerate = true;
+            reason = "Generated successfully";
           } else {
-            console.error(`[Scheduled] Failed to generate for ${profile.id}: ${await generateResponse.text()}`);
+            reason = `Generation failed: ${await generateResponse.text()}`;
           }
         } else {
-          console.log(`[Scheduled] Digest already exists for ${profile.id} on ${today}`);
+          reason = `Digest already exists for ${today}`;
         }
+      } else if (!hourMatches) {
+        reason = `Hour mismatch: current=${userHour}, target=${targetHour}`;
+      } else {
+        reason = `Outside 30-min window: minute=${userMinute}`;
       }
+      
+      debugInfo.push({
+        user_id: profile.id,
+        timezone: profile.timezone,
+        digest_time: profile.digest_time,
+        current_user_hour: userHour,
+        current_user_minute: userMinute,
+        target_hour: targetHour,
+        hour_matches: hourMatches,
+        would_generate: wouldGenerate,
+        reason,
+      });
     }
     
     return json({
       checked_users: profiles.length,
       generated_for: generatedFor,
       current_utc: now.toISOString(),
+      debug: debugInfo,
     });
     
   } catch (error) {
