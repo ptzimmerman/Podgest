@@ -741,7 +741,114 @@ export default {
 
     return json({ error: "Not found" }, 404);
   },
+
+  // Cloudflare Cron Triggers - more reliable than Inngest
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    const cronPattern = event.cron;
+    console.log(`[Cron] Triggered: ${cronPattern} at ${new Date().toISOString()}`);
+    
+    // Every 15 minutes - poll RSS feeds
+    if (cronPattern === "*/15 * * * *") {
+      console.log("[Cron] Running RSS poll...");
+      ctx.waitUntil(
+        pollAllSubscriptions(env)
+          .then(result => console.log(`[Cron] RSS poll complete: ${JSON.stringify(result)}`))
+          .catch(err => console.error(`[Cron] RSS poll error: ${err}`))
+      );
+    }
+    
+    // Every hour - check and generate digests
+    if (cronPattern === "0 * * * *") {
+      console.log("[Cron] Running scheduled digest check...");
+      ctx.waitUntil(
+        runScheduledDigest(env)
+          .then(result => console.log(`[Cron] Digest check complete: ${JSON.stringify(result)}`))
+          .catch(err => console.error(`[Cron] Digest check error: ${err}`))
+      );
+    }
+  },
 };
+
+// Run scheduled digest - same logic as handleScheduledDigest but returns data instead of Response
+async function runScheduledDigest(env: Env): Promise<{ generated_for: string[], checked_users: number }> {
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  
+  const profilesResponse = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/profiles?select=id,timezone,digest_time`,
+    { headers }
+  );
+  
+  if (!profilesResponse.ok) {
+    throw new Error("Failed to fetch profiles");
+  }
+  
+  const profiles = await profilesResponse.json() as Array<{
+    id: string;
+    timezone: string;
+    digest_time: string;
+  }>;
+  
+  const now = new Date();
+  const generatedFor: string[] = [];
+  
+  for (const profile of profiles) {
+    // Get current time in user's timezone using Intl API
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: profile.timezone,
+      hour: 'numeric',
+      minute: 'numeric',
+      hour12: false,
+    });
+    const parts = formatter.formatToParts(now);
+    const userHour = parseInt(parts.find(p => p.type === 'hour')?.value || '0');
+    const userMinute = parseInt(parts.find(p => p.type === 'minute')?.value || '0');
+    
+    const [targetHour] = (profile.digest_time || "06:00:00").split(":").map(Number);
+    
+    console.log(`[Cron] User ${profile.id}: timezone=${profile.timezone}, current=${userHour}:${userMinute}, target=${targetHour}:00`);
+    
+    // Check if current hour matches digest time (within first 30 min of the hour)
+    if (userHour === targetHour && userMinute < 30) {
+      const dateFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: profile.timezone });
+      const today = dateFormatter.format(now);
+      
+      // Check if digest already exists for today
+      const existingResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${profile.id}&digest_date=eq.${today}&select=id`,
+        { headers }
+      );
+      
+      const existing = await existingResponse.json() as Array<{ id: string }>;
+      
+      if (existing.length === 0) {
+        console.log(`[Cron] Generating digest for user ${profile.id}`);
+        
+        const generateResponse = await fetch(
+          `https://podgest-api.pztest.workers.dev/api/generate-digest`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ user_id: profile.id, hours_back: 24 }),
+          }
+        );
+        
+        if (generateResponse.ok) {
+          generatedFor.push(profile.id);
+        } else {
+          console.error(`[Cron] Failed to generate for ${profile.id}: ${await generateResponse.text()}`);
+        }
+      } else {
+        console.log(`[Cron] Digest already exists for ${profile.id} on ${today}`);
+      }
+    }
+  }
+  
+  return { generated_for: generatedFor, checked_users: profiles.length };
+}
 
 // ============================================
 // HELPERS
