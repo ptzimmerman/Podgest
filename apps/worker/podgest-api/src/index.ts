@@ -745,10 +745,13 @@ export default {
   // Cloudflare Cron Triggers - more reliable than Inngest
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     const cronPattern = event.cron;
-    console.log(`[Cron] Triggered: ${cronPattern} at ${new Date().toISOString()}`);
+    const scheduledTime = new Date(event.scheduledTime);
+    const minute = scheduledTime.getUTCMinutes();
     
-    // Every 15 minutes - poll RSS feeds
-    if (cronPattern === "*/15 * * * *") {
+    console.log(`[Cron] Triggered: pattern="${cronPattern}", scheduledTime=${scheduledTime.toISOString()}, minute=${minute}`);
+    
+    // Every 15 minutes - poll RSS feeds (fires at :00, :15, :30, :45)
+    if (cronPattern.includes("*/15") || minute % 15 === 0) {
       console.log("[Cron] Running RSS poll...");
       ctx.waitUntil(
         pollAllSubscriptions(env)
@@ -757,8 +760,8 @@ export default {
       );
     }
     
-    // Every hour - check and generate digests
-    if (cronPattern === "0 * * * *") {
+    // Every hour at :00 - check and generate digests
+    if (cronPattern.startsWith("0 ") || minute === 0) {
       console.log("[Cron] Running scheduled digest check...");
       ctx.waitUntil(
         runScheduledDigest(env)
