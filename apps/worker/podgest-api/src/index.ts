@@ -738,6 +738,18 @@ export default {
     if (url.pathname === "/api/admin/update-profile" && request.method === "POST") {
       return handleUpdateProfile(request, env);
     }
+    
+    // ElevenReader transcript - returns latest digest script as plain text
+    // URL: /transcript/latest or /transcript/{userId}
+    if (url.pathname.startsWith("/transcript/")) {
+      return handleLatestTranscript(url.pathname, env);
+    }
+    
+    // Daily cron trigger - can be called by Supabase pg_cron or external scheduler
+    // This runs the full daily workflow: poll + digest
+    if (url.pathname === "/api/daily-cron" && request.method === "POST") {
+      return handleDailyCron(env, ctx);
+    }
 
     return json({ error: "Not found" }, 404);
   },
@@ -1381,6 +1393,98 @@ async function handleUpdateProfile(request: Request, env: Env): Promise<Response
   }
 }
 
+// Serve the latest digest transcript for ElevenReader
+// URL: /transcript/latest or /transcript/{userId}
+async function handleLatestTranscript(pathname: string, env: Env): Promise<Response> {
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+  };
+  
+  // Get user ID - either from path or use default
+  let userId = "18f513bd-8ecf-4922-84b7-4ab7c7cc14df"; // Default user
+  const pathParts = pathname.split("/");
+  if (pathParts[2] && pathParts[2] !== "latest") {
+    userId = pathParts[2];
+  }
+  
+  // Get the latest completed digest for this user
+  const digestResponse = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&status=eq.completed&order=created_at.desc&limit=1`,
+    { headers }
+  );
+  
+  if (!digestResponse.ok) {
+    return new Response("Error fetching digest", { status: 500 });
+  }
+  
+  const digests = await digestResponse.json() as Array<{
+    id: string;
+    digest_date: string;
+    topic_clusters: { title: string; topics: string[] };
+    script_text?: string;
+  }>;
+  
+  if (!digests.length) {
+    return new Response("No digest found", { status: 404 });
+  }
+  
+  const digest = digests[0];
+  
+  // If we have script_text stored, use that
+  if (digest.script_text) {
+    return new Response(digest.script_text, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "public, max-age=300", // Cache for 5 minutes
+      },
+    });
+  }
+  
+  // Otherwise, generate a summary from topic_clusters
+  const topics = digest.topic_clusters?.topics || [];
+  const title = digest.topic_clusters?.title || `Podgest - ${digest.digest_date}`;
+  
+  const transcript = `${title}
+
+Today's topics:
+${topics.map((t, i) => `${i + 1}. ${t}`).join("\n")}
+
+Listen to the full audio digest at:
+https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/${digest.id}/digest.mp3
+`;
+  
+  return new Response(transcript, {
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "public, max-age=300",
+    },
+  });
+}
+
+// Daily cron trigger - can be called by Supabase pg_cron or any external scheduler
+// This runs: 1) Poll RSS feeds, 2) Wait, 3) Generate digest for all users at their scheduled time
+async function handleDailyCron(env: Env, ctx: ExecutionContext): Promise<Response> {
+  console.log("[DailyCron] Starting daily workflow...");
+  
+  // Step 1: Poll all RSS feeds
+  console.log("[DailyCron] Step 1: Polling RSS feeds...");
+  const pollResult = await pollAllSubscriptions(env);
+  console.log(`[DailyCron] Poll complete: ${JSON.stringify(pollResult)}`);
+  
+  // Step 2: Run scheduled digest check for all users
+  console.log("[DailyCron] Step 2: Running scheduled digest generation...");
+  const digestResult = await runScheduledDigest(env);
+  console.log(`[DailyCron] Digest check complete: ${JSON.stringify(digestResult)}`);
+  
+  return json({
+    success: true,
+    timestamp: new Date().toISOString(),
+    poll_result: pollResult,
+    digest_result: digestResult,
+  });
+}
+
 async function handleReembedAll(env: Env, request?: Request): Promise<Response> {
   // Parse offset from query string if request provided
   let offset = 0;
@@ -1872,6 +1976,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
       digest_date: new Date().toISOString().split('T')[0],
       status: "generating", // Will be updated to "completed" by webhook
       topic_clusters: { topics: script.topics_covered, title: script.title },
+      script_text: script.script, // Store full script for ElevenReader
       audio_storage_path: `${digestId}/digest.mp3`,
       audio_url: null, // Will be set by webhook
       duration_seconds: estimatedDuration,
