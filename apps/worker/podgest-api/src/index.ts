@@ -1,15 +1,11 @@
-import { Inngest } from "inngest";
-import { serve } from "inngest/cloudflare";
-
 export interface Env {
   SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
-  INNGEST_EVENT_KEY: string;
-  INNGEST_SIGNING_KEY: string;
   ANTHROPIC_API_KEY: string;
   SUPERMEMORY_API_KEY: string;
   ELEVENLABS_API_KEY: string;
 }
+// Note: Inngest removed - now using Supabase pg_cron for scheduling
 
 // Voice ID for news broadcaster style
 const VOICE_BROADCASTER = "cjVigY5qzO86Huf0OWal"; // Eric - Smooth, Trustworthy
@@ -255,55 +251,6 @@ async function downloadTranscript(transcriptInfo: TranscriptInfo): Promise<strin
 
 // Cache for original RSS URLs (podcast URL -> RSS URL)
 const rssUrlCache = new Map<string, string | null>();
-
-// ============================================
-// INNGEST CLIENT & FUNCTIONS
-// ============================================
-
-const inngest = new Inngest({ 
-  id: "podgest",
-  isDev: false,
-});
-
-const pollSubscriptions = inngest.createFunction(
-  { id: "poll-subscriptions" },
-  { cron: "*/15 * * * *" },
-  async ({ step, logger }) => {
-    logger.info("RSS poll triggered - calling endpoint");
-    
-    const result = await step.run("poll-rss-feeds", async () => {
-      const response = await fetch(
-        "https://podgest-api.pztest.workers.dev/api/poll",
-        { method: "POST", headers: { "Content-Type": "application/json" } }
-      );
-      return response.json();
-    });
-    
-    logger.info(`RSS poll result: ${JSON.stringify(result)}`);
-    return result;
-  }
-);
-
-// Daily digest generation - runs every hour and checks which users need digests
-const scheduledDigestGeneration = inngest.createFunction(
-  { id: "scheduled-digest-generation" },
-  { cron: "0 * * * *" }, // Every hour on the hour
-  async ({ step, logger }) => {
-    logger.info("Scheduled digest check triggered - calling endpoint");
-    
-    // Call our own endpoint to check and generate digests
-    const result = await step.run("check-and-generate", async () => {
-      const response = await fetch(
-        "https://podgest-api.pztest.workers.dev/api/scheduled-digest",
-        { method: "POST", headers: { "Content-Type": "application/json" } }
-      );
-      return response.json();
-    });
-    
-    logger.info(`Scheduled digest result: ${JSON.stringify(result)}`);
-    return result;
-  }
-);
 
 // ============================================
 // RSS PARSING
@@ -674,24 +621,6 @@ export default {
       }
     }
 
-    // Inngest endpoint
-    if (url.pathname === "/api/inngest") {
-      try {
-        const handler = serve({
-          client: inngest,
-          functions: [pollSubscriptions, scheduledDigestGeneration],
-          signingKey: env.INNGEST_SIGNING_KEY,
-          // Explicitly set the URL so Inngest knows where to call back for crons
-          serveHost: "https://podgest-api.pztest.workers.dev",
-          servePath: "/api/inngest",
-        });
-        return await handler(request, env, ctx);
-      } catch (error) {
-        console.error("[Inngest] Error:", error);
-        return json({ error: error instanceof Error ? error.message : String(error) }, 500);
-      }
-    }
-
     // Modal transcription webhook
     if (url.pathname === "/api/webhooks/modal" && request.method === "POST") {
       return handleModalWebhook(request, env, ctx);
@@ -717,7 +646,7 @@ export default {
       return handleGenerateDigest(request, env, ctx);
     }
     
-    // Scheduled digest generation (called by Inngest cron)
+    // Scheduled digest generation (called by pg_cron via /api/daily-cron)
     if (url.pathname === "/api/scheduled-digest" && request.method === "POST") {
       return handleScheduledDigest(env);
     }
@@ -753,35 +682,7 @@ export default {
 
     return json({ error: "Not found" }, 404);
   },
-
-  // Cloudflare Cron Triggers - more reliable than Inngest
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    const cronPattern = event.cron;
-    const scheduledTime = new Date(event.scheduledTime);
-    const minute = scheduledTime.getUTCMinutes();
-    
-    console.log(`[Cron] Triggered: pattern="${cronPattern}", scheduledTime=${scheduledTime.toISOString()}, minute=${minute}`);
-    
-    // Every 15 minutes - poll RSS feeds (fires at :00, :15, :30, :45)
-    if (cronPattern.includes("*/15") || minute % 15 === 0) {
-      console.log("[Cron] Running RSS poll...");
-      ctx.waitUntil(
-        pollAllSubscriptions(env)
-          .then(result => console.log(`[Cron] RSS poll complete: ${JSON.stringify(result)}`))
-          .catch(err => console.error(`[Cron] RSS poll error: ${err}`))
-      );
-    }
-    
-    // Every hour at :00 - check and generate digests
-    if (cronPattern.startsWith("0 ") || minute === 0) {
-      console.log("[Cron] Running scheduled digest check...");
-      ctx.waitUntil(
-        runScheduledDigest(env)
-          .then(result => console.log(`[Cron] Digest check complete: ${JSON.stringify(result)}`))
-          .catch(err => console.error(`[Cron] Digest check error: ${err}`))
-      );
-    }
-  },
+  // Note: Cron triggers removed - now using Supabase pg_cron via /api/daily-cron endpoint
 };
 
 // Run scheduled digest - same logic as handleScheduledDigest but returns data instead of Response
