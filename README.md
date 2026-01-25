@@ -49,6 +49,130 @@ You subscribe to many podcasts but don't have time to listen to them all. Hours 
 
 ---
 
+## System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              SUPABASE CLOUD                                  │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────────────┐  │
+│  │   PostgreSQL    │  │     Storage     │  │         pg_cron             │  │
+│  │  - profiles     │  │  - transcripts  │  │  ┌─────────────────────┐    │  │
+│  │  - episodes     │  │  - audio files  │  │  │ daily-digest-6am    │    │  │
+│  │  - digests      │  │  - cover art    │  │  │ (0 12 * * * UTC)    │────┼──┼───┐
+│  │  - subscriptions│  │                 │  │  ├─────────────────────┤    │  │   │
+│  │  - transcripts  │  │                 │  │  │ watchdog-hourly     │    │  │   │
+│  └────────┬────────┘  └────────┬────────┘  │  │ (30 * * * * UTC)    │────┼──┼───┤
+│           │                    │           │  └─────────────────────┘    │  │   │
+│           │                    │           └─────────────────────────────┘  │   │
+└───────────┼────────────────────┼────────────────────────────────────────────┘   │
+            │                    │                                                 │
+            │  Supabase REST API │                                                 │
+            ▼                    ▼                                                 │
+┌─────────────────────────────────────────────────────────────────────────────┐   │
+│                        CLOUDFLARE WORKERS                                    │   │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │   │
+│  │                     podgest-api Worker                               │◄───┼───┘
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  │    │
+│  │  │ /api/poll   │  │/api/generate│  │/api/daily-  │  │/transcript/│  │    │
+│  │  │             │  │  -digest    │  │    cron     │  │  latest    │  │    │
+│  │  │ RSS polling │  │ Script gen  │  │ Full flow   │  │ For Reader │  │    │
+│  │  └──────┬──────┘  └──────┬──────┘  └─────────────┘  └────────────┘  │    │
+│  └─────────┼────────────────┼──────────────────────────────────────────┘    │
+│            │                │                                                │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                     podgest-mcp Worker                               │    │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  │    │
+│  │  │search_pods  │  │get_episode  │  │compare_takes│  │listen_to_  │  │    │
+│  │  │             │  │             │  │             │  │  episode   │  │    │
+│  │  │ SuperMemory │  │ Full detail │  │ Topic views │  │ Deep links │  │    │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘  └────────────┘  │    │
+│  └──────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
+            │                │
+            │                │ Webhook callbacks
+            ▼                ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              MODAL                                           │
+│  ┌─────────────────────────────┐  ┌─────────────────────────────────────┐   │
+│  │     Transcriber (GPU)       │  │         TTS Generator               │   │
+│  │  - Download audio           │  │  - ElevenLabs API calls             │   │
+│  │  - ffmpeg preprocessing     │  │  - Audio chunking & concatenation   │   │
+│  │  - faster-whisper (A10G)    │  │  - Upload to Supabase Storage       │   │
+│  │  - Webhook on completion    │  │  - Webhook on completion            │   │
+│  └─────────────────────────────┘  └─────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           SUPERMEMORY                                        │
+│  - Semantic embeddings of all transcripts                                    │
+│  - Filtered by user_id (containerTags)                                       │
+│  - Metadata: podcast_title, episode_title, published_at                      │
+│  - Enables cross-episode Q&A queries                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Daily Digest Flow
+
+```
+6:00 AM (User's Timezone)
+         │
+         ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   pg_cron       │────▶│  /api/daily-    │────▶│   Poll RSS      │
+│ trigger_daily   │     │     cron        │     │   feeds         │
+│    _digest()    │     │                 │     │                 │
+└─────────────────┘     └─────────────────┘     └────────┬────────┘
+                                                         │
+         ┌───────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  New episodes?  │────▶│ Modal: Transcribe│────▶│  Claude: Extract│
+│                 │     │  (GPU)          │     │  topics         │
+└─────────────────┘     └─────────────────┘     └────────┬────────┘
+                                                         │
+         ┌───────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  SuperMemory    │────▶│  Claude: Generate│────▶│  Modal: TTS     │
+│  embed content  │     │  digest script  │     │  (ElevenLabs)   │
+└─────────────────┘     └─────────────────┘     └────────┬────────┘
+                                                         │
+         ┌───────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────┐     ┌─────────────────┐
+│  Upload to      │────▶│  Available in   │
+│  Supabase       │     │  podcast apps   │
+│  Storage        │     │  & ElevenReader │
+└─────────────────┘     └─────────────────┘
+```
+
+### Watchdog Pattern (Reliability)
+
+The system has TWO scheduling mechanisms for reliability:
+
+1. **Primary: `daily-digest-6am`** - Runs at 12:00 UTC (6 AM Mexico City)
+2. **Backup: `watchdog-hourly`** - Runs at :30 past every hour, checks if today's digest exists, triggers if missing
+
+```sql
+-- Watchdog function (simplified)
+CREATE FUNCTION watchdog_check_digest() RETURNS jsonb AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM digests WHERE digest_date = CURRENT_DATE) THEN
+    -- No digest today - trigger generation via HTTP
+    PERFORM net.http_post('https://podgest-api.../api/daily-cron');
+    RETURN '{"status": "triggered"}'::jsonb;
+  END IF;
+  RETURN '{"status": "ok"}'::jsonb;
+END;
+$$;
+```
+
+---
+
 ## Phase 1: Daily Podcast Digest
 
 ### 1.1 Podcast Aggregation
