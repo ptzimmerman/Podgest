@@ -1059,47 +1059,24 @@ Most podcasts release new episodes overnight, so 5-6 AM ensures fresh content.
 ```
 podgest/
 ├── apps/
-│   ├── web/                          # API endpoints + minimal UI (SvelteKit)
-│   │   ├── src/
-│   │   │   ├── routes/
-│   │   │   │   ├── +page.svelte              # Status dashboard (optional)
-│   │   │   │   ├── login/+page.svelte        # OAuth flow
-│   │   │   │   ├── tokens/+page.svelte       # MCP token generation
-│   │   │   │   └── api/
-│   │   │   │       ├── (removed inngest)      # Now using pg_cron
-│   │   │   │       ├── feed/[userId]/+server.ts  # Podcast RSS feed
-│   │   │   │       └── webhooks/
-│   │   │   │           └── modal/+server.ts  # Modal completion callback
-│   │   │   └── lib/
-│   │   │       ├── supabase.ts
-│   │   │       └── (removed)                  # Inngest removed
-│   │   ├── package.json
-│   │   └── svelte.config.js
+│   ├── worker/
+│   │   └── podgest-api/              # Main API (Cloudflare Worker)
+│   │       ├── src/
+│   │       │   └── index.ts          # All endpoints: poll, generate, webhooks, RSS feed
+│   │       ├── wrangler.jsonc
+│   │       └── package.json
 │   │
-│   └── mcp-server/                   # Cloudflare Worker
+│   └── mcp-server/                   # MCP Server (Cloudflare Worker)
 │       ├── src/
-│       │   ├── index.ts              # MCP protocol handler
-│       │   ├── auth.ts               # Token validation
-│       │   ├── tools/
-│       │   │   ├── search.ts
-│       │   │   ├── episode.ts
-│       │   │   └── compare.ts
-│       │   └── supermemory.ts
-│       ├── wrangler.toml
+│       │   └── index.ts              # MCP protocol + OAuth + tools
+│       ├── wrangler.jsonc
 │       └── package.json
 │
 ├── packages/
-│   ├── core/                         # Shared types and constants
-│   │   ├── src/
-│   │   │   ├── types.ts
-│   │   │   └── constants.ts
-│   │   └── package.json
-│   │
-│   └── workflows/                    # (deprecated - moved to podgest-api worker)
+│   └── core/                         # Shared types and constants
 │       ├── src/
-│       │   ├── client.ts             # (removed)
-│       │   ├── functions/            # Logic now in podgest-api worker
-│       │   └── events.ts             # (removed)
+│       │   ├── types.ts
+│       │   └── constants.ts
 │       └── package.json
 │
 ├── modal/
