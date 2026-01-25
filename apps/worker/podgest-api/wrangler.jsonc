@@ -6,11 +6,6 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
     "enabled": true
-  },
-  "triggers": {
-    "crons": [
-      "*/15 * * * *",
-      "0 * * * *"
-    ]
   }
+  // Note: Cron triggers removed - now using Supabase pg_cron for scheduling
 }
