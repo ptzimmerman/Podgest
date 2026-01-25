@@ -143,11 +143,29 @@ You subscribe to many podcasts but don't have time to listen to them all. Hours 
          ┌───────────────────────────────────────────────┘
          │
          ▼
-┌─────────────────┐     ┌─────────────────┐
-│  Upload to      │────▶│  Available in   │
-│  Supabase       │     │  podcast apps   │
-│  Storage        │     │  & ElevenReader │
-└─────────────────┘     └─────────────────┘
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Upload to      │────▶│  Update digest  │────▶│   OUTPUT URLs   │
+│  Supabase       │     │  record with    │     │                 │
+│  Storage        │     │  script_text    │     │                 │
+└─────────────────┘     └─────────────────┘     └────────┬────────┘
+                                                         │
+         ┌───────────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                        CONSUMER ENDPOINTS                         │
+│                                                                   │
+│  📻 RSS Feed (Spotify/Overcast/Apple Podcasts):                   │
+│     https://podgest-api.pztest.workers.dev/feed/{user_id}.xml    │
+│                                                                   │
+│  📝 ElevenReader Transcript (overwritten daily):                  │
+│     https://podgest-api.pztest.workers.dev/transcript/latest     │
+│     → Returns full script_text as plain text                      │
+│     → Always serves the most recent completed digest              │
+│                                                                   │
+│  🎧 Direct Audio:                                                 │
+│     https://...supabase.co/storage/v1/object/public/digests/...  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Watchdog Pattern (Reliability)
