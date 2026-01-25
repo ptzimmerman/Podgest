@@ -180,7 +180,7 @@ $$;
 | Component | Technology | Purpose |
 |-----------|------------|---------|
 | **Feed Storage** | Supabase Postgres | User podcast subscriptions |
-| **RSS Polling** | Inngest cron function | Check feeds every 30 min |
+| **RSS Polling** | Supabase pg_cron | Check feeds every 15 min via Cloudflare Worker |
 | **Episode Registry** | Supabase Postgres | Track processed episodes, prevent duplicates |
 
 **Managing Subscriptions:**
@@ -197,7 +197,7 @@ $$;
 
 | Component | Technology | Purpose |
 |-----------|------------|---------|
-| **Orchestration** | Inngest | Event-driven workflow with retries |
+| **Orchestration** | Supabase pg_cron + Webhooks | Cron triggers + webhook callbacks |
 | **Compute** | Modal (GPU) | Serverless A10G for Whisper |
 | **Model** | `faster-whisper` (base) | Balance of speed and accuracy |
 | **Preprocessing** | ffmpeg | Mono, 16kHz, silence removal |
@@ -577,7 +577,7 @@ If Claude needs the full transcript, it can fetch from the signed URL directly. 
 | Processing Step | Where It Runs |
 |-----------------|---------------|
 | Database + Auth + Storage | Supabase Cloud |
-| Workflow orchestration | Inngest (cloud) |
+| Workflow orchestration | Supabase pg_cron + Webhooks |
 | Transcription + ffmpeg | Modal (cloud GPU) |
 | Embeddings + search | SuperMemory (cloud) |
 | TTS generation | ElevenLabs API |
@@ -594,7 +594,7 @@ If Claude needs the full transcript, it can fetch from the signed URL directly. 
 | Decision | Rationale |
 |----------|-----------|
 | **Supabase Cloud** | Managed Postgres, Auth, Storage, Edge Functions — no Docker needed |
-| **Inngest** | Cloud workflow orchestration; built-in retries, step resumability |
+| **Supabase pg_cron** | Built-in cron scheduling, watchdog pattern for reliability |
 | **Modal** | Serverless GPU; ffmpeg + Whisper run there, not locally |
 | **Deepgram as fallback** | Managed transcription if Modal has issues |
 | **SuperMemory (or pgvector)** | Managed embeddings + search; verify filtering support early |
@@ -611,7 +611,7 @@ If Claude needs the full transcript, it can fetch from the signed URL directly. 
 | **Monolithic Edge Functions** | Timeout limits, hard to debug |
 | **Polling for job completion** | Use webhooks instead |
 | **Full transcripts in Postgres** | Use object storage |
-| **DIY job queue** | Use Inngest |
+| **DIY job queue** | Use pg_cron + webhooks |
 
 ---
 
@@ -623,9 +623,9 @@ Based on experience with similar podcast ingestion systems, here are anti-patter
 
 | Anti-Pattern | Problem | Our Approach |
 |--------------|---------|--------------|
-| **Monolithic functions** | Timeout limits, one failure breaks chain, hard to debug | Small, focused Inngest functions (<100 lines each) |
+| **Monolithic functions** | Timeout limits, one failure breaks chain, hard to debug | Small, focused webhook handlers with isolated failures |
 | **Polling for async jobs** | Wastes execution time, risks timeout, orphans jobs | Webhook callbacks from Modal |
-| **DIY job queue in DB** | No retries, no dead-letter, race conditions | Inngest for workflow orchestration |
+| **DIY job queue in DB** | No retries, no dead-letter, race conditions | pg_cron + watchdog pattern for reliability |
 | **Full documents in Postgres** | Bloats DB, slows queries | Tiered storage (Postgres → S3 → SuperMemory) |
 | **Tight coupling** | One failure cascades, no recovery | Event-driven architecture |
 | **GPU workarounds** | CPU fallback is 5-10x slower | Proper GPU config + managed fallback (Deepgram) |
@@ -634,7 +634,9 @@ Based on experience with similar podcast ingestion systems, here are anti-patter
 
 ## Architecture
 
-### Event-Driven Pipeline
+### Webhook-Based Pipeline
+
+The system uses a simple, reliable webhook-based architecture with Supabase pg_cron for scheduling:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -642,76 +644,81 @@ Based on experience with similar podcast ingestion systems, here are anti-patter
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                  │
 │  ┌─────────────────────────────────────────────────────────────────────────────┐│
-│  │                         EVENT BUS (Inngest)                                 ││
+│  │                      SUPABASE pg_cron (Scheduler)                           ││
+│  │  ┌────────────────────┐  ┌────────────────────┐                             ││
+│  │  │ daily-digest-6am   │  │ watchdog-hourly    │                             ││
+│  │  │ (0 12 * * * UTC)   │  │ (30 * * * * UTC)   │                             ││
+│  │  └─────────┬──────────┘  └─────────┬──────────┘                             ││
+│  └────────────┼───────────────────────┼────────────────────────────────────────┘│
+│               │                       │                                          │
+│               └───────────┬───────────┘                                          │
+│                           │ HTTP POST                                            │
+│                           ▼                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐│
+│  │                    CLOUDFLARE WORKER (podgest-api)                          ││
+│  │                                                                             ││
+│  │   /api/daily-cron ─────┬─────▶ Poll RSS feeds                               ││
+│  │                        │       │                                             ││
+│  │                        │       ▼                                             ││
+│  │                        │   New episodes? ──▶ Trigger Modal transcription    ││
+│  │                        │                           │                         ││
+│  │                        │                           │ webhook                 ││
+│  │                        │                           ▼                         ││
+│  │   /api/webhooks/modal ◀────────────────── Transcription complete            ││
+│  │         │                                                                    ││
+│  │         ▼                                                                    ││
+│  │   Extract topics (Claude) ──▶ Embed in SuperMemory                          ││
+│  │                        │                                                     ││
+│  │                        ▼                                                     ││
+│  │                   Check user digest_time                                     ││
+│  │                        │                                                     ││
+│  │                        ▼                                                     ││
+│  │   /api/generate-digest ──▶ Generate script (Claude)                         ││
+│  │                              │                                               ││
+│  │                              │ HTTP POST                                     ││
+│  │                              ▼                                               ││
+│  │                         Modal TTS ──▶ ElevenLabs ──▶ Upload audio           ││
+│  │                              │                                               ││
+│  │                              │ webhook                                       ││
+│  │                              ▼                                               ││
+│  │   /api/webhooks/tts ◀─── TTS complete, update digest record                 ││
+│  │                                                                             ││
 │  └─────────────────────────────────────────────────────────────────────────────┘│
-│        ▲                    ▲                    ▲                    ▲         │
-│        │                    │                    │                    │         │
-│  ┌─────┴─────┐       ┌──────┴──────┐      ┌──────┴──────┐      ┌──────┴──────┐ │
-│  │   RSS     │       │  Transcribe │      │   Extract   │      │   Embed     │ │
-│  │  Poller   │──────▶│   Worker    │─────▶│   Topics    │─────▶│   Worker    │ │
-│  │  (cron)   │ emit  │  (Inngest)  │ emit │  (Inngest)  │ emit │  (Inngest)  │ │
-│  └───────────┘       └─────────────┘      └─────────────┘      └─────────────┘ │
-│                             │                                                   │
-│                             ▼                                                   │
-│                      ┌─────────────┐                                           │
-│                      │    Modal    │◀─── webhook callback (not polling)        │
-│                      │    (GPU)    │                                           │
-│                      └─────────────┘                                           │
-│                                                                                 │
+│                                                                                  │
 │  ┌─────────────────────────────────────────────────────────────────────────────┐│
 │  │                              STORAGE LAYER                                  ││
 │  ├──────────────────┬───────────────────────┬──────────────────────────────────┤│
 │  │ Supabase Postgres│  Supabase Storage     │  SuperMemory                     ││
-│  │ - Metadata       │  - Raw transcripts    │  - Semantic chunks               ││
-│  │ - User data      │  - Generated audio    │  - Embeddings                    ││
-│  │ - Events log     │  - Podcast artwork    │  - Search index                  ││
+│  │ - profiles       │  - transcripts/       │  - Semantic chunks               ││
+│  │ - episodes       │  - digests/*.mp3      │  - Embeddings                    ││
+│  │ - digests        │  - cover.png          │  - Search index                  ││
+│  │ - subscriptions  │                       │  - Filtered by user_id           ││
+│  │ - transcriptions │                       │                                  ││
 │  └──────────────────┴───────────────────────┴──────────────────────────────────┘│
-│                                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐│
-│  │                           DAILY DIGEST PIPELINE                             ││
-│  │                                                                             ││
-│  │   ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐     ││
-│  │   │ Collect │──▶│ Cluster │──▶│ Script  │──▶│  TTS    │──▶│ Publish │     ││
-│  │   │ Topics  │   │ Topics  │   │  Gen    │   │(11Labs) │   │   RSS   │     ││
-│  │   └─────────┘   └─────────┘   └─────────┘   └─────────┘   └─────────┘     ││
-│  │                                                                             ││
-│  │   Triggered by: Inngest scheduled job @ 2 AM user-local-time               ││
-│  └─────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                  │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Why Inngest?
+### Why This Architecture?
 
-[Inngest](https://www.inngest.com/) is a serverless workflow engine that solves the hard problems:
+**Simple & Reliable:**
+- No external event bus (removed Inngest dependency)
+- Supabase pg_cron is built into our existing database
+- Webhooks provide natural async handoffs between services
+- Watchdog cron provides automatic retry if primary fails
 
-```typescript
-export const transcribeEpisode = inngest.createFunction(
-  { id: "transcribe-episode", retries: 3 },
-  { event: "episode.created" },
-  async ({ event, step }) => {
-    // Step 1: Call Modal (if this fails, Inngest retries automatically)
-    const transcript = await step.run("transcribe", async () => {
-      return await callModal(event.data.audioUrl);
-    });
-    
-    // Step 2: Extract topics (if step 1 succeeded but step 2 fails, 
-    // Inngest resumes from step 2, doesn't re-run step 1)
-    const topics = await step.run("extract-topics", async () => {
-      return await extractTopics(transcript);
-    });
-    
-    // Step 3: Store in SuperMemory
-    await step.run("embed", async () => {
-      return await superMemory.add(transcript, topics);
-    });
-  }
-);
+**Webhook Flow:**
+```
+pg_cron ──HTTP──▶ Cloudflare Worker ──HTTP──▶ Modal
+                        ▲                        │
+                        │                        │
+                        └────── webhook ─────────┘
 ```
 
 **Benefits:**
-- Built-in retries with exponential backoff
-- Step-level resumability (partial failures don't restart from scratch)
+- Each service is stateless and independently scalable
+- Failures are isolated (Modal failure doesn't affect RSS polling)
+- Easy to debug (every step has HTTP request/response logs)
 - Dead-letter handling for permanently failed jobs
 - Observability dashboard (see all running/failed jobs)
 - Scheduled jobs with timezone support
@@ -745,19 +752,23 @@ def transcribe_audio(audio_url: str, webhook_url: str, job_id: str):
     })
 ```
 
-The webhook handler is a simple endpoint that emits an Inngest event:
+The webhook handler processes the transcription and triggers downstream steps:
 
 ```typescript
-// /api/webhooks/modal
-export async function POST({ request }) {
-  const { job_id, transcript } = await request.json();
+// /api/webhooks/modal (Cloudflare Worker)
+export async function handleModalWebhook(request, env) {
+  const { job_id, transcript, status } = await request.json();
   
-  await inngest.send({
-    name: "transcription.completed",
-    data: { job_id, transcript }
-  });
+  // Update transcription record in Supabase
+  await updateTranscription(env, job_id, transcript, status);
   
-  return new Response("ok");
+  // Extract topics with Claude
+  await extractTopics(env, job_id);
+  
+  // Embed in SuperMemory
+  await embedInSuperMemory(env, job_id);
+  
+  return new Response(JSON.stringify({ success: true }));
 }
 ```
 
@@ -765,8 +776,8 @@ export async function POST({ request }) {
 
 ## Database Schema
 
-> **Note:** Job orchestration is handled by **Inngest**, not a `scheduled_jobs` table. 
-> Inngest provides built-in retries, dead-letter handling, and observability.
+> **Note:** Job orchestration is handled by **Supabase pg_cron** with a watchdog pattern.
+> The primary cron runs at the scheduled time; the watchdog runs hourly to catch any missed runs.
 
 ```sql
 -- ============================================
@@ -1030,13 +1041,13 @@ podgest/
 │   │   │   │   ├── login/+page.svelte        # OAuth flow
 │   │   │   │   ├── tokens/+page.svelte       # MCP token generation
 │   │   │   │   └── api/
-│   │   │   │       ├── inngest/+server.ts    # Inngest webhook endpoint
+│   │   │   │       ├── (removed inngest)      # Now using pg_cron
 │   │   │   │       ├── feed/[userId]/+server.ts  # Podcast RSS feed
 │   │   │   │       └── webhooks/
 │   │   │   │           └── modal/+server.ts  # Modal completion callback
 │   │   │   └── lib/
 │   │   │       ├── supabase.ts
-│   │   │       └── inngest.ts                # Inngest client
+│   │   │       └── (removed)                  # Inngest removed
 │   │   ├── package.json
 │   │   └── svelte.config.js
 │   │
@@ -1059,16 +1070,11 @@ podgest/
 │   │   │   └── constants.ts
 │   │   └── package.json
 │   │
-│   └── workflows/                    # Inngest workflow definitions
+│   └── workflows/                    # (deprecated - moved to podgest-api worker)
 │       ├── src/
-│       │   ├── client.ts             # Inngest client setup
-│       │   ├── functions/
-│       │   │   ├── poll-feeds.ts     # Cron: poll RSS feeds
-│       │   │   ├── transcribe-episode.ts  # Event: episode.created
-│       │   │   ├── extract-topics.ts      # Event: transcription.completed
-│       │   │   ├── embed-content.ts       # Event: topics.extracted
-│       │   │   └── generate-digest.ts     # Cron: daily digest per user
-│       │   └── events.ts             # Event type definitions
+│       │   ├── client.ts             # (removed)
+│       │   ├── functions/            # Logic now in podgest-api worker
+│       │   └── events.ts             # (removed)
 │       └── package.json
 │
 ├── modal/
@@ -1099,11 +1105,11 @@ podgest/
 
 | Concern | Approach |
 |---------|----------|
-| **Job orchestration** | Inngest workflows with step resumability |
+| **Job orchestration** | Supabase pg_cron with watchdog pattern |
 | **Async compute** | Modal webhooks (not polling) |
 | **Large content** | Supabase Storage for blobs, Postgres for metadata |
 | **Search** | SuperMemory for semantic search + embeddings |
-| **Retries** | Inngest automatic with exponential backoff |
+| **Retries** | Watchdog cron checks hourly, retriggers if missing |
 
 ---
 
@@ -1112,20 +1118,20 @@ podgest/
 ### Phase 1: Foundation & Infrastructure
 - [x] Initialize monorepo (pnpm + turborepo)
 - [x] Set up Supabase project with schema + storage buckets
-- [x] Set up Inngest account and local dev environment
+- [x] Set up Supabase pg_cron for scheduling
 - [ ] Implement Google OAuth flow (skipped for now — using magic links)
 - [x] Deploy Modal transcription endpoint with proper GPU config
 - [x] Add initial podcast subscriptions via Supabase dashboard
 
 ### Phase 2: Ingestion Pipeline
 - [x] **Verify SuperMemory** supports user_id, date, podcast filtering ✅ (containerTags + metadata filters)
-- [x] `poll-feeds` Inngest cron function (every 15 min)
-- [x] `transcribe-episode` Inngest function (triggered by episode.created)
+- [x] RSS polling via pg_cron (every 15 min)
+- [x] Transcription trigger via Modal webhook
 - [x] Modal webhook callback endpoint (`/api/webhooks/modal`)
 - [x] `extract-topics` function (Claude Sonnet 4) — auto-triggers after transcription completes
 - [x] `embed-content` function (stores in SuperMemory) — auto-triggers after topic extraction
-- [x] Deploy API (Cloudflare Workers) for Inngest + webhook endpoints
-- [x] Register Inngest app URL in dashboard
+- [x] Deploy API (Cloudflare Workers) for webhook endpoints
+- [x] Configure pg_cron jobs in Supabase
 - [x] Test full pipeline with 2-3 real podcasts
 
 ### Phase 3: Digest Generation ✅
@@ -1139,7 +1145,7 @@ podgest/
 - [x] TTS webhook callback (`/api/webhooks/tts`)
 - [x] Store generated audio in Supabase Storage (`digests` bucket)
 - [x] Save digest records to database for RSS feed
-- [x] Scheduled generation via Inngest cron (per-user timezone)
+- [x] Scheduled generation via pg_cron (per-user timezone)
 - [x] Free Edge TTS endpoint for testing (`test-audio` bucket)
 - [ ] Conversational two-host format (future - requires ElevenLabs enterprise)
 
@@ -1327,12 +1333,12 @@ This sub-phase enables proper authentication so multiple users can use Podgest w
 
 #### 5.3 Resilience
 - [ ] Deepgram fallback if Modal GPU issues persist
-- [ ] Inngest dead-letter handling and alerting
+- [x] Watchdog cron for automatic retry of missed runs
 - [ ] Error notification (email or Slack)
 
 #### 5.4 Observability & Tracing
 
-**Problem:** Logs are currently scattered across 6+ dashboards (Cloudflare, Inngest, Modal, Supabase, SuperMemory, ElevenLabs). When something fails, it's hard to trace what happened.
+**Problem:** Logs are currently scattered across 5+ dashboards (Cloudflare, Modal, Supabase, SuperMemory, ElevenLabs). When something fails, it's hard to trace what happened.
 
 **Solution:** Centralized logging with distributed tracing using natural trace IDs.
 
@@ -1595,7 +1601,7 @@ https://api.podgest.yourdomain.com/feed/{userId}
 | `/api/scheduled-digest` | POST | Check all users and generate digests for those at their scheduled time |
 | `/api/extract-topics` | POST | Manually extract topics for an episode (body: `{episode_id}`) |
 | `/api/embed-content` | POST | Manually embed episode in SuperMemory (body: `{episode_id}`) |
-| `/api/inngest` | POST | Inngest webhook handler |
+| `/api/daily-cron` | POST | Triggered by pg_cron, runs full daily workflow |
 | `/api/webhooks/modal` | POST | Modal transcription callback |
 | `/api/webhooks/tts` | POST | Modal TTS completion callback |
 | `/feed/{userId}` | GET | RSS feed for Spotify/podcatchers |
@@ -1656,7 +1662,7 @@ _(None currently — revisit as we build)_
 
 ## References
 
-- [Inngest Documentation](https://www.inngest.com/docs) - Serverless workflow orchestration
+- [Supabase pg_cron](https://supabase.com/docs/guides/database/extensions/pg_cron) - Database cron scheduling
 - [ElevenLabs API Docs](https://elevenlabs.io/docs) - Text-to-speech
 - [Modal Documentation](https://modal.com/docs) - Serverless GPU compute
 - [Deepgram API](https://developers.deepgram.com/) - Managed transcription (fallback)
