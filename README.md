@@ -1000,25 +1000,32 @@ CREATE POLICY "Service role transcript access" ON storage.objects
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    DAILY PIPELINE (User TZ: PST)                    │
+│                 DAILY PIPELINE (User TZ: America/Mexico_City)       │
 ├──────────┬──────────────────────────────────────────────────────────┤
 │ Time     │ Stage                                                    │
 ├──────────┼──────────────────────────────────────────────────────────┤
-│ Ongoing  │ RSS Polling (every 30 min) → Queue new episodes          │
-│ Ongoing  │ Transcription (process queue, ~10 min per hour of audio) │
+│ Ongoing  │ RSS Polling - pg_cron calls /api/daily-cron              │
+│          │   → Checks for new episodes                              │
+│          │   → Triggers Modal transcription for new content         │
+│          │   → Claude extracts topics                               │
+│          │   → SuperMemory embeds content                           │
 │          │                                                          │
-│ 2:00 AM  │ ▶ Digest Generation Triggered                            │
-│ 2:05 AM  │   Collect transcripts from past 24h                      │
-│ 2:10 AM  │   Topic extraction per episode (~2 min)                  │
-│ 2:20 AM  │   Cross-episode topic clustering (~5 min)                │
-│ 2:35 AM  │   Script generation (~3 min)                             │
-│ 2:45 AM  │   ElevenLabs TTS (~10 min for 30-min audio)              │
-│ 3:00 AM  │   Audio post-processing (intro, normalize)               │
-│ 3:15 AM  │   Upload to storage, update RSS feed                     │
-│ 3:20 AM  │ ✅ Digest ready                                          │
+│ 6:00 AM  │ ▶ pg_cron triggers digest generation (12:00 UTC)         │
+│ 6:00 AM  │   Collect transcripts from past 24-48h                   │
+│ 6:00 AM  │   Filter out episodes covered in last 7 days             │
+│ 6:01 AM  │   Claude generates 5-min digest script (~750 words)      │
+│ 6:02 AM  │   Modal calls ElevenLabs TTS                             │
+│ 6:03 AM  │   Audio uploaded to Supabase Storage                     │
+│ 6:03 AM  │   Digest record updated with script_text + audio_url     │
+│ 6:04 AM  │ ✅ Digest ready in RSS feed + /transcript/latest         │
 │          │                                                          │
-│ 6:00 AM  │ User wakes up, digest appears in Spotify                 │
+│ 6:30 AM  │ 🔄 Watchdog cron checks if digest exists (backup)        │
+│          │                                                          │
+│ 7:00 AM  │ User wakes up, digest in Spotify/Overcast/ElevenReader   │
 └──────────┴──────────────────────────────────────────────────────────┘
+
+Note: The 6:00 AM time is configurable per user in the profiles.digest_time column.
+Most podcasts release new episodes overnight, so 5-6 AM ensures fresh content.
 ```
 
 ---
