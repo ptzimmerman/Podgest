@@ -674,6 +674,57 @@ export default {
       return handleLatestTranscript(url.pathname, env);
     }
     
+    // Debug endpoint to check timezone calculation
+    if (url.pathname === "/api/debug-cron" && request.method === "GET") {
+      const headers = {
+        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+      };
+      const profilesResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/profiles?select=id,timezone,digest_time`,
+        { headers }
+      );
+      const profiles = await profilesResponse.json() as Array<{
+        id: string;
+        timezone: string;
+        digest_time: string;
+      }>;
+      
+      const now = new Date();
+      const debug = profiles.map(profile => {
+        const formatter = new Intl.DateTimeFormat('en-US', {
+          timeZone: profile.timezone,
+          hour: 'numeric',
+          minute: 'numeric',
+          hour12: false,
+        });
+        const parts = formatter.formatToParts(now);
+        const userHour = parseInt(parts.find(p => p.type === 'hour')?.value || '0');
+        const userMinute = parseInt(parts.find(p => p.type === 'minute')?.value || '0');
+        const [targetHour] = (profile.digest_time || "06:00:00").split(":").map(Number);
+        
+        const dateFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: profile.timezone });
+        const today = dateFormatter.format(now);
+        
+        return {
+          user_id: profile.id,
+          timezone: profile.timezone,
+          digest_time: profile.digest_time,
+          now_utc: now.toISOString(),
+          user_local_time: `${userHour}:${userMinute.toString().padStart(2, '0')}`,
+          user_hour: userHour,
+          user_minute: userMinute,
+          target_hour: targetHour,
+          would_trigger: userHour === targetHour && userMinute < 30,
+          today_date: today,
+          parts_raw: parts.map(p => ({ type: p.type, value: p.value })),
+        };
+      });
+      
+      return json({ debug, server_time: now.toISOString() });
+    }
+    
     // Daily cron trigger - can be called by Supabase pg_cron or external scheduler
     // This runs the full daily workflow: poll + digest
     if (url.pathname === "/api/daily-cron" && request.method === "POST") {
@@ -685,8 +736,53 @@ export default {
   // Note: Cron triggers removed - now using Supabase pg_cron via /api/daily-cron endpoint
 };
 
-// Run scheduled digest - same logic as handleScheduledDigest but returns data instead of Response
-async function runScheduledDigest(env: Env): Promise<{ generated_for: string[], checked_users: number }> {
+// Internal function to generate digest for a user (used by scheduled cron)
+// Returns { success: boolean, error?: string, digest_id?: string }
+async function generateDigestForUser(
+  env: Env, 
+  userId: string, 
+  hoursBack: number
+): Promise<{ success: boolean; error?: string; digest_id?: string }> {
+  // Create a fake Request object to reuse handleGenerateDigest logic
+  const fakeRequest = new Request("https://internal/api/generate-digest", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, hours_back: hoursBack }),
+  });
+  
+  // We don't have ExecutionContext here, but handleGenerateDigest only uses it for waitUntil
+  // which is optional. Pass a mock that does nothing.
+  const mockCtx: ExecutionContext = {
+    waitUntil: (_promise: Promise<unknown>) => {},
+    passThroughOnException: () => {},
+  };
+  
+  try {
+    const response = await handleGenerateDigest(fakeRequest, env, mockCtx);
+    const data = await response.json() as { success?: boolean; error?: string; digest_id?: string };
+    
+    if (response.ok && data.success !== false) {
+      return { success: true, digest_id: data.digest_id };
+    } else {
+      return { success: false, error: data.error || `HTTP ${response.status}` };
+    }
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+// Run scheduled digest - SIMPLIFIED: just check if today's digest exists, generate if not
+// The time-based scheduling is handled by pg_cron, we don't need to verify it here
+async function runScheduledDigest(env: Env): Promise<{ 
+  generated_for: string[], 
+  checked_users: number,
+  debug?: Array<{
+    user_id: string,
+    today_date: string,
+    digest_exists: boolean,
+    action: string
+  }>
+}> {
   const headers = {
     "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
     "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -710,60 +806,64 @@ async function runScheduledDigest(env: Env): Promise<{ generated_for: string[], 
   
   const now = new Date();
   const generatedFor: string[] = [];
+  const debugInfo: Array<{
+    user_id: string,
+    today_date: string,
+    digest_exists: boolean,
+    action: string
+  }> = [];
   
   for (const profile of profiles) {
-    // Get current time in user's timezone using Intl API
-    const formatter = new Intl.DateTimeFormat('en-US', {
-      timeZone: profile.timezone,
-      hour: 'numeric',
-      minute: 'numeric',
-      hour12: false,
-    });
-    const parts = formatter.formatToParts(now);
-    const userHour = parseInt(parts.find(p => p.type === 'hour')?.value || '0');
-    const userMinute = parseInt(parts.find(p => p.type === 'minute')?.value || '0');
+    // Get today's date in user's timezone
+    const dateFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: profile.timezone });
+    const today = dateFormatter.format(now);
     
-    const [targetHour] = (profile.digest_time || "06:00:00").split(":").map(Number);
+    console.log(`[Cron] Checking user ${profile.id}: timezone=${profile.timezone}, today=${today}`);
     
-    console.log(`[Cron] User ${profile.id}: timezone=${profile.timezone}, current=${userHour}:${userMinute}, target=${targetHour}:00`);
+    const userDebug = {
+      user_id: profile.id,
+      today_date: today,
+      digest_exists: false,
+      action: "checking"
+    };
     
-    // Check if current hour matches digest time (within first 30 min of the hour)
-    if (userHour === targetHour && userMinute < 30) {
-      const dateFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: profile.timezone });
-      const today = dateFormatter.format(now);
+    // Check if digest already exists for today
+    const existingResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${profile.id}&digest_date=eq.${today}&select=id`,
+      { headers }
+    );
+    
+    const existing = await existingResponse.json() as Array<{ id: string }>;
+    userDebug.digest_exists = existing.length > 0;
+    
+    if (existing.length === 0) {
+      console.log(`[Cron] Generating digest for user ${profile.id}`);
+      userDebug.action = "generating";
       
-      // Check if digest already exists for today
-      const existingResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${profile.id}&digest_date=eq.${today}&select=id`,
-        { headers }
-      );
-      
-      const existing = await existingResponse.json() as Array<{ id: string }>;
-      
-      if (existing.length === 0) {
-        console.log(`[Cron] Generating digest for user ${profile.id}`);
-        
-        const generateResponse = await fetch(
-          `https://podgest-api.pztest.workers.dev/api/generate-digest`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ user_id: profile.id, hours_back: 24 }),
-          }
-        );
-        
-        if (generateResponse.ok) {
+      try {
+        // Generate digest inline (avoids subrequest limits and self-call issues)
+        const result = await generateDigestForUser(env, profile.id, 24);
+        if (result.success) {
           generatedFor.push(profile.id);
+          userDebug.action = "generated";
         } else {
-          console.error(`[Cron] Failed to generate for ${profile.id}: ${await generateResponse.text()}`);
+          console.error(`[Cron] Failed to generate for ${profile.id}: ${result.error}`);
+          userDebug.action = `generation_failed:${result.error}`;
         }
-      } else {
-        console.log(`[Cron] Digest already exists for ${profile.id} on ${today}`);
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        console.error(`[Cron] Exception generating for ${profile.id}: ${errorMsg}`);
+        userDebug.action = `generation_error:${errorMsg}`;
       }
+    } else {
+      console.log(`[Cron] Digest already exists for ${profile.id} on ${today}`);
+      userDebug.action = "skipped_already_exists";
     }
+    
+    debugInfo.push(userDebug);
   }
   
-  return { generated_for: generatedFor, checked_users: profiles.length };
+  return { generated_for: generatedFor, checked_users: profiles.length, debug: debugInfo };
 }
 
 // ============================================
