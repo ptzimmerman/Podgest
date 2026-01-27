@@ -1465,24 +1465,37 @@ https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/${dige
 
 // Daily cron trigger - can be called by Supabase pg_cron or any external scheduler
 // This runs: 1) Poll RSS feeds, 2) Wait, 3) Generate digest for all users at their scheduled time
+// CRITICAL: Returns immediately and runs work in background to avoid pg_net timeout
 async function handleDailyCron(env: Env, ctx: ExecutionContext): Promise<Response> {
-  console.log("[DailyCron] Starting daily workflow...");
+  const startTime = new Date().toISOString();
+  console.log(`[DailyCron] Starting daily workflow at ${startTime}...`);
   
-  // Step 1: Poll all RSS feeds
-  console.log("[DailyCron] Step 1: Polling RSS feeds...");
-  const pollResult = await pollAllSubscriptions(env);
-  console.log(`[DailyCron] Poll complete: ${JSON.stringify(pollResult)}`);
+  // Return immediately - run actual work in background
+  // This avoids pg_net's timeout (default 5s, max 60s)
+  ctx.waitUntil((async () => {
+    try {
+      // Step 1: Poll all RSS feeds
+      console.log("[DailyCron] Step 1: Polling RSS feeds...");
+      const pollResult = await pollAllSubscriptions(env);
+      console.log(`[DailyCron] Poll complete: ${JSON.stringify(pollResult)}`);
+      
+      // Step 2: Run scheduled digest check for all users
+      console.log("[DailyCron] Step 2: Running scheduled digest generation...");
+      const digestResult = await runScheduledDigest(env);
+      console.log(`[DailyCron] Digest check complete: ${JSON.stringify(digestResult)}`);
+      
+      console.log(`[DailyCron] Workflow completed successfully`);
+    } catch (error) {
+      console.error(`[DailyCron] Background error: ${error}`);
+    }
+  })());
   
-  // Step 2: Run scheduled digest check for all users
-  console.log("[DailyCron] Step 2: Running scheduled digest generation...");
-  const digestResult = await runScheduledDigest(env);
-  console.log(`[DailyCron] Digest check complete: ${JSON.stringify(digestResult)}`);
-  
+  // Return immediately so pg_net doesn't timeout
   return json({
     success: true,
-    timestamp: new Date().toISOString(),
-    poll_result: pollResult,
-    digest_result: digestResult,
+    status: "triggered",
+    message: "Daily cron triggered - work running in background",
+    timestamp: startTime,
   });
 }
 
