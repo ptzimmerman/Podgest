@@ -740,6 +740,7 @@ export default {
 // Returns { success: boolean, error?: string, digest_id?: string }
 async function generateDigestForUser(
   env: Env, 
+  ctx: ExecutionContext,  // CRITICAL: Need real ctx for waitUntil to work
   userId: string, 
   hoursBack: number
 ): Promise<{ success: boolean; error?: string; digest_id?: string }> {
@@ -750,15 +751,9 @@ async function generateDigestForUser(
     body: JSON.stringify({ user_id: userId, hours_back: hoursBack }),
   });
   
-  // We don't have ExecutionContext here, but handleGenerateDigest only uses it for waitUntil
-  // which is optional. Pass a mock that does nothing.
-  const mockCtx: ExecutionContext = {
-    waitUntil: (_promise: Promise<unknown>) => {},
-    passThroughOnException: () => {},
-  };
-  
   try {
-    const response = await handleGenerateDigest(fakeRequest, env, mockCtx);
+    // Pass real ExecutionContext so waitUntil (used for TTS) actually works
+    const response = await handleGenerateDigest(fakeRequest, env, ctx);
     const data = await response.json() as { success?: boolean; error?: string; digest_id?: string };
     
     if (response.ok && data.success !== false) {
@@ -773,7 +768,7 @@ async function generateDigestForUser(
 
 // Run scheduled digest - SIMPLIFIED: just check if today's digest exists, generate if not
 // The time-based scheduling is handled by pg_cron, we don't need to verify it here
-async function runScheduledDigest(env: Env): Promise<{ 
+async function runScheduledDigest(env: Env, ctx: ExecutionContext): Promise<{ 
   generated_for: string[], 
   checked_users: number,
   debug?: Array<{
@@ -842,7 +837,8 @@ async function runScheduledDigest(env: Env): Promise<{
       
       try {
         // Generate digest inline (avoids subrequest limits and self-call issues)
-        const result = await generateDigestForUser(env, profile.id, 24);
+        // Pass ctx so waitUntil works for TTS trigger
+        const result = await generateDigestForUser(env, ctx, profile.id, 24);
         if (result.success) {
           generatedFor.push(profile.id);
           userDebug.action = "generated";
@@ -1464,38 +1460,43 @@ https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/${dige
 }
 
 // Daily cron trigger - can be called by Supabase pg_cron or any external scheduler
-// This runs: 1) Poll RSS feeds, 2) Wait, 3) Generate digest for all users at their scheduled time
-// CRITICAL: Returns immediately and runs work in background to avoid pg_net timeout
+// This runs: 1) Poll RSS feeds, 2) Generate digest for users who need one
+// Runs synchronously - pg_net should be configured with 60s+ timeout
 async function handleDailyCron(env: Env, ctx: ExecutionContext): Promise<Response> {
   const startTime = new Date().toISOString();
   console.log(`[DailyCron] Starting daily workflow at ${startTime}...`);
   
-  // Return immediately - run actual work in background
-  // This avoids pg_net's timeout (default 5s, max 60s)
-  ctx.waitUntil((async () => {
-    try {
-      // Step 1: Poll all RSS feeds
-      console.log("[DailyCron] Step 1: Polling RSS feeds...");
-      const pollResult = await pollAllSubscriptions(env);
-      console.log(`[DailyCron] Poll complete: ${JSON.stringify(pollResult)}`);
-      
-      // Step 2: Run scheduled digest check for all users
-      console.log("[DailyCron] Step 2: Running scheduled digest generation...");
-      const digestResult = await runScheduledDigest(env);
-      console.log(`[DailyCron] Digest check complete: ${JSON.stringify(digestResult)}`);
-      
-      console.log(`[DailyCron] Workflow completed successfully`);
-    } catch (error) {
-      console.error(`[DailyCron] Background error: ${error}`);
-    }
-  })());
+  let pollResult: unknown = null;
+  let digestResult: unknown = null;
   
-  // Return immediately so pg_net doesn't timeout
+  try {
+    // Step 1: Poll all RSS feeds
+    console.log("[DailyCron] Step 1: Polling RSS feeds...");
+    pollResult = await pollAllSubscriptions(env);
+    console.log(`[DailyCron] Poll complete: ${JSON.stringify(pollResult)}`);
+    
+    // Step 2: Run scheduled digest check for all users
+    console.log("[DailyCron] Step 2: Running scheduled digest generation...");
+    digestResult = await runScheduledDigest(env, ctx);
+    console.log(`[DailyCron] Digest check complete: ${JSON.stringify(digestResult)}`);
+    
+  } catch (error) {
+    console.error(`[DailyCron] Error: ${error}`);
+    return json({
+      success: false,
+      error: String(error),
+      timestamp: startTime,
+      poll_result: pollResult,
+      digest_result: digestResult,
+    }, 500);
+  }
+  
   return json({
     success: true,
-    status: "triggered",
-    message: "Daily cron triggered - work running in background",
+    status: "completed",
     timestamp: startTime,
+    poll_result: pollResult,
+    digest_result: digestResult,
   });
 }
 
