@@ -46,7 +46,7 @@ export function OnboardingKeys() {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${session.access_token}`,
       },
-      body: JSON.stringify({ keyType, key }),
+      body: JSON.stringify({ key_type: keyType, key }),
     })
 
     if (!validateRes.ok) {
@@ -66,7 +66,7 @@ export function OnboardingKeys() {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${session.access_token}`,
       },
-      body: JSON.stringify({ keyType, key }),
+      body: JSON.stringify({ key_type: keyType, key }),
     })
 
     if (!saveRes.ok) {
