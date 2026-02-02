@@ -6,6 +6,8 @@ import { Login } from './pages/Login'
 import { Callback } from './pages/Callback'
 import { Settings } from './pages/Settings'
 import { Subscriptions } from './pages/Subscriptions'
+import { OnboardingKeys } from './pages/onboarding/Keys'
+import { OnboardingPodcasts } from './pages/onboarding/Podcasts'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -25,7 +27,25 @@ function App() {
           <Route path="/login" element={<Login />} />
           <Route path="/callback" element={<Callback />} />
 
-          {/* Protected routes */}
+          {/* Onboarding routes (protected but no layout) */}
+          <Route
+            path="/onboarding/keys"
+            element={
+              <ProtectedRoute>
+                <OnboardingKeys />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/onboarding/podcasts"
+            element={
+              <ProtectedRoute>
+                <OnboardingPodcasts />
+              </ProtectedRoute>
+            }
+          />
+
+          {/* Protected routes with layout */}
           <Route
             element={
               <ProtectedRoute>
