@@ -4,6 +4,7 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   SUPERMEMORY_API_KEY: string;
   ELEVENLABS_API_KEY: string;
+  OPENAI_API_KEY: string;
 }
 // Note: Inngest removed - now using Supabase pg_cron for scheduling
 
@@ -358,7 +359,7 @@ interface Subscription {
   podcast_title: string;
 }
 
-async function pollAllSubscriptions(env: Env): Promise<{
+async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<{
   subscriptions_polled: number;
   new_episodes: number;
   transcriptions_triggered: number;
@@ -382,11 +383,14 @@ async function pollAllSubscriptions(env: Env): Promise<{
   );
   
   if (!subsResponse.ok) {
-    throw new Error(`Failed to fetch subscriptions: ${subsResponse.status}`);
+    const errorMsg = `Failed to fetch subscriptions: ${subsResponse.status}`;
+    await logger?.log('poll_fetch_subscriptions', 'failed', {}, errorMsg);
+    throw new Error(errorMsg);
   }
   
   const subscriptions: Subscription[] = await subsResponse.json();
   console.log(`[Poll] Found ${subscriptions.length} active subscriptions`);
+  await logger?.log('poll_fetch_subscriptions', 'completed', { count: subscriptions.length });
 
   // 2. Process each subscription
   for (const sub of subscriptions) {
@@ -586,6 +590,10 @@ async function pollAllSubscriptions(env: Env): Promise<{
       const errorMsg = `Error processing ${sub.podcast_title}: ${subError}`;
       console.error(`[Poll] ${errorMsg}`);
       errors.push(errorMsg);
+      await logger?.log('poll_subscription_error', 'failed', { 
+        podcast_title: sub.podcast_title,
+        feed_url: sub.feed_url,
+      }, errorMsg);
     }
   }
 
@@ -730,6 +738,17 @@ export default {
     if (url.pathname === "/api/daily-cron" && request.method === "POST") {
       return handleDailyCron(env, ctx);
     }
+    
+    // Pipeline observability - view recent runs
+    if (url.pathname === "/api/pipeline/runs" && request.method === "GET") {
+      return handlePipelineRuns(env, url);
+    }
+    
+    // Pipeline observability - view logs for a specific run
+    if (url.pathname.startsWith("/api/pipeline/run/") && request.method === "GET") {
+      const runId = url.pathname.replace("/api/pipeline/run/", "");
+      return handlePipelineRunLogs(env, runId);
+    }
 
     return json({ error: "Not found" }, 404);
   },
@@ -768,7 +787,7 @@ async function generateDigestForUser(
 
 // Run scheduled digest - SIMPLIFIED: just check if today's digest exists, generate if not
 // The time-based scheduling is handled by pg_cron, we don't need to verify it here
-async function runScheduledDigest(env: Env, ctx: ExecutionContext): Promise<{ 
+async function runScheduledDigest(env: Env, ctx: ExecutionContext, logger?: PipelineLogger): Promise<{ 
   generated_for: string[], 
   checked_users: number,
   debug?: Array<{
@@ -790,7 +809,9 @@ async function runScheduledDigest(env: Env, ctx: ExecutionContext): Promise<{
   );
   
   if (!profilesResponse.ok) {
-    throw new Error("Failed to fetch profiles");
+    const errorMsg = "Failed to fetch profiles";
+    await logger?.log('digest_fetch_profiles', 'failed', {}, errorMsg);
+    throw new Error(errorMsg);
   }
   
   const profiles = await profilesResponse.json() as Array<{
@@ -798,6 +819,8 @@ async function runScheduledDigest(env: Env, ctx: ExecutionContext): Promise<{
     timezone: string;
     digest_time: string;
   }>;
+  
+  await logger?.log('digest_fetch_profiles', 'completed', { user_count: profiles.length });
   
   const now = new Date();
   const generatedFor: string[] = [];
@@ -834,6 +857,11 @@ async function runScheduledDigest(env: Env, ctx: ExecutionContext): Promise<{
     if (existing.length === 0) {
       console.log(`[Cron] Generating digest for user ${profile.id}`);
       userDebug.action = "generating";
+      await logger?.log('digest_user_generate', 'started', { 
+        user_id: profile.id, 
+        timezone: profile.timezone,
+        today_date: today,
+      });
       
       try {
         // Generate digest inline (avoids subrequest limits and self-call issues)
@@ -842,24 +870,78 @@ async function runScheduledDigest(env: Env, ctx: ExecutionContext): Promise<{
         if (result.success) {
           generatedFor.push(profile.id);
           userDebug.action = "generated";
+          await logger?.log('digest_user_generate', 'completed', { 
+            user_id: profile.id, 
+            digest_id: result.digest_id,
+          });
         } else {
           console.error(`[Cron] Failed to generate for ${profile.id}: ${result.error}`);
           userDebug.action = `generation_failed:${result.error}`;
+          await logger?.log('digest_user_generate', 'failed', { user_id: profile.id }, result.error);
         }
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         console.error(`[Cron] Exception generating for ${profile.id}: ${errorMsg}`);
         userDebug.action = `generation_error:${errorMsg}`;
+        await logger?.log('digest_user_generate', 'failed', { user_id: profile.id }, errorMsg);
       }
     } else {
       console.log(`[Cron] Digest already exists for ${profile.id} on ${today}`);
       userDebug.action = "skipped_already_exists";
+      await logger?.log('digest_user_skip', 'completed', { 
+        user_id: profile.id, 
+        reason: 'already_exists',
+        today_date: today,
+      });
     }
     
     debugInfo.push(userDebug);
   }
   
   return { generated_for: generatedFor, checked_users: profiles.length, debug: debugInfo };
+}
+
+// ============================================
+// PIPELINE LOGGING
+// ============================================
+
+interface PipelineLogger {
+  runId: string;
+  log: (step: string, status: 'started' | 'completed' | 'failed', details?: Record<string, unknown>, error?: string) => Promise<void>;
+}
+
+function createPipelineLogger(env: Env): PipelineLogger {
+  const runId = crypto.randomUUID();
+  
+  return {
+    runId,
+    log: async (step: string, status: 'started' | 'completed' | 'failed', details?: Record<string, unknown>, error?: string) => {
+      try {
+        await fetch(
+          `${env.SUPABASE_URL}/rest/v1/pipeline_logs`,
+          {
+            method: "POST",
+            headers: {
+              "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+              "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+              "Content-Type": "application/json",
+              "Prefer": "return=minimal",
+            },
+            body: JSON.stringify({
+              run_id: runId,
+              step,
+              status,
+              details: details || null,
+              error: error || null,
+            }),
+          }
+        );
+      } catch (e) {
+        // Don't let logging failures break the pipeline
+        console.error(`[Logger] Failed to log ${step}:`, e);
+      }
+    },
+  };
 }
 
 // ============================================
@@ -1464,7 +1546,10 @@ https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/${dige
 // Runs synchronously - pg_net should be configured with 60s+ timeout
 async function handleDailyCron(env: Env, ctx: ExecutionContext): Promise<Response> {
   const startTime = new Date().toISOString();
-  console.log(`[DailyCron] Starting daily workflow at ${startTime}...`);
+  const logger = createPipelineLogger(env);
+  
+  console.log(`[DailyCron] Starting daily workflow at ${startTime}, run_id=${logger.runId}`);
+  await logger.log('cron_start', 'started', { timestamp: startTime });
   
   let pollResult: unknown = null;
   let digestResult: unknown = null;
@@ -1472,19 +1557,36 @@ async function handleDailyCron(env: Env, ctx: ExecutionContext): Promise<Respons
   try {
     // Step 1: Poll all RSS feeds
     console.log("[DailyCron] Step 1: Polling RSS feeds...");
-    pollResult = await pollAllSubscriptions(env);
+    await logger.log('poll_start', 'started');
+    
+    pollResult = await pollAllSubscriptions(env, logger);
+    
+    await logger.log('poll_complete', 'completed', pollResult as Record<string, unknown>);
     console.log(`[DailyCron] Poll complete: ${JSON.stringify(pollResult)}`);
     
     // Step 2: Run scheduled digest check for all users
     console.log("[DailyCron] Step 2: Running scheduled digest generation...");
-    digestResult = await runScheduledDigest(env, ctx);
+    await logger.log('digest_start', 'started');
+    
+    digestResult = await runScheduledDigest(env, ctx, logger);
+    
+    await logger.log('digest_complete', 'completed', digestResult as Record<string, unknown>);
     console.log(`[DailyCron] Digest check complete: ${JSON.stringify(digestResult)}`);
     
+    await logger.log('cron_complete', 'completed', {
+      timestamp: new Date().toISOString(),
+      duration_ms: Date.now() - new Date(startTime).getTime(),
+    });
+    
   } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
     console.error(`[DailyCron] Error: ${error}`);
+    await logger.log('cron_error', 'failed', { poll_result: pollResult, digest_result: digestResult }, errorMsg);
+    
     return json({
       success: false,
-      error: String(error),
+      error: errorMsg,
+      run_id: logger.runId,
       timestamp: startTime,
       poll_result: pollResult,
       digest_result: digestResult,
@@ -1494,6 +1596,7 @@ async function handleDailyCron(env: Env, ctx: ExecutionContext): Promise<Respons
   return json({
     success: true,
     status: "completed",
+    run_id: logger.runId,
     timestamp: startTime,
     poll_result: pollResult,
     digest_result: digestResult,
@@ -2020,27 +2123,28 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     
     console.log(`[Digest] Saved pending digest ${digestId}`);
     
-    // 6. Trigger Modal TTS asynchronously with webhook callback
-    console.log(`[Digest] Triggering Modal TTS for ${script.script.length} chars...`);
+    // 6. Trigger Modal TTS asynchronously with webhook callback (using OpenAI - 10x cheaper)
+    console.log(`[Digest] Triggering OpenAI TTS for ${script.script.length} chars...`);
     
     // Use waitUntil to ensure the request is sent even after response is returned
     ctx.waitUntil(
       fetch(
-        "https://ptzimmerman--podgest-transcribe-tts-web.modal.run",
+        "https://ptzimmerman--podgest-transcribe-openai-tts-web.modal.run",
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             script: script.script,
-            elevenlabs_api_key: env.ELEVENLABS_API_KEY,
-            voice_id: VOICE_BROADCASTER,
+            openai_api_key: env.OPENAI_API_KEY,
+            voice: "echo",  // Warm, conversational voice
+            model: "tts-1-hd",  // High quality
             supabase_url: env.SUPABASE_URL,
             supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
             digest_id: digestId,
             webhook_url: "https://podgest-api.pztest.workers.dev/api/webhooks/tts",
           }),
         }
-      ).then(res => console.log(`[Digest] Modal TTS triggered: ${res.status}`))
+      ).then(res => console.log(`[Digest] OpenAI TTS triggered: ${res.status}`))
        .catch(err => console.error(`[Digest] Modal trigger error: ${err}`))
     );
     
@@ -2328,6 +2432,68 @@ function formatDuration(seconds: number): string {
     return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   }
   return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+// ============================================
+// PIPELINE OBSERVABILITY ENDPOINTS
+// ============================================
+
+async function handlePipelineRuns(env: Env, url: URL): Promise<Response> {
+  const limit = parseInt(url.searchParams.get("limit") || "10");
+  
+  try {
+    const response = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/rpc/get_recent_pipeline_runs`,
+      {
+        method: "POST",
+        headers: {
+          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ limit_count: limit }),
+      }
+    );
+    
+    if (!response.ok) {
+      const err = await response.text();
+      return json({ error: "Failed to fetch pipeline runs", details: err }, 500);
+    }
+    
+    const runs = await response.json();
+    return json({ runs });
+    
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+}
+
+async function handlePipelineRunLogs(env: Env, runId: string): Promise<Response> {
+  try {
+    const response = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/rpc/get_pipeline_run_logs`,
+      {
+        method: "POST",
+        headers: {
+          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ p_run_id: runId }),
+      }
+    );
+    
+    if (!response.ok) {
+      const err = await response.text();
+      return json({ error: "Failed to fetch pipeline logs", details: err }, 500);
+    }
+    
+    const logs = await response.json();
+    return json({ run_id: runId, logs });
+    
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
 }
 
 // TTS now handled by Modal - see modal/transcribe.py

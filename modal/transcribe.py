@@ -30,6 +30,7 @@ tts_image = (
     .pip_install(
         "requests",
         "fastapi",
+        "openai",
     )
 )
 
@@ -413,7 +414,253 @@ class TextToSpeech:
         return 0
 
 
-# TTS Web endpoint
+# ============================================
+# TTS with OpenAI (Primary - 10x cheaper than ElevenLabs)
+# ============================================
+
+@app.cls(
+    image=tts_image,
+    timeout=600,
+    scaledown_window=60,
+    memory=2048,
+    retries=1,
+)
+class OpenAITTS:
+    """Generate audio from text using OpenAI TTS API."""
+    
+    # OpenAI TTS has 4096 char limit per request
+    MAX_CHUNK_SIZE = 4000
+    
+    @modal.method()
+    def generate(
+        self,
+        script: str,
+        openai_api_key: str,
+        voice: str = "onyx",  # onyx is great for news/podcasts (deep, authoritative)
+        model: str = "tts-1-hd",  # tts-1-hd for quality, tts-1 for speed/cost
+        supabase_url: str | None = None,
+        supabase_key: str | None = None,
+        digest_id: str | None = None,
+        webhook_url: str | None = None,
+    ) -> dict:
+        """
+        Generate audio from script text using OpenAI TTS.
+        
+        Voices: alloy, echo, fable, onyx, nova, shimmer
+        Models: tts-1 (fast/cheap), tts-1-hd (quality)
+        """
+        import requests
+        import tempfile
+        import subprocess
+        import os
+        from openai import OpenAI
+        
+        try:
+            print(f"🎙️ Generating OpenAI TTS for {len(script)} characters (voice={voice}, model={model})")
+            
+            client = OpenAI(api_key=openai_api_key)
+            
+            # Remove [PAUSE] markers and split into chunks
+            clean_script = script.replace("[PAUSE]", " ... ")
+            chunks = self._chunk_text(clean_script)
+            print(f"📦 Split into {len(chunks)} chunks")
+            
+            # Generate audio for each chunk
+            audio_files = []
+            total_chars = 0
+            
+            for i, chunk in enumerate(chunks):
+                print(f"🔊 Generating chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
+                
+                response = client.audio.speech.create(
+                    model=model,
+                    voice=voice,
+                    input=chunk,
+                    response_format="mp3",
+                )
+                
+                # Save to temp file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+                    for audio_chunk in response.iter_bytes():
+                        f.write(audio_chunk)
+                    audio_files.append(f.name)
+                
+                total_chars += len(chunk)
+            
+            # Concatenate all audio files with ffmpeg
+            print(f"🔗 Concatenating {len(audio_files)} audio files")
+            output_path = tempfile.mktemp(suffix=".mp3")
+            self._concat_audio(audio_files, output_path)
+            
+            # Get duration
+            duration = self._get_duration(output_path)
+            print(f"⏱️ Total duration: {duration:.1f}s")
+            
+            # Read final audio
+            with open(output_path, "rb") as f:
+                final_audio = f.read()
+            
+            result = {
+                "status": "completed",
+                "digest_id": digest_id,
+                "duration_seconds": int(duration),
+                "characters": total_chars,
+                "provider": "openai",
+                "voice": voice,
+                "model": model,
+            }
+            
+            # Upload to Supabase if credentials provided
+            if supabase_url and supabase_key and digest_id:
+                audio_path = f"{digest_id}/digest.mp3"
+                upload_url = f"{supabase_url}/storage/v1/object/digests/{audio_path}"
+                
+                print(f"📤 Uploading to Supabase: {audio_path}")
+                upload_response = requests.post(
+                    upload_url,
+                    headers={
+                        "Authorization": f"Bearer {supabase_key}",
+                        "Content-Type": "audio/mpeg",
+                        "x-upsert": "true",
+                    },
+                    data=final_audio,
+                    timeout=120,
+                )
+                
+                if upload_response.ok:
+                    result["audio_url"] = f"{supabase_url}/storage/v1/object/public/digests/{audio_path}"
+                    print(f"✅ Uploaded: {result['audio_url']}")
+                else:
+                    print(f"❌ Upload failed: {upload_response.status_code} - {upload_response.text}")
+                    result["upload_error"] = upload_response.text
+            
+            # Cleanup temp files
+            for f in audio_files + [output_path]:
+                if os.path.exists(f):
+                    os.unlink(f)
+            
+            # Send to webhook if provided
+            if webhook_url:
+                print(f"📤 Sending to webhook: {webhook_url}")
+                requests.post(webhook_url, json=result, timeout=30)
+            
+            return result
+            
+        except Exception as e:
+            import traceback
+            print(f"❌ OpenAI TTS Error: {e}")
+            print(traceback.format_exc())
+            
+            error_result = {
+                "status": "failed",
+                "digest_id": digest_id,
+                "error": str(e),
+                "provider": "openai",
+            }
+            
+            if webhook_url:
+                requests.post(webhook_url, json=error_result, timeout=30)
+            
+            return error_result
+    
+    def _chunk_text(self, text: str) -> list[str]:
+        """Split text into chunks at sentence boundaries."""
+        import re
+        
+        # Split by sentences
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        chunks = []
+        current = ""
+        
+        for sentence in sentences:
+            if len(current) + len(sentence) + 1 > self.MAX_CHUNK_SIZE:
+                if current:
+                    chunks.append(current.strip())
+                current = sentence
+            else:
+                current += (" " if current else "") + sentence
+        
+        if current:
+            chunks.append(current.strip())
+        
+        return chunks
+    
+    def _concat_audio(self, input_files: list[str], output_path: str):
+        """Concatenate audio files using ffmpeg."""
+        import subprocess
+        import tempfile
+        
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
+            for path in input_files:
+                f.write(f"file '{path}'\n")
+            concat_list = f.name
+        
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", concat_list, "-c", "copy", output_path
+            ], check=True, capture_output=True)
+        finally:
+            import os
+            os.unlink(concat_list)
+    
+    def _get_duration(self, audio_path: str) -> float:
+        """Get audio duration in seconds."""
+        import subprocess
+        import json
+        
+        result = subprocess.run([
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", audio_path
+        ], capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            return float(data.get("format", {}).get("duration", 0))
+        return 0
+
+
+# OpenAI TTS Web endpoint (PRIMARY)
+@app.function(image=tts_image)
+@modal.fastapi_endpoint(method="POST")
+def openai_tts_web(request: dict) -> dict:
+    """
+    HTTP endpoint for OpenAI TTS generation.
+    
+    Expected JSON body:
+    {
+        "script": "...",
+        "openai_api_key": "...",
+        "voice": "onyx" (optional - alloy, echo, fable, onyx, nova, shimmer),
+        "model": "tts-1-hd" (optional - tts-1 or tts-1-hd),
+        "supabase_url": "..." (optional),
+        "supabase_key": "..." (optional),
+        "digest_id": "..." (optional),
+        "webhook_url": "..." (optional)
+    }
+    """
+    script = request.get("script")
+    api_key = request.get("openai_api_key")
+    
+    if not script:
+        return {"error": "script is required"}
+    if not api_key:
+        return {"error": "openai_api_key is required"}
+    
+    tts = OpenAITTS()
+    return tts.generate.remote(
+        script=script,
+        openai_api_key=api_key,
+        voice=request.get("voice", "onyx"),
+        model=request.get("model", "tts-1-hd"),
+        supabase_url=request.get("supabase_url"),
+        supabase_key=request.get("supabase_key"),
+        digest_id=request.get("digest_id"),
+        webhook_url=request.get("webhook_url"),
+    )
+
+
+# ElevenLabs TTS Web endpoint (legacy)
 @app.function(image=tts_image)
 @modal.fastapi_endpoint(method="POST")
 def tts_web(request: dict) -> dict:
