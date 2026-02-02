@@ -6,7 +6,7 @@
   "compatibility_flags": ["nodejs_compat"],
   
   // Environment variables (set via wrangler secret)
-  // SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPERMEMORY_API_KEY, SUPABASE_ANON_KEY
+  // SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY, USER_ENCRYPTION_KEY
   
   "kv_namespaces": [
     {

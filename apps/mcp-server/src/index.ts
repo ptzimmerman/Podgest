@@ -13,13 +13,14 @@
  */
 
 import { OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+import { searchTranscripts, getUserOpenAIKey, type TranscriptSearchResult } from "./pgvector";
 
 // Env interface with OAuth Provider bindings
 export interface Env {
   SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
   SUPABASE_ANON_KEY: string;
-  SUPERMEMORY_API_KEY: string;
+  USER_ENCRYPTION_KEY: string;  // For decrypting user API keys
   OAUTH_KV: KVNamespace;
   OAUTH_PROVIDER: OAuthHelpers;
 }
@@ -232,59 +233,83 @@ async function searchPodcasts(
   daysBack: number | undefined,
   userId: string,
   env: Env
-): Promise<{ results: Array<{ episode_id: string; podcast_name: string; title: string; excerpt: string; published_at: string }> }> {
-  // Search SuperMemory with user's container tag
-  const searchParams: Record<string, unknown> = {
-    q: query,
-    limit: Math.min(limit, 20),
-    containerTags: [userId],
-  };
+): Promise<{ results: Array<{ episode_id: string; podcast_name: string; title: string; excerpt: string; published_at: string }> } | { error: string }> {
+  // Get user's OpenAI key for generating embeddings
+  const openaiKey = await getUserOpenAIKey(
+    env.SUPABASE_URL,
+    env.SUPABASE_SERVICE_ROLE_KEY,
+    userId,
+    env.USER_ENCRYPTION_KEY
+  );
 
-  if (daysBack) {
-    // TODO: Date filtering doesn't seem to work with SuperMemory's filter syntax
-    // For now, just log the date we would have filtered by
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - daysBack);
-    console.log(`[searchPodcasts] Would filter by date >= ${cutoffDate.toISOString()} (${cutoffDate.getTime()})`)
+  if (!openaiKey) {
+    return { 
+      error: "Search requires an OpenAI API key. Please add your OpenAI API key in the Podgest settings at https://podgest.app/settings"
+    };
   }
 
-  const searchResponse = await fetch("https://api.supermemory.ai/v3/search", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${env.SUPERMEMORY_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(searchParams),
-  });
+  try {
+    // Search using pgvector
+    const results = await searchTranscripts(
+      query,
+      userId,
+      openaiKey,
+      env.SUPABASE_URL,
+      env.SUPABASE_SERVICE_ROLE_KEY,
+      { limit: Math.min(limit, 20) }
+    );
 
-  if (!searchResponse.ok) {
-    console.error("SuperMemory search failed:", await searchResponse.text());
-    return { results: [] };
+    if (daysBack) {
+      // Log for debugging - date filtering could be added to the RPC in future
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - daysBack);
+      console.log(`[searchPodcasts] Date filter requested: >= ${cutoffDate.toISOString()}`);
+    }
+
+    // Fetch episode published dates to include in results
+    const episodeIds = [...new Set(results.map(r => r.episode_id))];
+    let episodeDates: Map<string, string> = new Map();
+
+    if (episodeIds.length > 0) {
+      const episodesResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/episodes?id=in.(${episodeIds.join(",")})&select=id,published_at`,
+        {
+          headers: {
+            "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          },
+        }
+      );
+
+      if (episodesResponse.ok) {
+        const episodes = await episodesResponse.json() as Array<{ id: string; published_at: string }>;
+        episodeDates = new Map(episodes.map(e => [e.id, e.published_at]));
+      }
+    }
+
+    return {
+      results: results.map((r) => ({
+        episode_id: r.episode_id,
+        podcast_name: r.podcast_title || "Unknown",
+        title: r.episode_title || "Unknown",
+        excerpt: r.chunk_text?.substring(0, 500) || "No content available",
+        published_at: episodeDates.get(r.episode_id) || "",
+      })),
+    };
+  } catch (error) {
+    console.error("[searchPodcasts] Error:", error);
+    if (error instanceof Error) {
+      // Return user-friendly error for known issues
+      if (error.message.includes('Invalid OpenAI API key')) {
+        return { error: "Your OpenAI API key is invalid. Please update it in Podgest settings." };
+      }
+      if (error.message.includes('rate limit')) {
+        return { error: "OpenAI rate limit exceeded. Please try again in a moment." };
+      }
+      return { error: `Search failed: ${error.message}` };
+    }
+    return { error: "Search failed. Please try again." };
   }
-
-  const searchResults = await searchResponse.json() as {
-    results: Array<{
-      id: string;
-      content?: string;
-      chunks?: Array<{ content: string }>;
-      metadata?: {
-        episode_id?: string;
-        podcast_title?: string;
-        episode_title?: string;
-        published_at?: number;
-      };
-    }>;
-  };
-
-  return {
-    results: (searchResults.results || []).map((r) => ({
-      episode_id: r.metadata?.episode_id || r.id,
-      podcast_name: r.metadata?.podcast_title || "Unknown",
-      title: r.metadata?.episode_title || "Unknown",
-      excerpt: r.chunks?.[0]?.content?.substring(0, 500) || r.content?.substring(0, 500) || "No content available",
-      published_at: r.metadata?.published_at ? new Date(r.metadata.published_at).toISOString() : "",
-    })),
-  };
 }
 
 async function getEpisode(
@@ -418,62 +443,88 @@ async function compareTakes(
   daysBack: number = 30,
   userId: string,
   env: Env
-): Promise<{ perspectives: Array<{ podcast_name: string; episode_title: string; take: string; published_at: string }> }> {
-  // Search for the topic across all podcasts
-  const searchParams: Record<string, unknown> = {
-    q: topic,
-    limit: 10,
-    containerTags: [userId],
-  };
+): Promise<{ perspectives: Array<{ podcast_name: string; episode_title: string; take: string; published_at: string }> } | { error: string }> {
+  // Get user's OpenAI key for generating embeddings
+  const openaiKey = await getUserOpenAIKey(
+    env.SUPABASE_URL,
+    env.SUPABASE_SERVICE_ROLE_KEY,
+    userId,
+    env.USER_ENCRYPTION_KEY
+  );
 
-  // TODO: Date filtering doesn't seem to work with SuperMemory's filter syntax
-  // For now, just log the date we would have filtered by
-  const cutoffDate = new Date();
-  cutoffDate.setDate(cutoffDate.getDate() - daysBack);
-  console.log(`[compareTakes] Would filter by date >= ${cutoffDate.toISOString()} (${cutoffDate.getTime()})`);
-
-  const searchResponse = await fetch("https://api.supermemory.ai/v3/search", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${env.SUPERMEMORY_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(searchParams),
-  });
-
-  if (!searchResponse.ok) {
-    return { perspectives: [] };
+  if (!openaiKey) {
+    return { 
+      error: "Comparing takes requires an OpenAI API key. Please add your OpenAI API key in the Podgest settings at https://podgest.app/settings"
+    };
   }
 
-  const searchResults = await searchResponse.json() as {
-    results: Array<{
-      content?: string;
-      chunks?: Array<{ content: string }>;
-      metadata?: {
-        podcast_title?: string;
-        episode_title?: string;
-        published_at?: number;
-      };
-    }>;
-  };
+  try {
+    // Log date filter intent
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - daysBack);
+    console.log(`[compareTakes] Date filter requested: >= ${cutoffDate.toISOString()}`);
 
-  // Group by podcast and take best result from each
-  const byPodcast = new Map<string, typeof searchResults.results[0]>();
-  for (const result of searchResults.results || []) {
-    const podcastName = result.metadata?.podcast_title || "Unknown";
-    if (!byPodcast.has(podcastName)) {
-      byPodcast.set(podcastName, result);
+    // Search using pgvector
+    const results = await searchTranscripts(
+      topic,
+      userId,
+      openaiKey,
+      env.SUPABASE_URL,
+      env.SUPABASE_SERVICE_ROLE_KEY,
+      { limit: 15 }  // Get more results to find diverse perspectives
+    );
+
+    // Fetch episode published dates
+    const episodeIds = [...new Set(results.map(r => r.episode_id))];
+    let episodeDates: Map<string, string> = new Map();
+
+    if (episodeIds.length > 0) {
+      const episodesResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/episodes?id=in.(${episodeIds.join(",")})&select=id,published_at`,
+        {
+          headers: {
+            "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          },
+        }
+      );
+
+      if (episodesResponse.ok) {
+        const episodes = await episodesResponse.json() as Array<{ id: string; published_at: string }>;
+        episodeDates = new Map(episodes.map(e => [e.id, e.published_at]));
+      }
     }
-  }
 
-  return {
-    perspectives: Array.from(byPodcast.values()).map((r) => ({
-      podcast_name: r.metadata?.podcast_title || "Unknown",
-      episode_title: r.metadata?.episode_title || "Unknown",
-      take: r.chunks?.[0]?.content?.substring(0, 800) || r.content?.substring(0, 800) || "No content",
-      published_at: r.metadata?.published_at ? new Date(r.metadata.published_at).toISOString() : "",
-    })),
-  };
+    // Group by podcast and take best result from each
+    const byPodcast = new Map<string, TranscriptSearchResult>();
+    for (const result of results) {
+      const podcastName = result.podcast_title || "Unknown";
+      if (!byPodcast.has(podcastName)) {
+        byPodcast.set(podcastName, result);
+      }
+    }
+
+    return {
+      perspectives: Array.from(byPodcast.values()).map((r) => ({
+        podcast_name: r.podcast_title || "Unknown",
+        episode_title: r.episode_title || "Unknown",
+        take: r.chunk_text?.substring(0, 800) || "No content",
+        published_at: episodeDates.get(r.episode_id) || "",
+      })),
+    };
+  } catch (error) {
+    console.error("[compareTakes] Error:", error);
+    if (error instanceof Error) {
+      if (error.message.includes('Invalid OpenAI API key')) {
+        return { error: "Your OpenAI API key is invalid. Please update it in Podgest settings." };
+      }
+      if (error.message.includes('rate limit')) {
+        return { error: "OpenAI rate limit exceeded. Please try again in a moment." };
+      }
+      return { error: `Compare failed: ${error.message}` };
+    }
+    return { error: "Compare failed. Please try again." };
+  }
 }
 
 async function listPodcasts(
