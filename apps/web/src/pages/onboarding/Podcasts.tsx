@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../../lib/supabase'
 
+const API_URL = import.meta.env.VITE_API_URL || 'https://podgest-api.pztest.workers.dev'
+
 type Subscription = {
   id: string
   podcast_title: string
@@ -113,6 +115,41 @@ export function OnboardingPodcasts() {
   const handleAddCustom = () => {
     if (newFeedUrl) {
       addPodcast(newFeedUrl)
+    }
+  }
+
+  const [finishing, setFinishing] = useState(false)
+
+  const handleFinishSetup = async () => {
+    setFinishing(true)
+    
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) {
+        navigate('/login')
+        return
+      }
+
+      // Generate welcome episode in the background
+      fetch(`${API_URL}/api/generate-welcome`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session.access_token}`,
+        },
+      }).then(res => {
+        if (res.ok) {
+          console.log('Welcome episode generation triggered')
+        }
+      }).catch(err => {
+        console.error('Failed to trigger welcome episode:', err)
+      })
+
+      // Navigate immediately - welcome episode generates in background
+      navigate('/settings')
+    } catch (err) {
+      console.error('Error finishing setup:', err)
+      navigate('/settings')
     }
   }
 
@@ -254,15 +291,15 @@ export function OnboardingPodcasts() {
             ← Back
           </button>
           <button
-            onClick={() => navigate('/settings')}
-            disabled={!canContinue}
+            onClick={handleFinishSetup}
+            disabled={!canContinue || finishing}
             className={`px-6 py-3 rounded-lg font-medium transition-colors ${
-              canContinue
+              canContinue && !finishing
                 ? 'bg-indigo-600 text-white hover:bg-indigo-700'
                 : 'bg-gray-200 text-gray-500 cursor-not-allowed'
             }`}
           >
-            Finish Setup →
+            {finishing ? 'Setting up...' : 'Finish Setup →'}
           </button>
         </div>
 
