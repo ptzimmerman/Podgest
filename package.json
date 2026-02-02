@@ -7,9 +7,14 @@
     "dev": "pnpm --filter web dev",
     "build": "pnpm --filter web build",
     "test": "echo \"No tests yet\"",
-    "lint": "pnpm -r lint"
+    "lint": "pnpm -r lint",
+    "migrate:embeddings": "./scripts/migrate-supermemory-to-pgvector.sh"
   },
   "devDependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "@types/node": "^20.14.0",
+    "openai": "^4.52.0",
+    "tsx": "^4.16.0",
     "typescript": "^5.3.3"
   },
   "engines": {

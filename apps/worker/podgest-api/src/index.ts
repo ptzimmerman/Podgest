@@ -1,3 +1,7 @@
+import { getUserApiKeys, validateOpenAIKey, validateAnthropicKey, validateElevenLabsKey } from './user-keys';
+import { generateChunkedEmbeddings } from './embeddings';
+import { encryptApiKey } from './encryption';
+
 export interface Env {
   SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
@@ -5,6 +9,9 @@ export interface Env {
   SUPERMEMORY_API_KEY: string;
   ELEVENLABS_API_KEY: string;
   OPENAI_API_KEY: string;
+  // Phase 8: BYOK encryption key for user API keys
+  // Generate with: openssl rand -hex 32
+  API_KEY_ENCRYPTION_KEY: string;
 }
 // Note: Inngest removed - now using Supabase pg_cron for scheduling
 
@@ -749,6 +756,16 @@ export default {
       const runId = url.pathname.replace("/api/pipeline/run/", "");
       return handlePipelineRunLogs(env, runId);
     }
+    
+    // BYOK: Validate API key (for Settings UI)
+    if (url.pathname === "/api/validate-key" && request.method === "POST") {
+      return handleValidateKey(request);
+    }
+    
+    // BYOK: Save user API keys
+    if (url.pathname === "/api/user-keys" && request.method === "POST") {
+      return handleSaveUserKey(request, env);
+    }
 
     return json({ error: "Not found" }, 404);
   },
@@ -1019,10 +1036,16 @@ async function handleModalWebhook(request: Request, env: Env, ctx: ExecutionCont
 
       console.log(`[Webhook] Transcription completed for episode: ${jobData.episode_id}`);
       
-      // Trigger topic extraction and SuperMemory embedding asynchronously (don't wait)
+      // Trigger topic extraction, SuperMemory embedding, and pgvector embeddings asynchronously
       ctx.waitUntil(
-        extractTopicsForEpisode(jobData.episode_id, payload.text, env)
-          .then(() => embedInSuperMemory(jobData.episode_id, payload.text, env))
+        (async () => {
+          // First, do topic extraction and SuperMemory embedding (existing)
+          await extractTopicsForEpisode(jobData.episode_id, payload.text, env);
+          await embedInSuperMemory(jobData.episode_id, payload.text, env);
+          
+          // Generate pgvector embeddings using user's OpenAI key (BYOK)
+          await generateEmbeddingsForTranscript(jobData.episode_id, payload.text, env);
+        })()
       );
       
       return json({ success: true, status: "completed" });
@@ -1382,6 +1405,124 @@ async function embedInSuperMemory(episodeId: string, transcriptText: string, env
     
   } catch (error) {
     console.error(`[SuperMemory] Error for episode ${episodeId}:`, error);
+  }
+}
+
+// ============================================
+// PGVECTOR EMBEDDING GENERATION (BYOK)
+// ============================================
+
+/**
+ * Generate pgvector embeddings for a transcript using the user's OpenAI key.
+ * Falls back to env.OPENAI_API_KEY if user doesn't have one configured.
+ */
+async function generateEmbeddingsForTranscript(episodeId: string, transcriptText: string, env: Env): Promise<void> {
+  console.log(`[Embeddings] Starting pgvector embedding for episode: ${episodeId}`);
+  
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  
+  try {
+    // 1. Get episode to find the feed_url
+    const episodeResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episodeId}&select=id,feed_url`,
+      { headers }
+    );
+    
+    if (!episodeResponse.ok) {
+      console.error(`[Embeddings] Failed to fetch episode: ${episodeResponse.status}`);
+      return;
+    }
+    
+    const episodes = await episodeResponse.json() as Array<{ id: string; feed_url: string }>;
+    if (!episodes.length) {
+      console.error(`[Embeddings] Episode not found: ${episodeId}`);
+      return;
+    }
+    
+    // 2. Find user via subscription
+    const subResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/subscriptions?feed_url=eq.${encodeURIComponent(episodes[0].feed_url)}&select=user_id&limit=1`,
+      { headers }
+    );
+    
+    const subs = await subResponse.json() as Array<{ user_id: string }>;
+    const userId = subs[0]?.user_id;
+    
+    if (!userId) {
+      console.log(`[Embeddings] No user found for episode, skipping pgvector embedding`);
+      return;
+    }
+    
+    // 3. Get user's OpenAI key (or use fallback)
+    let openaiKey = env.OPENAI_API_KEY;
+    
+    try {
+      const userKeys = await getUserApiKeys(
+        env.SUPABASE_URL,
+        env.SUPABASE_SERVICE_ROLE_KEY,
+        userId,
+        env.API_KEY_ENCRYPTION_KEY
+      );
+      
+      if (userKeys.openaiKey) {
+        openaiKey = userKeys.openaiKey;
+        console.log(`[Embeddings] Using user's OpenAI key for user ${userId}`);
+      }
+    } catch (keyError) {
+      console.warn(`[Embeddings] Failed to fetch user keys, using default: ${keyError}`);
+    }
+    
+    // 4. Get transcription ID
+    const transcriptionResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episodeId}&select=id`,
+      { headers }
+    );
+    const transcriptions = await transcriptionResponse.json() as Array<{ id: string }>;
+    
+    if (!transcriptions.length) {
+      console.error(`[Embeddings] Transcription not found for episode: ${episodeId}`);
+      return;
+    }
+    
+    const transcriptionId = transcriptions[0].id;
+    
+    // 5. Generate chunked embeddings
+    console.log(`[Embeddings] Generating embeddings for transcript (${transcriptText.length} chars)...`);
+    const chunkedEmbeddings = await generateChunkedEmbeddings(transcriptText, openaiKey);
+    
+    console.log(`[Embeddings] Generated ${chunkedEmbeddings.length} chunks for episode ${episodeId}`);
+    
+    // 6. Store embeddings in transcript_embeddings table
+    for (const chunk of chunkedEmbeddings) {
+      const insertResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/transcript_embeddings`,
+        {
+          method: "POST",
+          headers: { ...headers, "Prefer": "return=minimal" },
+          body: JSON.stringify({
+            transcription_id: transcriptionId,
+            chunk_index: chunk.chunkIndex,
+            chunk_text: chunk.chunkText,
+            word_count: chunk.wordCount,
+            embedding: JSON.stringify(chunk.embedding), // pgvector expects array as string
+          }),
+        }
+      );
+      
+      if (!insertResponse.ok) {
+        const err = await insertResponse.text();
+        console.error(`[Embeddings] Failed to insert chunk ${chunk.chunkIndex}: ${err}`);
+      }
+    }
+    
+    console.log(`[Embeddings] ✅ Stored ${chunkedEmbeddings.length} embeddings for episode ${episodeId}`);
+    
+  } catch (error) {
+    console.error(`[Embeddings] Error for episode ${episodeId}:`, error);
   }
 }
 
@@ -1948,11 +2089,38 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     };
     
     const hoursBack = body.hours_back || 24;
+    const userId = body.user_id || "00000000-0000-0000-0000-000000000000";
     
     // Fixed at 5 minutes for now (avoids Cloudflare Worker CPU limits)
     const maxLengthMinutes = 5;
     
     console.log(`[Digest] Generating ${maxLengthMinutes}-minute digest for last ${hoursBack} hours`);
+    
+    // BYOK: Fetch user's API keys (with fallback to env keys)
+    let userAnthropicKey = env.ANTHROPIC_API_KEY;
+    let userOpenAIKey = env.OPENAI_API_KEY;
+    
+    if (userId !== "00000000-0000-0000-0000-000000000000") {
+      try {
+        const userKeys = await getUserApiKeys(
+          env.SUPABASE_URL,
+          env.SUPABASE_SERVICE_ROLE_KEY,
+          userId,
+          env.API_KEY_ENCRYPTION_KEY
+        );
+        
+        if (userKeys.anthropicKey) {
+          userAnthropicKey = userKeys.anthropicKey;
+          console.log(`[Digest] Using user's Anthropic key for user ${userId}`);
+        }
+        if (userKeys.openaiKey) {
+          userOpenAIKey = userKeys.openaiKey;
+          console.log(`[Digest] Using user's OpenAI key for TTS for user ${userId}`);
+        }
+      } catch (keyError) {
+        console.warn(`[Digest] Failed to fetch user keys, using defaults: ${keyError}`);
+      }
+    }
     
     // 1. Get episodes already covered in recent digests (last 7 days) to avoid repeats
     const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -2078,19 +2246,18 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     
     console.log(`[Digest] Generating script with Claude...`);
     
-    // 4. Generate news broadcaster script with Claude
-    const script = await generateDigestScript(episodeSummaries, maxLengthMinutes, env.ANTHROPIC_API_KEY);
+    // 4. Generate news broadcaster script with Claude (using user's key if available)
+    const script = await generateDigestScript(episodeSummaries, maxLengthMinutes, userAnthropicKey);
     
     console.log(`[Digest] Script generated: ${script.word_count} words`);
     
     // 5. Save pending digest record first (so we can update it when TTS completes)
     const digestId = crypto.randomUUID();
-    const placeholderUserId = body.user_id || "00000000-0000-0000-0000-000000000000";
     const estimatedDuration = Math.round(script.word_count / 2.5);
     
     const digestRecord = {
       id: digestId,
-      user_id: placeholderUserId,
+      user_id: userId,
       digest_date: new Date().toISOString().split('T')[0],
       status: "generating", // Will be updated to "completed" by webhook
       topic_clusters: { topics: script.topics_covered, title: script.title },
@@ -2124,6 +2291,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     console.log(`[Digest] Saved pending digest ${digestId}`);
     
     // 6. Trigger Modal TTS asynchronously with webhook callback (using OpenAI - 10x cheaper)
+    // Uses user's OpenAI key if available, falls back to env key
     console.log(`[Digest] Triggering OpenAI TTS for ${script.script.length} chars...`);
     
     // Use waitUntil to ensure the request is sent even after response is returned
@@ -2135,7 +2303,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             script: script.script,
-            openai_api_key: env.OPENAI_API_KEY,
+            openai_api_key: userOpenAIKey,  // BYOK: Use user's key if available
             voice: "echo",  // Warm, conversational voice
             model: "tts-1-hd",  // High quality
             supabase_url: env.SUPABASE_URL,
@@ -2493,6 +2661,191 @@ async function handlePipelineRunLogs(env: Env, runId: string): Promise<Response>
     
   } catch (error) {
     return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+}
+
+// ============================================
+// BYOK API KEY MANAGEMENT ENDPOINTS
+// ============================================
+
+/**
+ * Validate an API key by testing it against the provider's API.
+ * POST /api/validate-key
+ * Body: { key_type: 'openai' | 'anthropic' | 'elevenlabs', key: string }
+ */
+async function handleValidateKey(request: Request): Promise<Response> {
+  try {
+    const body = await request.json() as {
+      key_type: 'openai' | 'anthropic' | 'elevenlabs';
+      key: string;
+    };
+    
+    if (!body.key_type || !body.key) {
+      return json({ valid: false, error: "key_type and key are required" }, 400);
+    }
+    
+    let valid = false;
+    let error: string | undefined;
+    
+    switch (body.key_type) {
+      case 'openai':
+        valid = await validateOpenAIKey(body.key);
+        if (!valid) error = "Invalid OpenAI API key";
+        break;
+        
+      case 'anthropic':
+        valid = await validateAnthropicKey(body.key);
+        if (!valid) error = "Invalid Anthropic API key";
+        break;
+        
+      case 'elevenlabs':
+        valid = await validateElevenLabsKey(body.key);
+        if (!valid) error = "Invalid ElevenLabs API key";
+        break;
+        
+      default:
+        return json({ valid: false, error: `Invalid key_type: ${body.key_type}` }, 400);
+    }
+    
+    return json({ valid, error });
+    
+  } catch (error) {
+    console.error("[ValidateKey] Error:", error);
+    return json({ 
+      valid: false, 
+      error: error instanceof Error ? error.message : "Validation failed" 
+    }, 500);
+  }
+}
+
+/**
+ * Save an encrypted API key for a user.
+ * POST /api/user-keys
+ * Body: { user_id: string, key_type: 'openai' | 'anthropic' | 'elevenlabs', encrypted_key: string }
+ * 
+ * Note: The frontend should encrypt the key before sending using the same encryption scheme.
+ * Alternatively, we can accept the plaintext key and encrypt it here.
+ */
+async function handleSaveUserKey(request: Request, env: Env): Promise<Response> {
+  try {
+    const body = await request.json() as {
+      user_id: string;
+      key_type: 'openai' | 'anthropic' | 'elevenlabs';
+      api_key?: string;           // Plaintext key (we'll encrypt it)
+      encrypted_key?: string;      // Or pre-encrypted key
+    };
+    
+    if (!body.user_id) {
+      return json({ error: "user_id is required" }, 400);
+    }
+    
+    if (!body.key_type) {
+      return json({ error: "key_type is required" }, 400);
+    }
+    
+    // Determine which key to use
+    let encryptedKey: string;
+    
+    if (body.api_key) {
+      // Encrypt the plaintext key
+      encryptedKey = await encryptApiKey(body.api_key, env.API_KEY_ENCRYPTION_KEY);
+    } else if (body.encrypted_key) {
+      // Use the pre-encrypted key
+      encryptedKey = body.encrypted_key;
+    } else {
+      return json({ error: "Either api_key or encrypted_key is required" }, 400);
+    }
+    
+    // Map key_type to column name
+    const columnMap = {
+      openai: 'openai_key_encrypted',
+      anthropic: 'anthropic_key_encrypted',
+      elevenlabs: 'elevenlabs_key_encrypted',
+    };
+    
+    const validColumnMap = {
+      openai: 'openai_valid',
+      anthropic: 'anthropic_valid',
+      elevenlabs: 'elevenlabs_valid',
+    };
+    
+    const validatedAtColumnMap = {
+      openai: 'openai_validated_at',
+      anthropic: 'anthropic_validated_at',
+      elevenlabs: 'elevenlabs_validated_at',
+    };
+    
+    const column = columnMap[body.key_type];
+    const validColumn = validColumnMap[body.key_type];
+    const validatedAtColumn = validatedAtColumnMap[body.key_type];
+    
+    const headers = {
+      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+    };
+    
+    // Check if user already has a row
+    const existingResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${body.user_id}&select=id`,
+      { headers }
+    );
+    
+    const existing = await existingResponse.json() as Array<{ id: string }>;
+    
+    const updateData: Record<string, unknown> = {
+      [column]: encryptedKey,
+      [validColumn]: true,  // Mark as valid since user just provided it
+      [validatedAtColumn]: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    
+    if (existing.length > 0) {
+      // Update existing row
+      const updateResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${body.user_id}`,
+        {
+          method: "PATCH",
+          headers: { ...headers, "Prefer": "return=representation" },
+          body: JSON.stringify(updateData),
+        }
+      );
+      
+      if (!updateResponse.ok) {
+        const err = await updateResponse.text();
+        return json({ error: `Failed to update key: ${err}` }, 500);
+      }
+      
+      return json({ success: true, action: "updated" });
+    } else {
+      // Insert new row
+      const insertData = {
+        user_id: body.user_id,
+        ...updateData,
+      };
+      
+      const insertResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/user_api_keys`,
+        {
+          method: "POST",
+          headers: { ...headers, "Prefer": "return=representation" },
+          body: JSON.stringify(insertData),
+        }
+      );
+      
+      if (!insertResponse.ok) {
+        const err = await insertResponse.text();
+        return json({ error: `Failed to save key: ${err}` }, 500);
+      }
+      
+      return json({ success: true, action: "created" });
+    }
+    
+  } catch (error) {
+    console.error("[SaveUserKey] Error:", error);
+    return json({ 
+      error: error instanceof Error ? error.message : "Failed to save key" 
+    }, 500);
   }
 }
 
