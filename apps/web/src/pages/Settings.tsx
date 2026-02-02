@@ -4,9 +4,9 @@ import { supabase } from '../lib/supabase'
 const API_URL = import.meta.env.VITE_API_URL || 'https://podgest-api.petehodgson.workers.dev'
 
 type KeyStatus = {
-  openai: { configured: boolean; valid: boolean | null; masked?: string }
-  anthropic: { configured: boolean; valid: boolean | null; masked?: string }
-  elevenlabs: { configured: boolean; valid: boolean | null; masked?: string }
+  openai: { configured: boolean; valid: boolean | null }
+  anthropic: { configured: boolean; valid: boolean | null }
+  elevenlabs: { configured: boolean; valid: boolean | null }
 }
 
 export function Settings() {
@@ -29,26 +29,26 @@ export function Settings() {
 
       const { data, error } = await supabase
         .from('user_api_keys')
-        .select('key_type, openai_valid, anthropic_valid, elevenlabs_valid')
+        .select('openai_key_encrypted, anthropic_key_encrypted, elevenlabs_key_encrypted, openai_valid, anthropic_valid, elevenlabs_valid')
         .eq('user_id', session.user.id)
+        .single()
 
-      if (error) throw error
+      if (error && error.code !== 'PGRST116') throw error // PGRST116 = no rows
 
       const status: KeyStatus = {
-        openai: { configured: false, valid: null },
-        anthropic: { configured: false, valid: null },
-        elevenlabs: { configured: false, valid: null },
+        openai: { 
+          configured: !!data?.openai_key_encrypted, 
+          valid: data?.openai_valid ?? null 
+        },
+        anthropic: { 
+          configured: !!data?.anthropic_key_encrypted, 
+          valid: data?.anthropic_valid ?? null 
+        },
+        elevenlabs: { 
+          configured: !!data?.elevenlabs_key_encrypted, 
+          valid: data?.elevenlabs_valid ?? null 
+        },
       }
-
-      data?.forEach((row: { key_type: string; openai_valid: boolean | null; anthropic_valid: boolean | null; elevenlabs_valid: boolean | null }) => {
-        if (row.key_type === 'openai') {
-          status.openai = { configured: true, valid: row.openai_valid, masked: 'sk-...configured' }
-        } else if (row.key_type === 'anthropic') {
-          status.anthropic = { configured: true, valid: row.anthropic_valid, masked: 'sk-ant-...configured' }
-        } else if (row.key_type === 'elevenlabs') {
-          status.elevenlabs = { configured: true, valid: row.elevenlabs_valid, masked: 'xi-...configured' }
-        }
-      })
 
       setKeyStatus(status)
     } catch (err) {
@@ -154,22 +154,22 @@ export function Settings() {
   const StatusBadge = ({ status }: { status: { configured: boolean; valid: boolean | null } }) => {
     if (!status.configured) {
       return (
-        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-600">
-          Using shared key
+        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
+          Not configured
         </span>
       )
     }
     if (status.valid === true) {
       return (
         <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">
-          ✓ Configured
+          Configured
         </span>
       )
     }
     if (status.valid === false) {
       return (
         <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
-          ✗ Invalid
+          Invalid
         </span>
       )
     }
@@ -188,12 +188,14 @@ export function Settings() {
     )
   }
 
+  const allKeysConfigured = keyStatus?.openai.configured && keyStatus?.anthropic.configured
+
   return (
     <div className="space-y-8">
       <div>
         <h1 className="text-2xl font-bold text-gray-900">Settings</h1>
         <p className="mt-1 text-sm text-gray-600">
-          Manage your API keys and preferences.
+          Manage your API keys for digest generation.
         </p>
       </div>
 
@@ -203,12 +205,18 @@ export function Settings() {
         </div>
       )}
 
+      {!allKeysConfigured && (
+        <div className="p-4 rounded-lg bg-amber-50 text-amber-800 border border-amber-200">
+          <strong>Action Required:</strong> You must configure your OpenAI and Anthropic API keys to generate digests.
+        </div>
+      )}
+
       {/* API Keys Section */}
       <section className="bg-white rounded-lg border border-gray-200 p-6">
         <div className="mb-6">
           <h2 className="text-lg font-semibold text-gray-900">API Keys</h2>
           <p className="mt-1 text-sm text-gray-500">
-            Your API keys are encrypted and stored securely. Keys marked "Using shared key" will use the system default.
+            Your API keys are encrypted and stored securely. They are required to generate your podcast digests.
           </p>
         </div>
 
@@ -217,12 +225,12 @@ export function Settings() {
           <div>
             <div className="flex items-center justify-between">
               <label htmlFor="openai-key" className="block text-sm font-medium text-gray-700">
-                OpenAI API Key
+                OpenAI API Key <span className="text-red-500">*</span>
               </label>
               {keyStatus && <StatusBadge status={keyStatus.openai} />}
             </div>
             <p className="mt-1 text-xs text-gray-500">
-              Used for embeddings (semantic search)
+              Required for embeddings (semantic search)
             </p>
             <input
               type="password"
@@ -238,12 +246,12 @@ export function Settings() {
           <div>
             <div className="flex items-center justify-between">
               <label htmlFor="anthropic-key" className="block text-sm font-medium text-gray-700">
-                Anthropic API Key
+                Anthropic API Key <span className="text-red-500">*</span>
               </label>
               {keyStatus && <StatusBadge status={keyStatus.anthropic} />}
             </div>
             <p className="mt-1 text-xs text-gray-500">
-              Used for summarization and script generation
+              Required for summarization and script generation
             </p>
             <input
               type="password"
@@ -291,11 +299,11 @@ export function Settings() {
 
       {/* Info Section */}
       <section className="bg-blue-50 rounded-lg border border-blue-200 p-6">
-        <h3 className="text-sm font-medium text-blue-800">About API Keys</h3>
+        <h3 className="text-sm font-medium text-blue-800">Where to get API keys</h3>
         <ul className="mt-2 text-sm text-blue-700 space-y-1">
-          <li>• <strong>OpenAI</strong>: Get your key at <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer" className="underline">platform.openai.com</a></li>
-          <li>• <strong>Anthropic</strong>: Get your key at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener noreferrer" className="underline">console.anthropic.com</a></li>
-          <li>• <strong>ElevenLabs</strong>: Get your key at <a href="https://elevenlabs.io/app/settings/api-keys" target="_blank" rel="noopener noreferrer" className="underline">elevenlabs.io</a></li>
+          <li>• <strong>OpenAI</strong>: <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer" className="underline">platform.openai.com/api-keys</a></li>
+          <li>• <strong>Anthropic</strong>: <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener noreferrer" className="underline">console.anthropic.com/settings/keys</a></li>
+          <li>• <strong>ElevenLabs</strong>: <a href="https://elevenlabs.io/app/settings/api-keys" target="_blank" rel="noopener noreferrer" className="underline">elevenlabs.io/app/settings/api-keys</a></li>
         </ul>
       </section>
     </div>

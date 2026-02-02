@@ -1150,16 +1150,54 @@ interface TopicExtractionResult {
 async function extractTopicsForEpisode(episodeId: string, transcriptText: string, env: Env): Promise<void> {
   console.log(`[Topics] Starting extraction for episode: ${episodeId}`);
   
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  
   try {
-    const result = await callClaudeForTopics(transcriptText, env.ANTHROPIC_API_KEY);
+    // Get episode to find user via subscription
+    const episodeResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episodeId}&select=id,feed_url`,
+      { headers }
+    );
+    const episodes = await episodeResponse.json() as Array<{ id: string; feed_url: string }>;
+    
+    if (!episodes.length) {
+      console.error(`[Topics] Episode not found: ${episodeId}`);
+      return;
+    }
+    
+    // Find user via subscription
+    const subResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/subscriptions?feed_url=eq.${encodeURIComponent(episodes[0].feed_url)}&select=user_id&limit=1`,
+      { headers }
+    );
+    const subs = await subResponse.json() as Array<{ user_id: string }>;
+    const userId = subs[0]?.user_id;
+    
+    if (!userId) {
+      console.log(`[Topics] No user found for episode, skipping topic extraction`);
+      return;
+    }
+    
+    // Get user's Anthropic key (required - no fallback)
+    const userKeys = await getUserApiKeys(
+      env.SUPABASE_URL,
+      env.SUPABASE_SERVICE_ROLE_KEY,
+      userId,
+      env.API_KEY_ENCRYPTION_KEY
+    );
+    
+    if (!userKeys.anthropicKey) {
+      console.error(`[Topics] User ${userId} does not have Anthropic key configured, skipping topic extraction`);
+      return;
+    }
+    
+    const result = await callClaudeForTopics(transcriptText, userKeys.anthropicKey);
     
     // Get transcription ID
-    const headers = {
-      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-    };
-    
     const transcriptionResponse = await fetch(
       `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episodeId}&select=id`,
       { headers }
@@ -1414,7 +1452,7 @@ async function embedInSuperMemory(episodeId: string, transcriptText: string, env
 
 /**
  * Generate pgvector embeddings for a transcript using the user's OpenAI key.
- * Falls back to env.OPENAI_API_KEY if user doesn't have one configured.
+ * Requires user to have OpenAI key configured - no fallbacks.
  */
 async function generateEmbeddingsForTranscript(episodeId: string, transcriptText: string, env: Env): Promise<void> {
   console.log(`[Embeddings] Starting pgvector embedding for episode: ${episodeId}`);
@@ -1457,8 +1495,8 @@ async function generateEmbeddingsForTranscript(episodeId: string, transcriptText
       return;
     }
     
-    // 3. Get user's OpenAI key (or use fallback)
-    let openaiKey = env.OPENAI_API_KEY;
+    // 3. Get user's OpenAI key (required - no fallback)
+    let openaiKey: string | undefined;
     
     try {
       const userKeys = await getUserApiKeys(
@@ -1468,12 +1506,17 @@ async function generateEmbeddingsForTranscript(episodeId: string, transcriptText
         env.API_KEY_ENCRYPTION_KEY
       );
       
-      if (userKeys.openaiKey) {
-        openaiKey = userKeys.openaiKey;
-        console.log(`[Embeddings] Using user's OpenAI key for user ${userId}`);
+      openaiKey = userKeys.openaiKey;
+      
+      if (!openaiKey) {
+        console.error(`[Embeddings] User ${userId} does not have OpenAI key configured, skipping embeddings`);
+        return;
       }
+      
+      console.log(`[Embeddings] Using user's OpenAI key for user ${userId}`);
     } catch (keyError) {
-      console.warn(`[Embeddings] Failed to fetch user keys, using default: ${keyError}`);
+      console.error(`[Embeddings] Failed to fetch user keys: ${keyError}`);
+      return;
     }
     
     // 4. Get transcription ID
@@ -1876,6 +1919,41 @@ async function handleExtractTopics(request: Request, env: Env): Promise<Response
       "Content-Type": "application/json",
     };
     
+    // Get episode to find user via subscription
+    const episodeResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episode_id}&select=id,feed_url`,
+      { headers }
+    );
+    const episodes = await episodeResponse.json() as Array<{ id: string; feed_url: string }>;
+    
+    if (!episodes.length) {
+      return json({ error: "Episode not found" }, 404);
+    }
+    
+    // Find user via subscription
+    const subResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/subscriptions?feed_url=eq.${encodeURIComponent(episodes[0].feed_url)}&select=user_id&limit=1`,
+      { headers }
+    );
+    const subs = await subResponse.json() as Array<{ user_id: string }>;
+    const userId = subs[0]?.user_id;
+    
+    if (!userId) {
+      return json({ error: "No user found for this episode" }, 400);
+    }
+    
+    // Get user's Anthropic key (required - no fallback)
+    const userKeys = await getUserApiKeys(
+      env.SUPABASE_URL,
+      env.SUPABASE_SERVICE_ROLE_KEY,
+      userId,
+      env.API_KEY_ENCRYPTION_KEY
+    );
+    
+    if (!userKeys.anthropicKey) {
+      return json({ error: "Anthropic API key not configured. Please add your API key in Settings." }, 400);
+    }
+    
     // Get transcript from storage
     const transcriptResponse = await fetch(
       `${env.SUPABASE_URL}/storage/v1/object/transcripts/${episode_id}/transcript.json`,
@@ -1889,7 +1967,7 @@ async function handleExtractTopics(request: Request, env: Env): Promise<Response
     const transcript = await transcriptResponse.json() as { text: string };
     
     // Extract topics
-    const result = await callClaudeForTopics(transcript.text, env.ANTHROPIC_API_KEY);
+    const result = await callClaudeForTopics(transcript.text, userKeys.anthropicKey);
     
     // Get transcription ID
     const transcriptionResponse = await fetch(
@@ -2096,30 +2174,36 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     
     console.log(`[Digest] Generating ${maxLengthMinutes}-minute digest for last ${hoursBack} hours`);
     
-    // BYOK: Fetch user's API keys (with fallback to env keys)
-    let userAnthropicKey = env.ANTHROPIC_API_KEY;
-    let userOpenAIKey = env.OPENAI_API_KEY;
+    // BYOK: Fetch user's API keys (required - no fallbacks)
+    let userAnthropicKey: string | undefined;
+    let userOpenAIKey: string | undefined;
+    let userElevenLabsKey: string | undefined;
     
-    if (userId !== "00000000-0000-0000-0000-000000000000") {
-      try {
-        const userKeys = await getUserApiKeys(
-          env.SUPABASE_URL,
-          env.SUPABASE_SERVICE_ROLE_KEY,
-          userId,
-          env.API_KEY_ENCRYPTION_KEY
-        );
-        
-        if (userKeys.anthropicKey) {
-          userAnthropicKey = userKeys.anthropicKey;
-          console.log(`[Digest] Using user's Anthropic key for user ${userId}`);
-        }
-        if (userKeys.openaiKey) {
-          userOpenAIKey = userKeys.openaiKey;
-          console.log(`[Digest] Using user's OpenAI key for TTS for user ${userId}`);
-        }
-      } catch (keyError) {
-        console.warn(`[Digest] Failed to fetch user keys, using defaults: ${keyError}`);
+    if (userId === "00000000-0000-0000-0000-000000000000") {
+      return json({ error: "Valid user ID is required" }, 400);
+    }
+    
+    try {
+      const userKeys = await getUserApiKeys(
+        env.SUPABASE_URL,
+        env.SUPABASE_SERVICE_ROLE_KEY,
+        userId,
+        env.API_KEY_ENCRYPTION_KEY
+      );
+      
+      userAnthropicKey = userKeys.anthropicKey;
+      userOpenAIKey = userKeys.openaiKey;
+      userElevenLabsKey = userKeys.elevenlabsKey;
+      
+      if (!userAnthropicKey) {
+        console.error(`[Digest] User ${userId} does not have Anthropic key configured`);
+        return json({ error: "Anthropic API key not configured. Please add your API key in Settings." }, 400);
       }
+      
+      console.log(`[Digest] Using user's API keys for user ${userId}`);
+    } catch (keyError) {
+      console.error(`[Digest] Failed to fetch user keys: ${keyError}`);
+      return json({ error: "Failed to retrieve API keys. Please configure your keys in Settings." }, 500);
     }
     
     // 1. Get episodes already covered in recent digests (last 7 days) to avoid repeats
