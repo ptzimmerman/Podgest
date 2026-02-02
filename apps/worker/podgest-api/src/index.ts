@@ -791,6 +791,11 @@ export default {
     if (url.pathname === "/api/user-keys" && request.method === "POST") {
       return withCors(await handleSaveUserKey(request, env));
     }
+    
+    // Generate welcome episode for new user
+    if (url.pathname === "/api/generate-welcome" && request.method === "POST") {
+      return withCors(await handleGenerateWelcome(request, env, ctx));
+    }
 
     return json({ error: "Not found" }, 404);
   },
@@ -1156,6 +1161,166 @@ async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
     }
   } catch (error) {
     console.error("[TTS Webhook] Error:", error);
+    return json({ error: "Internal error" }, 500);
+  }
+}
+
+// ============================================
+// WELCOME EPISODE GENERATION
+// ============================================
+
+/**
+ * Generate a personalized welcome episode for a new user.
+ * This creates a short audio greeting explaining how Podgest works.
+ */
+async function handleGenerateWelcome(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  try {
+    // Extract user_id from JWT token
+    const authHeader = request.headers.get('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return json({ error: "Authorization required" }, 401);
+    }
+    
+    const token = authHeader.replace('Bearer ', '');
+    let userId: string;
+    
+    try {
+      const payloadBase64 = token.split('.')[1];
+      const payload = JSON.parse(atob(payloadBase64));
+      userId = payload.sub;
+      if (!userId) {
+        return json({ error: "Invalid token" }, 401);
+      }
+    } catch {
+      return json({ error: "Invalid token format" }, 401);
+    }
+    
+    const headers = {
+      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+    };
+    
+    // Check if user already has a welcome episode
+    const existingResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=eq.welcome&select=id`,
+      { headers }
+    );
+    const existing = await existingResponse.json() as Array<{ id: string }>;
+    
+    if (existing.length > 0) {
+      console.log(`[Welcome] User ${userId} already has welcome episode`);
+      return json({ success: true, message: "Welcome episode already exists", digest_id: existing[0].id });
+    }
+    
+    // Get user info for personalization
+    const profileResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,email`,
+      { headers }
+    );
+    
+    let userName = "there";
+    if (profileResponse.ok) {
+      const profiles = await profileResponse.json() as Array<{ id: string; email?: string }>;
+      if (profiles.length > 0 && profiles[0].email) {
+        const emailPart = profiles[0].email.split('@')[0];
+        const firstName = emailPart.split(/[._0-9]/)[0];
+        if (firstName && firstName.length > 1) {
+          userName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
+        }
+      }
+    }
+    
+    // Get user's OpenAI key for TTS
+    const userKeys = await getUserApiKeys(
+      env.SUPABASE_URL,
+      env.SUPABASE_SERVICE_ROLE_KEY,
+      userId,
+      env.API_KEY_ENCRYPTION_KEY
+    );
+    
+    if (!userKeys.openaiKey) {
+      return json({ error: "OpenAI API key required. Please add your key in Settings." }, 400);
+    }
+    
+    // Create the welcome script
+    const welcomeScript = `Hey ${userName}! Welcome to Podgest, your personal podcast digest.
+
+Here's how it works: Every morning at 6 AM, I check your subscribed podcasts for new episodes. When I find new content, I transcribe it using AI and identify the most interesting topics and insights.
+
+Then I create a personalized 5-minute audio digest just for you, summarizing the best moments from all your shows. Think of it like having a friend who listens to all your podcasts and gives you the highlights.
+
+Your first real digest will arrive tomorrow morning. In the meantime, feel free to add more podcasts in your settings. The more shows you subscribe to, the richer your daily digest becomes.
+
+You can also connect me to Claude or ChatGPT using the MCP server. This lets you ask questions about any podcast content, like "What did they say about AI on Lex Fridman?" or "Compare what different hosts think about remote work." It's pretty powerful.
+
+Alright, that's the quick tour. I'll catch you tomorrow with your first digest. Welcome aboard!`;
+
+    // Create digest record
+    const digestId = crypto.randomUUID();
+    const digestRecord = {
+      id: digestId,
+      user_id: userId,
+      digest_date: "welcome",  // Special marker for welcome episode
+      status: "generating",
+      topic_clusters: {
+        title: `Welcome to Podgest, ${userName}!`,
+        topics: ["Introduction", "How it works", "Getting started"],
+      },
+      script: welcomeScript,
+      word_count: welcomeScript.split(/\s+/).length,
+      episodes_included: [],
+      created_at: new Date().toISOString(),
+    };
+    
+    const insertResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests`,
+      {
+        method: "POST",
+        headers: { ...headers, "Prefer": "return=minimal" },
+        body: JSON.stringify(digestRecord),
+      }
+    );
+    
+    if (!insertResponse.ok) {
+      const err = await insertResponse.text();
+      console.error(`[Welcome] Failed to create digest record: ${err}`);
+      return json({ error: "Failed to create welcome episode" }, 500);
+    }
+    
+    console.log(`[Welcome] Created digest record ${digestId}, triggering TTS...`);
+    
+    // Trigger TTS generation
+    ctx.waitUntil(
+      fetch(
+        "https://ptzimmerman--podgest-transcribe-openai-tts-web.modal.run",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            script: welcomeScript,
+            openai_api_key: userKeys.openaiKey,
+            voice: "echo",
+            model: "tts-1-hd",
+            supabase_url: env.SUPABASE_URL,
+            supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
+            digest_id: digestId,
+            webhook_url: "https://podgest-api.pztest.workers.dev/api/webhooks/tts",
+          }),
+        }
+      ).then(res => console.log(`[Welcome] TTS triggered: ${res.status}`))
+       .catch(err => console.error(`[Welcome] TTS error: ${err}`))
+    );
+    
+    return json({ 
+      success: true, 
+      message: "Welcome episode is being generated", 
+      digest_id: digestId,
+      estimated_time: "~30 seconds"
+    });
+    
+  } catch (error) {
+    console.error("[Welcome] Error:", error);
     return json({ error: "Internal error" }, 500);
   }
 }
@@ -2597,6 +2762,25 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
       "Content-Type": "application/json",
     };
     
+    // Fetch user profile for personalization
+    const profileResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,email`,
+      { headers }
+    );
+    
+    let userName = "there";
+    if (profileResponse.ok) {
+      const profiles = await profileResponse.json() as Array<{ id: string; email?: string }>;
+      if (profiles.length > 0 && profiles[0].email) {
+        // Extract first name from email (before @ and any dots/numbers)
+        const emailPart = profiles[0].email.split('@')[0];
+        const firstName = emailPart.split(/[._0-9]/)[0];
+        if (firstName && firstName.length > 1) {
+          userName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
+        }
+      }
+    }
+    
     // Fetch completed digests for this user
     const digestsResponse = await fetch(
       `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&status=eq.completed&order=digest_date.desc&limit=50`,
@@ -2617,11 +2801,67 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
     }>;
     
     // Build RSS XML
-    const feedUrl = `https://podgest-api.pztest.workers.dev/feed/${userId}`;
+    const feedUrl = `https://podgest-api.pztest.workers.dev/feed/${userId}.xml`;
     const now = new Date().toUTCString();
+    const coverImage = "https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/cover.png";
+    const welcomeAudio = "https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/welcome.mp3";
     
     // Build items with actual file sizes
     const items: string[] = [];
+    
+    // Check for welcome episode (if no regular digests)
+    if (digests.length === 0) {
+      // Fetch welcome episode if it exists
+      const welcomeResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=eq.welcome&status=eq.completed&select=*`,
+        { headers }
+      );
+      
+      if (welcomeResponse.ok) {
+        const welcomeDigests = await welcomeResponse.json() as Array<{
+          id: string;
+          topic_clusters: { title: string; topics: string[] };
+          audio_url: string;
+          duration_seconds: number;
+          completed_at: string;
+          script: string;
+        }>;
+        
+        if (welcomeDigests.length > 0) {
+          const welcome = welcomeDigests[0];
+          const welcomeDate = new Date(welcome.completed_at).toUTCString();
+          const description = welcome.script || "Welcome to Podgest! Your first real digest arrives tomorrow morning.";
+          const duration = formatDuration(welcome.duration_seconds || 60);
+          
+          // Get file size
+          let fileSize = 0;
+          try {
+            const headResponse = await fetch(welcome.audio_url, { method: "HEAD" });
+            const contentLength = headResponse.headers.get("content-length");
+            if (contentLength) {
+              fileSize = parseInt(contentLength, 10);
+            }
+          } catch (e) {
+            console.error(`[RSS] Failed to get welcome file size`);
+          }
+          
+          items.push(`
+    <item>
+      <title><![CDATA[${welcome.topic_clusters?.title || `Welcome to Podgest, ${userName}!`}]]></title>
+      <description><![CDATA[${description}]]></description>
+      <pubDate>${welcomeDate}</pubDate>
+      <guid isPermaLink="false">${welcome.id}</guid>
+      <enclosure url="${welcome.audio_url}" length="${fileSize}" type="audio/mpeg"/>
+      <itunes:duration>${duration}</itunes:duration>
+      <itunes:explicit>no</itunes:explicit>
+      <itunes:episodeType>trailer</itunes:episodeType>
+      <itunes:summary>Your first daily digest arrives tomorrow morning!</itunes:summary>
+    </item>`);
+        }
+      }
+    }
+    
+    // Add actual digest episodes
     for (const d of digests) {
       const pubDate = new Date(d.completed_at).toUTCString();
       const title = d.topic_clusters?.title || `Daily Digest - ${d.digest_date}`;
@@ -2649,9 +2889,13 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
       <enclosure url="${d.audio_url}" length="${fileSize}" type="audio/mpeg"/>
       <itunes:duration>${duration}</itunes:duration>
       <itunes:explicit>no</itunes:explicit>
-      <itunes:episodeType>Full</itunes:episodeType>
+      <itunes:episodeType>full</itunes:episodeType>
     </item>`);
     }
+    
+    const feedTitle = digests.length === 0 
+      ? `Podgest - ${userName}'s Daily Digest`
+      : "Podgest Daily Digest";
     
     const rss = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" 
@@ -2659,14 +2903,14 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
   xmlns:content="http://purl.org/rss/1.0/modules/content/"
   xmlns:atom="http://www.w3.org/2005/Atom">
   <channel>
-    <title>Podgest Daily Digest</title>
+    <title>${feedTitle}</title>
     <description>Your personalized podcast news digest, delivered daily. AI-powered summaries of your favorite podcasts.</description>
     <link>${feedUrl}</link>
     <language>en-us</language>
     <lastBuildDate>${now}</lastBuildDate>
     <atom:link href="${feedUrl}" rel="self" type="application/rss+xml"/>
     <itunes:author>Podgest</itunes:author>
-    <itunes:summary>AI-powered daily digest of your favorite podcasts.</itunes:summary>
+    <itunes:summary>AI-powered daily digest of your favorite podcasts, personalized for ${userName}.</itunes:summary>
     <itunes:category text="News">
       <itunes:category text="Daily News"/>
     </itunes:category>
@@ -2674,12 +2918,12 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
     <itunes:type>episodic</itunes:type>
     <itunes:owner>
       <itunes:name>Podgest</itunes:name>
-      <itunes:email>podgest@example.com</itunes:email>
+      <itunes:email>hello@podgest.app</itunes:email>
     </itunes:owner>
-    <itunes:image href="https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/cover.png"/>
+    <itunes:image href="${coverImage}"/>
     <image>
-      <url>https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/cover.png</url>
-      <title>Podgest Daily Digest</title>
+      <url>${coverImage}</url>
+      <title>${feedTitle}</title>
       <link>${feedUrl}</link>
     </image>
 ${items.join("\n")}
