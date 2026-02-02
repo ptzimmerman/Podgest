@@ -2400,10 +2400,10 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
       return json({ error: "Failed to retrieve API keys. Please configure your keys in Settings." }, 500);
     }
     
-    // 1. Get episodes already covered in recent digests (last 7 days) to avoid repeats
+    // 1. Get episodes already covered in THIS USER's recent digests (last 7 days) to avoid repeats
     const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     const recentDigestsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?digest_date=gte.${weekAgo}&select=episodes_included`,
+      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=gte.${weekAgo}&select=episodes_included`,
       { headers }
     );
     
