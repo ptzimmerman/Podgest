@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 
-const API_URL = import.meta.env.VITE_API_URL || 'https://podgest-api.petehodgson.workers.dev'
+const API_URL = import.meta.env.VITE_API_URL || 'https://podgest-api.pztest.workers.dev'
 
 type KeyStatus = {
   openai: { configured: boolean; valid: boolean | null }
@@ -17,6 +17,9 @@ export function Settings() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [userId, setUserId] = useState<string | null>(null)
+  const [copiedFeed, setCopiedFeed] = useState(false)
+  const [copiedMcp, setCopiedMcp] = useState(false)
 
   useEffect(() => {
     fetchKeyStatus()
@@ -26,6 +29,8 @@ export function Settings() {
     try {
       const { data: { session } } = await supabase.auth.getSession()
       if (!session) return
+
+      setUserId(session.user.id)
 
       const { data, error } = await supabase
         .from('user_api_keys')
@@ -151,6 +156,17 @@ export function Settings() {
     }
   }
 
+  const copyToClipboard = async (text: string, type: 'feed' | 'mcp') => {
+    await navigator.clipboard.writeText(text)
+    if (type === 'feed') {
+      setCopiedFeed(true)
+      setTimeout(() => setCopiedFeed(false), 2000)
+    } else {
+      setCopiedMcp(true)
+      setTimeout(() => setCopiedMcp(false), 2000)
+    }
+  }
+
   const StatusBadge = ({ status }: { status: { configured: boolean; valid: boolean | null } }) => {
     if (!status.configured) {
       return (
@@ -189,13 +205,15 @@ export function Settings() {
   }
 
   const allKeysConfigured = keyStatus?.openai.configured && keyStatus?.anthropic.configured
+  const rssFeedUrl = userId ? `${API_URL}/feed/${userId}.xml` : ''
+  const mcpServerUrl = 'https://podgest-mcp.pztest.workers.dev'
 
   return (
     <div className="space-y-8">
       <div>
         <h1 className="text-2xl font-bold text-gray-900">Settings</h1>
         <p className="mt-1 text-sm text-gray-600">
-          Manage your API keys for digest generation.
+          Manage your Podgest configuration and integrations.
         </p>
       </div>
 
@@ -210,6 +228,207 @@ export function Settings() {
           <strong>Action Required:</strong> You must configure your OpenAI and Anthropic API keys to generate digests.
         </div>
       )}
+
+      {/* RSS Feed Section */}
+      <section className="bg-white rounded-lg border border-gray-200 p-6">
+        <div className="flex items-start gap-4">
+          <div className="flex-shrink-0 w-10 h-10 bg-orange-100 rounded-lg flex items-center justify-center">
+            <svg className="w-6 h-6 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 5c7.18 0 13 5.82 13 13M6 11a7 7 0 017 7m-6 0a1 1 0 11-2 0 1 1 0 012 0z" />
+            </svg>
+          </div>
+          <div className="flex-1">
+            <h2 className="text-lg font-semibold text-gray-900">Your Podcast Feed</h2>
+            <p className="mt-1 text-sm text-gray-500">
+              Subscribe to your personalized Podgest digest in any podcast app (Apple Podcasts, Spotify, Overcast, etc.)
+            </p>
+            
+            <div className="mt-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">RSS Feed URL</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  readOnly
+                  value={rssFeedUrl}
+                  className="flex-1 px-3 py-2 bg-gray-50 border border-gray-300 rounded-lg text-sm text-gray-600 font-mono"
+                />
+                <button
+                  onClick={() => copyToClipboard(rssFeedUrl, 'feed')}
+                  className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 transition-colors flex items-center gap-2"
+                >
+                  {copiedFeed ? (
+                    <>
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                      </svg>
+                      Copied!
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
+                      </svg>
+                      Copy
+                    </>
+                  )}
+                </button>
+              </div>
+              <p className="mt-2 text-xs text-gray-500">
+                Paste this URL into your podcast app's "Add by URL" or "Add RSS Feed" option.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* MCP Server Section */}
+      <section className="bg-white rounded-lg border border-gray-200 p-6">
+        <div className="flex items-start gap-4">
+          <div className="flex-shrink-0 w-10 h-10 bg-purple-100 rounded-lg flex items-center justify-center">
+            <svg className="w-6 h-6 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            </svg>
+          </div>
+          <div className="flex-1">
+            <h2 className="text-lg font-semibold text-gray-900">AI Assistant Integration (MCP)</h2>
+            <p className="mt-1 text-sm text-gray-500">
+              Connect Podgest to Claude, ChatGPT, or Cursor to search and analyze your podcast library with AI.
+            </p>
+
+            <div className="mt-4 bg-gray-50 rounded-lg p-4">
+              <h3 className="text-sm font-semibold text-gray-900 mb-3">What you can do:</h3>
+              <ul className="space-y-2 text-sm text-gray-600">
+                <li className="flex items-start gap-2">
+                  <span className="text-purple-600 mt-0.5">•</span>
+                  <span><strong>Search across all podcasts</strong> — "What have people said about AI regulation?"</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="text-purple-600 mt-0.5">•</span>
+                  <span><strong>Compare perspectives</strong> — "How do different hosts view the future of remote work?"</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="text-purple-600 mt-0.5">•</span>
+                  <span><strong>Get episode details</strong> — Find transcripts and listen links for any episode</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="text-purple-600 mt-0.5">•</span>
+                  <span><strong>Discover connections</strong> — Find themes across different shows you follow</span>
+                </li>
+              </ul>
+            </div>
+
+            <div className="mt-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">MCP Server URL</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  readOnly
+                  value={mcpServerUrl}
+                  className="flex-1 px-3 py-2 bg-gray-50 border border-gray-300 rounded-lg text-sm text-gray-600 font-mono"
+                />
+                <button
+                  onClick={() => copyToClipboard(mcpServerUrl, 'mcp')}
+                  className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 transition-colors flex items-center gap-2"
+                >
+                  {copiedMcp ? (
+                    <>
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                      </svg>
+                      Copied!
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
+                      </svg>
+                      Copy
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              <h3 className="text-sm font-semibold text-gray-900">Setup Instructions:</h3>
+              
+              <details className="group">
+                <summary className="flex items-center gap-2 cursor-pointer text-sm font-medium text-gray-700 hover:text-gray-900">
+                  <svg className="w-4 h-4 transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                  </svg>
+                  Claude Desktop (macOS/Windows)
+                </summary>
+                <div className="mt-2 ml-6 text-sm text-gray-600 space-y-2">
+                  <p>1. Open Claude Desktop settings → Developer → Edit Config</p>
+                  <p>2. Add to your <code className="bg-gray-100 px-1 rounded">claude_desktop_config.json</code>:</p>
+                  <pre className="bg-gray-800 text-gray-100 p-3 rounded-lg text-xs overflow-x-auto">
+{`{
+  "mcpServers": {
+    "podgest": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "${mcpServerUrl}/sse"]
+    }
+  }
+}`}
+                  </pre>
+                  <p>3. Restart Claude Desktop and sign in when prompted</p>
+                </div>
+              </details>
+
+              <details className="group">
+                <summary className="flex items-center gap-2 cursor-pointer text-sm font-medium text-gray-700 hover:text-gray-900">
+                  <svg className="w-4 h-4 transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                  </svg>
+                  Claude Mobile (iOS/Android)
+                </summary>
+                <div className="mt-2 ml-6 text-sm text-gray-600 space-y-2">
+                  <p>1. Go to <a href="https://claude.ai/settings/mcp" target="_blank" rel="noopener noreferrer" className="text-indigo-600 underline">claude.ai/settings/mcp</a></p>
+                  <p>2. Click "Add Server" and paste the MCP Server URL</p>
+                  <p>3. Sign in with Google when prompted</p>
+                </div>
+              </details>
+
+              <details className="group">
+                <summary className="flex items-center gap-2 cursor-pointer text-sm font-medium text-gray-700 hover:text-gray-900">
+                  <svg className="w-4 h-4 transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                  </svg>
+                  ChatGPT Desktop
+                </summary>
+                <div className="mt-2 ml-6 text-sm text-gray-600 space-y-2">
+                  <p>1. Open ChatGPT Desktop → Settings → Developer Mode</p>
+                  <p>2. Click "Add MCP Connector"</p>
+                  <p>3. Paste the MCP Server URL and connect</p>
+                </div>
+              </details>
+
+              <details className="group">
+                <summary className="flex items-center gap-2 cursor-pointer text-sm font-medium text-gray-700 hover:text-gray-900">
+                  <svg className="w-4 h-4 transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                  </svg>
+                  Cursor IDE
+                </summary>
+                <div className="mt-2 ml-6 text-sm text-gray-600 space-y-2">
+                  <p>1. Create <code className="bg-gray-100 px-1 rounded">.cursor/mcp.json</code> in your project:</p>
+                  <pre className="bg-gray-800 text-gray-100 p-3 rounded-lg text-xs overflow-x-auto">
+{`{
+  "mcpServers": {
+    "podgest": {
+      "url": "${mcpServerUrl}/sse"
+    }
+  }
+}`}
+                  </pre>
+                  <p>2. Restart Cursor and sign in when prompted</p>
+                </div>
+              </details>
+            </div>
+          </div>
+        </div>
+      </section>
 
       {/* API Keys Section */}
       <section className="bg-white rounded-lg border border-gray-200 p-6">
