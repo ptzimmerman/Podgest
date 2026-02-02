@@ -1215,18 +1215,23 @@ async function handleGenerateWelcome(request: Request, env: Env, ctx: ExecutionC
     
     // Get user info for personalization
     const profileResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,email`,
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,email,display_name`,
       { headers }
     );
     
     let userName = "there";
     if (profileResponse.ok) {
-      const profiles = await profileResponse.json() as Array<{ id: string; email?: string }>;
-      if (profiles.length > 0 && profiles[0].email) {
-        const emailPart = profiles[0].email.split('@')[0];
-        const firstName = emailPart.split(/[._0-9]/)[0];
-        if (firstName && firstName.length > 1) {
-          userName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
+      const profiles = await profileResponse.json() as Array<{ id: string; email?: string; display_name?: string }>;
+      if (profiles.length > 0) {
+        // Prefer display_name, fall back to first name from email
+        if (profiles[0].display_name) {
+          userName = profiles[0].display_name.split(' ')[0]; // First name from display name
+        } else if (profiles[0].email) {
+          const emailPart = profiles[0].email.split('@')[0];
+          const firstName = emailPart.split(/[._0-9]/)[0];
+          if (firstName && firstName.length > 1) {
+            userName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
+          }
         }
       }
     }
@@ -2763,19 +2768,23 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
     
     // Fetch user profile for personalization
     const profileResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,email`,
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,email,display_name`,
       { headers }
     );
     
     let userName = "there";
     if (profileResponse.ok) {
-      const profiles = await profileResponse.json() as Array<{ id: string; email?: string }>;
-      if (profiles.length > 0 && profiles[0].email) {
-        // Extract first name from email (before @ and any dots/numbers)
-        const emailPart = profiles[0].email.split('@')[0];
-        const firstName = emailPart.split(/[._0-9]/)[0];
-        if (firstName && firstName.length > 1) {
-          userName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
+      const profiles = await profileResponse.json() as Array<{ id: string; email?: string; display_name?: string }>;
+      if (profiles.length > 0) {
+        // Prefer display_name, fall back to first name from email
+        if (profiles[0].display_name) {
+          userName = profiles[0].display_name.split(' ')[0]; // First name from display name
+        } else if (profiles[0].email) {
+          const emailPart = profiles[0].email.split('@')[0];
+          const firstName = emailPart.split(/[._0-9]/)[0];
+          if (firstName && firstName.length > 1) {
+            userName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
+          }
         }
       }
     }
