@@ -616,9 +616,34 @@ async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<
 // WORKER FETCH HANDLER
 // ============================================
 
+// CORS headers for browser requests
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
+// Helper to add CORS headers to response
+function withCors(response: Response): Response {
+  const newHeaders = new Headers(response.headers);
+  Object.entries(corsHeaders).forEach(([key, value]) => {
+    newHeaders.set(key, value);
+  });
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: newHeaders,
+  });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
+
+    // Handle CORS preflight requests
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
 
     // Health check
     if (url.pathname === "/health" || url.pathname === "/") {
@@ -759,12 +784,12 @@ export default {
     
     // BYOK: Validate API key (for Settings UI)
     if (url.pathname === "/api/validate-key" && request.method === "POST") {
-      return handleValidateKey(request);
+      return withCors(await handleValidateKey(request));
     }
     
     // BYOK: Save user API keys
     if (url.pathname === "/api/user-keys" && request.method === "POST") {
-      return handleSaveUserKey(request, env);
+      return withCors(await handleSaveUserKey(request, env));
     }
 
     return json({ error: "Not found" }, 404);
