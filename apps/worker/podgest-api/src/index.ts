@@ -1675,45 +1675,22 @@ async function generateEmbeddingsForTranscript(episodeId: string, transcriptText
       return;
     }
     
-    // 2. Find user via subscription
+    // 2. Find ALL users subscribed to this feed (not just one!)
     const subResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/subscriptions?feed_url=eq.${encodeURIComponent(episodes[0].feed_url)}&select=user_id&limit=1`,
+      `${env.SUPABASE_URL}/rest/v1/subscriptions?feed_url=eq.${encodeURIComponent(episodes[0].feed_url)}&select=user_id`,
       { headers }
     );
     
     const subs = await subResponse.json() as Array<{ user_id: string }>;
-    const userId = subs[0]?.user_id;
     
-    if (!userId) {
-      console.log(`[Embeddings] No user found for episode, skipping pgvector embedding`);
+    if (!subs.length) {
+      console.log(`[Embeddings] No users subscribed to this feed, skipping pgvector embedding`);
       return;
     }
     
-    // 3. Get user's OpenAI key (required - no fallback)
-    let openaiKey: string | undefined;
+    console.log(`[Embeddings] Found ${subs.length} users subscribed to this feed`);
     
-    try {
-      const userKeys = await getUserApiKeys(
-        env.SUPABASE_URL,
-        env.SUPABASE_SERVICE_ROLE_KEY,
-        userId,
-        env.API_KEY_ENCRYPTION_KEY
-      );
-      
-      openaiKey = userKeys.openaiKey;
-      
-      if (!openaiKey) {
-        console.error(`[Embeddings] User ${userId} does not have OpenAI key configured, skipping embeddings`);
-        return;
-      }
-      
-      console.log(`[Embeddings] Using user's OpenAI key for user ${userId}`);
-    } catch (keyError) {
-      console.error(`[Embeddings] Failed to fetch user keys: ${keyError}`);
-      return;
-    }
-    
-    // 4. Get transcription ID
+    // 3. Get transcription ID (shared across all users)
     const transcriptionResponse = await fetch(
       `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episodeId}&select=id`,
       { headers }
@@ -1727,36 +1704,77 @@ async function generateEmbeddingsForTranscript(episodeId: string, transcriptText
     
     const transcriptionId = transcriptions[0].id;
     
-    // 5. Generate chunked embeddings
+    // 4. Generate embeddings ONCE using first user's key, then store for ALL users
+    // Find a user with a valid OpenAI key
+    let openaiKey: string | undefined;
+    let keyUserId: string | undefined;
+    
+    for (const sub of subs) {
+      try {
+        const userKeys = await getUserApiKeys(
+          env.SUPABASE_URL,
+          env.SUPABASE_SERVICE_ROLE_KEY,
+          sub.user_id,
+          env.API_KEY_ENCRYPTION_KEY
+        );
+        
+        if (userKeys.openaiKey) {
+          openaiKey = userKeys.openaiKey;
+          keyUserId = sub.user_id;
+          break;
+        }
+      } catch (keyError) {
+        console.log(`[Embeddings] Failed to get key for user ${sub.user_id}: ${keyError}`);
+      }
+    }
+    
+    if (!openaiKey) {
+      console.error(`[Embeddings] No users have OpenAI key configured, skipping embeddings`);
+      return;
+    }
+    
+    console.log(`[Embeddings] Using OpenAI key from user ${keyUserId} to generate embeddings`);
+    
+    // 5. Generate chunked embeddings (once)
     console.log(`[Embeddings] Generating embeddings for transcript (${transcriptText.length} chars)...`);
     const chunkedEmbeddings = await generateChunkedEmbeddings(transcriptText, openaiKey);
     
     console.log(`[Embeddings] Generated ${chunkedEmbeddings.length} chunks for episode ${episodeId}`);
     
-    // 6. Store embeddings in transcript_embeddings table
-    for (const chunk of chunkedEmbeddings) {
-      const insertResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/transcript_embeddings`,
-        {
-          method: "POST",
-          headers: { ...headers, "Prefer": "return=minimal" },
-          body: JSON.stringify({
-            transcription_id: transcriptionId,
-            chunk_index: chunk.chunkIndex,
-            chunk_text: chunk.chunkText,
-            word_count: chunk.wordCount,
-            embedding: JSON.stringify(chunk.embedding), // pgvector expects array as string
-          }),
-        }
-      );
+    // 6. Store embeddings for EACH subscribed user
+    for (const sub of subs) {
+      console.log(`[Embeddings] Storing embeddings for user ${sub.user_id}...`);
       
-      if (!insertResponse.ok) {
-        const err = await insertResponse.text();
-        console.error(`[Embeddings] Failed to insert chunk ${chunk.chunkIndex}: ${err}`);
+      for (const chunk of chunkedEmbeddings) {
+        const insertResponse = await fetch(
+          `${env.SUPABASE_URL}/rest/v1/transcript_embeddings`,
+          {
+            method: "POST",
+            headers: { ...headers, "Prefer": "return=minimal" },
+            body: JSON.stringify({
+              user_id: sub.user_id,
+              episode_id: episodeId,
+              chunk_index: chunk.chunkIndex,
+              chunk_text: chunk.chunkText,
+              word_count: chunk.wordCount,
+              embedding: JSON.stringify(chunk.embedding), // pgvector expects array as string
+            }),
+          }
+        );
+        
+        if (!insertResponse.ok) {
+          const err = await insertResponse.text();
+          // Ignore duplicate key errors (user already has this embedding)
+          if (!err.includes('duplicate')) {
+            console.error(`[Embeddings] Failed to insert chunk ${chunk.chunkIndex} for user ${sub.user_id}: ${err}`);
+          }
+        }
       }
+      
+      console.log(`[Embeddings] ✅ Stored ${chunkedEmbeddings.length} embeddings for user ${sub.user_id}`);
     }
     
-    console.log(`[Embeddings] ✅ Stored ${chunkedEmbeddings.length} embeddings for episode ${episodeId}`);
+    console.log(`[Embeddings] ✅ Completed embeddings for ${subs.length} users on episode ${episodeId}`);
     
   } catch (error) {
     console.error(`[Embeddings] Error for episode ${episodeId}:`, error);
