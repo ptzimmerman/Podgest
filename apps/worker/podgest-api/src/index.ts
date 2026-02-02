@@ -1201,16 +1201,16 @@ async function handleGenerateWelcome(request: Request, env: Env, ctx: ExecutionC
       "Content-Type": "application/json",
     };
     
-    // Check if user already has a welcome episode
+    // Check if user already has a welcome episode (marked with date 1970-01-01)
     const existingResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=eq.welcome&select=id`,
+      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=eq.1970-01-01&select=id,status`,
       { headers }
     );
-    const existing = await existingResponse.json() as Array<{ id: string }>;
+    const existing = await existingResponse.json() as Array<{ id: string; status: string }>;
     
     if (existing.length > 0) {
-      console.log(`[Welcome] User ${userId} already has welcome episode`);
-      return json({ success: true, message: "Welcome episode already exists", digest_id: existing[0].id });
+      console.log(`[Welcome] User ${userId} already has welcome episode (status: ${existing[0].status})`);
+      return json({ success: true, message: "Welcome episode already exists", digest_id: existing[0].id, status: existing[0].status });
     }
     
     // Get user info for personalization
@@ -1261,14 +1261,13 @@ Alright, that's the quick tour. I'll catch you tomorrow with your first digest. 
     const digestRecord = {
       id: digestId,
       user_id: userId,
-      digest_date: "welcome",  // Special marker for welcome episode
+      digest_date: "1970-01-01",  // Special date marker for welcome episode
       status: "generating",
       topic_clusters: {
         title: `Welcome to Podgest, ${userName}!`,
         topics: ["Introduction", "How it works", "Getting started"],
       },
-      script: welcomeScript,
-      word_count: welcomeScript.split(/\s+/).length,
+      script_text: welcomeScript,
       episodes_included: [],
       created_at: new Date().toISOString(),
     };
@@ -2811,9 +2810,9 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
     
     // Check for welcome episode (if no regular digests)
     if (digests.length === 0) {
-      // Fetch welcome episode if it exists
+      // Fetch welcome episode if it exists (marked with date 1970-01-01)
       const welcomeResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=eq.welcome&status=eq.completed&select=*`,
+        `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=eq.1970-01-01&status=eq.completed&select=*`,
         { headers }
       );
       
@@ -2824,13 +2823,13 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
           audio_url: string;
           duration_seconds: number;
           completed_at: string;
-          script: string;
+          script_text: string;
         }>;
         
         if (welcomeDigests.length > 0) {
           const welcome = welcomeDigests[0];
           const welcomeDate = new Date(welcome.completed_at).toUTCString();
-          const description = welcome.script || "Welcome to Podgest! Your first real digest arrives tomorrow morning.";
+          const description = welcome.script_text || "Welcome to Podgest! Your first real digest arrives tomorrow morning.";
           const duration = formatDuration(welcome.duration_seconds || 60);
           
           // Get file size
