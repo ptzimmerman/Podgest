@@ -2837,33 +2837,44 @@ async function handleValidateKey(request: Request): Promise<Response> {
  */
 async function handleSaveUserKey(request: Request, env: Env): Promise<Response> {
   try {
-    const body = await request.json() as {
-      user_id: string;
-      key_type: 'openai' | 'anthropic' | 'elevenlabs';
-      api_key?: string;           // Plaintext key (we'll encrypt it)
-      encrypted_key?: string;      // Or pre-encrypted key
-    };
-    
-    if (!body.user_id) {
-      return json({ error: "user_id is required" }, 400);
+    // Extract user_id from JWT token in Authorization header
+    const authHeader = request.headers.get('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return json({ error: "Authorization header required" }, 401);
     }
+    
+    const token = authHeader.replace('Bearer ', '');
+    let userId: string;
+    
+    try {
+      // Decode JWT to get user ID (the 'sub' claim)
+      // JWT format: header.payload.signature
+      const payloadBase64 = token.split('.')[1];
+      const payload = JSON.parse(atob(payloadBase64));
+      userId = payload.sub;
+      
+      if (!userId) {
+        return json({ error: "Invalid token: missing user ID" }, 401);
+      }
+    } catch {
+      return json({ error: "Invalid token format" }, 401);
+    }
+    
+    const body = await request.json() as {
+      key_type: 'openai' | 'anthropic' | 'elevenlabs';
+      key: string;  // Plaintext key (we'll encrypt it)
+    };
     
     if (!body.key_type) {
       return json({ error: "key_type is required" }, 400);
     }
     
-    // Determine which key to use
-    let encryptedKey: string;
-    
-    if (body.api_key) {
-      // Encrypt the plaintext key
-      encryptedKey = await encryptApiKey(body.api_key, env.API_KEY_ENCRYPTION_KEY);
-    } else if (body.encrypted_key) {
-      // Use the pre-encrypted key
-      encryptedKey = body.encrypted_key;
-    } else {
-      return json({ error: "Either api_key or encrypted_key is required" }, 400);
+    if (!body.key) {
+      return json({ error: "key is required" }, 400);
     }
+    
+    // Encrypt the plaintext key
+    const encryptedKey = await encryptApiKey(body.key, env.API_KEY_ENCRYPTION_KEY);
     
     // Map key_type to column name
     const columnMap = {
@@ -2896,7 +2907,7 @@ async function handleSaveUserKey(request: Request, env: Env): Promise<Response> 
     
     // Check if user already has a row
     const existingResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${body.user_id}&select=id`,
+      `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${userId}&select=id`,
       { headers }
     );
     
@@ -2912,7 +2923,7 @@ async function handleSaveUserKey(request: Request, env: Env): Promise<Response> 
     if (existing.length > 0) {
       // Update existing row
       const updateResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${body.user_id}`,
+        `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${userId}`,
         {
           method: "PATCH",
           headers: { ...headers, "Prefer": "return=representation" },
@@ -2929,7 +2940,7 @@ async function handleSaveUserKey(request: Request, env: Env): Promise<Response> 
     } else {
       // Insert new row
       const insertData = {
-        user_id: body.user_id,
+        user_id: userId,
         ...updateData,
       };
       
