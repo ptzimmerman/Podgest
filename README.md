@@ -1662,6 +1662,1217 @@ _(None currently — revisit as we build)_
 
 ---
 
+## Phase 8: Multi-User BYOK & Infrastructure Upgrade
+
+### Overview
+
+Transform Podgest from a single-user, API-only system to a multi-tenant platform with a user-facing Settings UI. Users bring their own API keys (BYOK). Includes migration from SuperMemory to pgvector for embeddings, and a new Newsletter Edition feature.
+
+**Note:** There is currently NO user-facing UI - the Settings UI is being built from scratch as part of this phase.
+
+### Key Changes
+
+| Component | Before | After |
+|-----------|--------|-------|
+| **User Interface** | None (API only) | Full Settings UI (React + Vite) |
+| **Embeddings** | SuperMemory (external) | pgvector (Supabase-native) |
+| **API Keys** | Hardcoded in env | Per-user, encrypted in DB |
+| **TTS** | Shared ElevenLabs/OpenAI | User's OpenAI key |
+| **Summarization** | Shared Anthropic | User's Anthropic key |
+| **Newsletters** | Not supported | Email forwarding → audio digest |
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        MULTI-USER BYOK ARCHITECTURE                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                         SETTINGS UI (New)                               ││
+│  │                                                                          ││
+│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐          ││
+│  │  │  API Keys       │  │  Subscriptions  │  │  Preferences    │          ││
+│  │  │  - OpenAI *     │  │  - Add RSS      │  │  - Timezone     │          ││
+│  │  │  - Anthropic *  │  │  - Manage pods  │  │  - Digest time  │          ││
+│  │  │  - ElevenLabs   │  │  - Priorities   │  │  - Voice choice │          ││
+│  │  └─────────────────┘  └─────────────────┘  └─────────────────┘          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                       │                                      │
+│                                       ▼                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                         SUPABASE                                         ││
+│  │                                                                          ││
+│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐          ││
+│  │  │  user_api_keys  │  │  transcript_    │  │  profiles       │          ││
+│  │  │  (encrypted)    │  │  embeddings     │  │  subscriptions  │          ││
+│  │  │                 │  │  (pgvector)     │  │  digests        │          ││
+│  │  └─────────────────┘  └─────────────────┘  └─────────────────┘          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                       │                                      │
+│                                       ▼                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                    DIGEST GENERATION (Per-User Keys)                    ││
+│  │                                                                          ││
+│  │  pg_cron ──▶ For each user:                                             ││
+│  │              1. Fetch user's encrypted API keys                         ││
+│  │              2. Decrypt keys                                            ││
+│  │              3. Generate script (user's Anthropic key)                  ││
+│  │              4. Generate audio (user's OpenAI key)                      ││
+│  │              5. Store digest under user's account                       ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Database Migrations
+
+#### 8.1 User API Keys Table
+
+```sql
+-- Store encrypted API keys per user
+CREATE TABLE public.user_api_keys (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE UNIQUE,
+  
+  -- Encrypted API keys (AES-256-GCM)
+  openai_key_encrypted TEXT,
+  anthropic_key_encrypted TEXT,
+  elevenlabs_key_encrypted TEXT,
+  
+  -- Validation status
+  openai_valid BOOLEAN DEFAULT false,
+  anthropic_valid BOOLEAN DEFAULT false,
+  elevenlabs_valid BOOLEAN DEFAULT false,
+  
+  -- Last validation timestamps
+  openai_validated_at TIMESTAMPTZ,
+  anthropic_validated_at TIMESTAMPTZ,
+  elevenlabs_validated_at TIMESTAMPTZ,
+  
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE public.user_api_keys ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users manage their own API keys" ON public.user_api_keys
+  FOR ALL USING (auth.uid() = user_id);
+```
+
+#### 8.2 pgvector Embeddings Table (Replaces SuperMemory)
+
+```sql
+-- Enable pgvector extension
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Transcript embeddings for semantic search
+CREATE TABLE public.transcript_embeddings (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
+  episode_id UUID REFERENCES public.episodes(id) ON DELETE CASCADE,
+  
+  -- Chunk metadata
+  chunk_index INTEGER NOT NULL,
+  chunk_text TEXT NOT NULL,
+  word_count INTEGER,
+  
+  -- The embedding vector (1536 dimensions for text-embedding-3-small)
+  embedding vector(1536),
+  
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Index for fast similarity search (IVFFlat)
+CREATE INDEX transcript_embeddings_embedding_idx ON public.transcript_embeddings 
+  USING ivfflat (embedding vector_cosine_ops)
+  WITH (lists = 100);
+
+-- Index for user filtering
+CREATE INDEX transcript_embeddings_user_episode_idx 
+  ON public.transcript_embeddings(user_id, episode_id);
+
+-- RLS: users can only access their own embeddings
+ALTER TABLE public.transcript_embeddings ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users access their own embeddings" ON public.transcript_embeddings
+  FOR ALL USING (auth.uid() = user_id);
+
+-- Service role bypass for pipeline
+CREATE POLICY "Service role full access" ON public.transcript_embeddings
+  FOR ALL TO service_role USING (true) WITH CHECK (true);
+```
+
+#### 8.3 Newsletter Embeddings Table
+
+```sql
+-- Newsletter embeddings (same structure as transcripts)
+CREATE TABLE public.newsletter_embeddings (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
+  newsletter_id UUID REFERENCES public.newsletters(id) ON DELETE CASCADE,
+  
+  chunk_index INTEGER NOT NULL,
+  chunk_text TEXT NOT NULL,
+  word_count INTEGER,
+  
+  embedding vector(1536),
+  
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX newsletter_embeddings_embedding_idx ON public.newsletter_embeddings 
+  USING ivfflat (embedding vector_cosine_ops)
+  WITH (lists = 100);
+
+CREATE INDEX newsletter_embeddings_user_idx 
+  ON public.newsletter_embeddings(user_id, newsletter_id);
+
+ALTER TABLE public.newsletter_embeddings ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users access their own newsletter embeddings" ON public.newsletter_embeddings
+  FOR ALL USING (auth.uid() = user_id);
+
+CREATE POLICY "Service role full access" ON public.newsletter_embeddings
+  FOR ALL TO service_role USING (true) WITH CHECK (true);
+```
+
+### API Key Encryption
+
+```typescript
+// packages/core/src/encryption.ts
+
+import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
+
+// ENCRYPTION_KEY must be 32 bytes, stored in environment
+// Generate with: openssl rand -hex 32
+
+export function encryptApiKey(plaintext: string, encryptionKey: Buffer): string {
+  const iv = randomBytes(16);
+  const cipher = createCipheriv('aes-256-gcm', encryptionKey, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  
+  // Format: iv:tag:ciphertext (all hex encoded)
+  return `${iv.toString('hex')}:${tag.toString('hex')}:${encrypted.toString('hex')}`;
+}
+
+export function decryptApiKey(ciphertext: string, encryptionKey: Buffer): string {
+  const [ivHex, tagHex, encryptedHex] = ciphertext.split(':');
+  
+  const iv = Buffer.from(ivHex, 'hex');
+  const tag = Buffer.from(tagHex, 'hex');
+  const encrypted = Buffer.from(encryptedHex, 'hex');
+  
+  const decipher = createDecipheriv('aes-256-gcm', encryptionKey, iv);
+  decipher.setAuthTag(tag);
+  
+  return decipher.update(encrypted) + decipher.final('utf8');
+}
+```
+
+### Embedding Generation
+
+```typescript
+// packages/core/src/embeddings.ts
+
+import OpenAI from 'openai';
+
+const CHUNK_SIZE = 500;      // words per chunk
+const CHUNK_OVERLAP = 50;    // overlap for context continuity
+
+export async function generateEmbeddings(
+  text: string,
+  openaiKey: string
+): Promise<{ chunks: string[]; embeddings: number[][] }> {
+  const openai = new OpenAI({ apiKey: openaiKey });
+  
+  // Chunk the text
+  const chunks = chunkText(text, CHUNK_SIZE, CHUNK_OVERLAP);
+  
+  // Generate embeddings in batch
+  const response = await openai.embeddings.create({
+    model: 'text-embedding-3-small',
+    input: chunks,
+  });
+  
+  const embeddings = response.data.map(d => d.embedding);
+  
+  return { chunks, embeddings };
+}
+
+export async function searchEmbeddings(
+  query: string,
+  userId: string,
+  openaiKey: string,
+  supabase: SupabaseClient,
+  options: { limit?: number; episodeIds?: string[] } = {}
+): Promise<SearchResult[]> {
+  const openai = new OpenAI({ apiKey: openaiKey });
+  
+  // Embed the query
+  const response = await openai.embeddings.create({
+    model: 'text-embedding-3-small',
+    input: query,
+  });
+  const queryEmbedding = response.data[0].embedding;
+  
+  // Search pgvector
+  const { data, error } = await supabase.rpc('search_transcripts', {
+    query_embedding: queryEmbedding,
+    match_user_id: userId,
+    match_count: options.limit || 10,
+    filter_episode_ids: options.episodeIds || null,
+  });
+  
+  return data;
+}
+
+function chunkText(text: string, size: number, overlap: number): string[] {
+  const words = text.split(/\s+/);
+  const chunks: string[] = [];
+  
+  for (let i = 0; i < words.length; i += size - overlap) {
+    const chunk = words.slice(i, i + size).join(' ');
+    if (chunk.length > 50) { // Skip tiny chunks
+      chunks.push(chunk);
+    }
+  }
+  
+  return chunks;
+}
+```
+
+### pgvector Search Function
+
+```sql
+-- Semantic search function for transcripts
+CREATE OR REPLACE FUNCTION search_transcripts(
+  query_embedding vector(1536),
+  match_user_id UUID,
+  match_count INT DEFAULT 10,
+  filter_episode_ids UUID[] DEFAULT NULL
+)
+RETURNS TABLE (
+  episode_id UUID,
+  episode_title TEXT,
+  podcast_title TEXT,
+  chunk_text TEXT,
+  chunk_index INT,
+  similarity FLOAT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT 
+    te.episode_id,
+    e.title as episode_title,
+    s.podcast_title,
+    te.chunk_text,
+    te.chunk_index,
+    1 - (te.embedding <=> query_embedding) as similarity
+  FROM transcript_embeddings te
+  JOIN episodes e ON e.id = te.episode_id
+  JOIN subscriptions s ON s.feed_url = e.feed_url AND s.user_id = match_user_id
+  WHERE te.user_id = match_user_id
+    AND (filter_episode_ids IS NULL OR te.episode_id = ANY(filter_episode_ids))
+  ORDER BY te.embedding <=> query_embedding
+  LIMIT match_count;
+END;
+$$;
+
+-- Combined search across transcripts and newsletters
+CREATE OR REPLACE FUNCTION search_all_content(
+  query_embedding vector(1536),
+  match_user_id UUID,
+  match_count INT DEFAULT 10
+)
+RETURNS TABLE (
+  content_type TEXT,
+  content_id UUID,
+  title TEXT,
+  source TEXT,
+  chunk_text TEXT,
+  similarity FLOAT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+  RETURN QUERY
+  (
+    -- Transcript results
+    SELECT 
+      'podcast'::TEXT as content_type,
+      te.episode_id as content_id,
+      e.title,
+      s.podcast_title as source,
+      te.chunk_text,
+      1 - (te.embedding <=> query_embedding) as similarity
+    FROM transcript_embeddings te
+    JOIN episodes e ON e.id = te.episode_id
+    JOIN subscriptions s ON s.feed_url = e.feed_url AND s.user_id = match_user_id
+    WHERE te.user_id = match_user_id
+  )
+  UNION ALL
+  (
+    -- Newsletter results
+    SELECT 
+      'newsletter'::TEXT as content_type,
+      ne.newsletter_id as content_id,
+      n.subject as title,
+      n.sender_name as source,
+      ne.chunk_text,
+      1 - (ne.embedding <=> query_embedding) as similarity
+    FROM newsletter_embeddings ne
+    JOIN newsletters n ON n.id = ne.newsletter_id
+    WHERE ne.user_id = match_user_id
+  )
+  ORDER BY similarity DESC
+  LIMIT match_count;
+END;
+$$;
+```
+
+### SuperMemory Migration Script
+
+```typescript
+// scripts/migrate-supermemory-to-pgvector.ts
+
+/**
+ * One-time migration from SuperMemory to pgvector
+ * 
+ * Run with: npx ts-node scripts/migrate-supermemory-to-pgvector.ts
+ */
+
+import { createClient } from '@supabase/supabase-js';
+import OpenAI from 'openai';
+
+const CHUNK_SIZE = 500;
+const CHUNK_OVERLAP = 50;
+const BATCH_SIZE = 10; // Embeddings per API call
+
+async function migrate() {
+  const supabase = createClient(
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!
+  );
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+  // 1. Get all completed transcriptions
+  const { data: transcriptions, error } = await supabase
+    .from('transcriptions')
+    .select(`
+      id, 
+      episode_id, 
+      transcript_storage_path,
+      episodes!inner(feed_url)
+    `)
+    .eq('status', 'completed');
+
+  if (error) throw error;
+  console.log(`Found ${transcriptions.length} transcripts to migrate`);
+
+  // 2. Get user_id mapping (episode -> subscription -> user)
+  const { data: subscriptions } = await supabase
+    .from('subscriptions')
+    .select('user_id, feed_url');
+  
+  const feedToUser = new Map(subscriptions?.map(s => [s.feed_url, s.user_id]));
+
+  let totalChunks = 0;
+  let totalTokens = 0;
+
+  for (const t of transcriptions) {
+    const userId = feedToUser.get(t.episodes.feed_url);
+    if (!userId) {
+      console.log(`  Skipping ${t.episode_id} - no user mapping`);
+      continue;
+    }
+
+    // 3. Download transcript
+    const { data: blob } = await supabase.storage
+      .from('transcripts')
+      .download(t.transcript_storage_path);
+    
+    if (!blob) {
+      console.log(`  Skipping ${t.episode_id} - transcript not found`);
+      continue;
+    }
+
+    const transcript = JSON.parse(await blob.text());
+    const text = transcript.text;
+
+    // 4. Chunk text
+    const chunks = chunkText(text, CHUNK_SIZE, CHUNK_OVERLAP);
+    console.log(`  ${t.episode_id}: ${chunks.length} chunks`);
+
+    // 5. Generate embeddings in batches
+    const embeddings: number[][] = [];
+    for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+      const batch = chunks.slice(i, i + BATCH_SIZE);
+      const response = await openai.embeddings.create({
+        model: 'text-embedding-3-small',
+        input: batch,
+      });
+      embeddings.push(...response.data.map(d => d.embedding));
+      totalTokens += response.usage.total_tokens;
+    }
+
+    // 6. Insert into pgvector
+    const rows = chunks.map((chunk, i) => ({
+      user_id: userId,
+      episode_id: t.episode_id,
+      chunk_index: i,
+      chunk_text: chunk,
+      word_count: chunk.split(/\s+/).length,
+      embedding: embeddings[i],
+    }));
+
+    const { error: insertError } = await supabase
+      .from('transcript_embeddings')
+      .insert(rows);
+
+    if (insertError) {
+      console.error(`  Error inserting ${t.episode_id}:`, insertError);
+    } else {
+      totalChunks += chunks.length;
+    }
+
+    // Rate limit protection
+    await sleep(100);
+  }
+
+  // 7. Calculate cost
+  const cost = (totalTokens / 1_000_000) * 0.02;
+  
+  console.log('\n✅ Migration complete!');
+  console.log(`   Total chunks: ${totalChunks}`);
+  console.log(`   Total tokens: ${totalTokens.toLocaleString()}`);
+  console.log(`   Estimated cost: $${cost.toFixed(4)}`);
+}
+
+function chunkText(text: string, size: number, overlap: number): string[] {
+  const words = text.split(/\s+/);
+  const chunks: string[] = [];
+  
+  for (let i = 0; i < words.length; i += size - overlap) {
+    const chunk = words.slice(i, i + size).join(' ');
+    if (chunk.split(/\s+/).length > 20) {
+      chunks.push(chunk);
+    }
+  }
+  
+  return chunks;
+}
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+migrate().catch(console.error);
+```
+
+### Settings UI (Built from Scratch)
+
+#### Tech Stack
+
+| Component | Choice | Rationale |
+|-----------|--------|-----------|
+| **Framework** | React 18 + Vite | Fast dev, modern tooling |
+| **Styling** | Tailwind CSS | Rapid prototyping, no design system needed |
+| **Auth** | Supabase Auth | Already integrated, Google OAuth |
+| **State** | React Query (TanStack) | Server state caching, mutations |
+| **Hosting** | Cloudflare Pages | Free tier, integrates with existing workers |
+| **Domain** | `app.podgest.app` | Separate from API/RSS feeds |
+
+#### Pages & Routes
+
+| Route | Description |
+|-------|-------------|
+| `/` | Landing page (minimal - links to login) |
+| `/login` | Supabase Auth UI (Google OAuth) |
+| `/callback` | OAuth callback handler |
+| `/settings` | Main settings dashboard (protected) |
+| `/settings/api-keys` | API key management |
+| `/settings/subscriptions` | Podcast subscription management |
+| `/settings/preferences` | Timezone, digest times, voice |
+| `/settings/newsletters` | Newsletter forwarding setup |
+
+#### Settings UI Specification
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  ⚙️ Podgest Settings                                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │  🔑 API Keys                                                            ││
+│  │                                                                          ││
+│  │  Your API keys are encrypted and stored securely. They are used to      ││
+│  │  generate your personalized digests. You are billed directly by each    ││
+│  │  provider based on your usage.                                          ││
+│  │                                                                          ││
+│  │  ───────────────────────────────────────────────────────────────────── ││
+│  │                                                                          ││
+│  │  OpenAI API Key * (required)                                            ││
+│  │  ┌─────────────────────────────────────────────────────────┐            ││
+│  │  │ sk-proj-••••••••••••••••••••••••••••••••                │  ✅ Valid  ││
+│  │  └─────────────────────────────────────────────────────────┘            ││
+│  │  Used for: Text-to-speech (~$0.09/digest), Embeddings (~$0.01/episode) ││
+│  │  Get yours at: platform.openai.com/api-keys                             ││
+│  │                                                                          ││
+│  │  Anthropic API Key * (required)                                         ││
+│  │  ┌─────────────────────────────────────────────────────────┐            ││
+│  │  │ sk-ant-••••••••••••••••••••••••••••••••                 │  ✅ Valid  ││
+│  │  └─────────────────────────────────────────────────────────┘            ││
+│  │  Used for: Summarization & script generation (~$0.15/digest)            ││
+│  │  Get yours at: console.anthropic.com/settings/keys                      ││
+│  │                                                                          ││
+│  │  ElevenLabs API Key (optional)                                          ││
+│  │  ┌─────────────────────────────────────────────────────────┐            ││
+│  │  │                                                         │  ○ Not set ││
+│  │  └─────────────────────────────────────────────────────────┘            ││
+│  │  Premium voices (uses OpenAI TTS if not provided)                       ││
+│  │                                                                          ││
+│  │                                            [ Save API Keys ]            ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │  📊 Usage This Month                                                    ││
+│  │                                                                          ││
+│  │  Podcast Digests Generated:     28                                      ││
+│  │  Newsletter Digests Generated:   0                                      ││
+│  │  Episodes Processed:            47                                      ││
+│  │                                                                          ││
+│  │  Estimated API Costs:                                                   ││
+│  │    OpenAI (TTS + Embeddings)    ~$2.99                                  ││
+│  │    Anthropic (Claude)           ~$4.20                                  ││
+│  │    ─────────────────────────────────────                                ││
+│  │    Total                        ~$7.19                                  ││
+│  │                                                                          ││
+│  │  💡 Costs are billed directly to your API accounts                      ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │  🎙️ Digest Preferences                                                  ││
+│  │                                                                          ││
+│  │  Timezone           [ America/Mexico_City          ▼ ]                  ││
+│  │  Podcast Digest     [ 06:00 AM ▼ ]                                      ││
+│  │  Newsletter Digest  [ 06:30 AM ▼ ]                                      ││
+│  │  TTS Voice          [ ● Echo (warm)  ○ Onyx (deep)  ○ Nova (friendly) ] ││
+│  │                                                                          ││
+│  │                                            [ Save Preferences ]         ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │  📧 Newsletter Forwarding                                               ││
+│  │                                                                          ││
+│  │  Forward newsletters to this address to include them in your digest:    ││
+│  │                                                                          ││
+│  │  ┌─────────────────────────────────────────────────────────┐            ││
+│  │  │ 18f513bd-8ecf-4922-84b7-4ab7c7cc14df@newsletters.podgest.app  [📋] ││
+│  │  └─────────────────────────────────────────────────────────┘            ││
+│  │                                                                          ││
+│  │  📖 Setup Guide: Set up a Gmail filter to auto-forward                  ││
+│  │                                                                          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### API Endpoints for Settings UI
+
+All endpoints require Supabase Auth JWT in `Authorization: Bearer <token>` header.
+
+```typescript
+// New endpoints in podgest-api worker
+
+// ─── API Keys ───────────────────────────────────────────────────────────────
+
+// GET /api/settings/keys
+// Returns key status (masked keys, validation status)
+// Response: { openai: { set: true, valid: true, masked: "sk-proj-••••" }, ... }
+
+// POST /api/settings/keys
+// Validates and saves API keys (encrypted)
+// Body: { openai_key?, anthropic_key?, elevenlabs_key? }
+
+// POST /api/settings/keys/validate
+// Validates keys without saving (for inline validation)
+// Body: { openai_key?, anthropic_key?, elevenlabs_key? }
+// Response: { openai: { valid: true }, anthropic: { valid: false, error: "Invalid key" } }
+
+// ─── Subscriptions ──────────────────────────────────────────────────────────
+
+// GET /api/subscriptions
+// Returns user's podcast subscriptions
+// Response: { subscriptions: [{ id, feed_url, podcast_name, last_polled, episode_count }] }
+
+// POST /api/subscriptions
+// Add a new podcast subscription
+// Body: { feed_url: "https://feeds.example.com/podcast.xml" }
+
+// DELETE /api/subscriptions/:id
+// Remove a subscription
+
+// ─── Preferences ────────────────────────────────────────────────────────────
+
+// GET /api/settings/preferences
+// Returns user preferences
+// Response: { timezone, digest_time, newsletter_digest_time, tts_voice }
+
+// PATCH /api/settings/preferences
+// Updates digest preferences
+// Body: { timezone?, digest_time?, newsletter_digest_time?, tts_voice? }
+
+// ─── Usage & Stats ──────────────────────────────────────────────────────────
+
+// GET /api/settings/usage
+// Returns usage stats for current billing period
+// Response: { 
+//   podcast_digests: 28, newsletter_digests: 5, episodes_processed: 47,
+//   estimated_costs: { openai: 2.99, anthropic: 4.20, total: 7.19 }
+// }
+
+// ─── Newsletter ─────────────────────────────────────────────────────────────
+
+// GET /api/settings/newsletter-email
+// Returns user's newsletter forwarding address
+// Response: { email: "{userId}@newsletters.podgest.app" }
+```
+
+### MCP Server Updates
+
+Replace SuperMemory calls with pgvector queries:
+
+```typescript
+// Before (SuperMemory)
+const results = await supermemory.search({
+  query,
+  containerTags: [userId],
+  limit: 10,
+});
+
+// After (pgvector)
+const results = await searchEmbeddings(
+  query,
+  userId,
+  userApiKeys.openai_key, // User's key for query embedding
+  supabase,
+  { limit: 10 }
+);
+```
+
+### Implementation Checklist
+
+#### Phase 8.1: Database & Infrastructure
+- [ ] Generate encryption key (`openssl rand -hex 32`)
+- [ ] Add `API_KEY_ENCRYPTION_KEY` to Cloudflare Worker secrets
+- [ ] Create migration: `user_api_keys` table
+- [ ] Create migration: `transcript_embeddings` table (pgvector)
+- [ ] Create migration: `newsletter_embeddings` table (pgvector)
+- [ ] Create migration: `search_transcripts` function
+- [ ] Create migration: `search_all_content` function
+- [ ] Run migrations in Supabase
+
+#### Phase 8.2: SuperMemory → pgvector Migration
+- [ ] Write backfill script
+- [ ] Test backfill on small subset
+- [ ] Run full backfill migration
+- [ ] Verify embeddings count matches SuperMemory
+- [ ] Update pipeline to write to pgvector (new transcripts)
+- [ ] Update MCP server to query pgvector
+- [ ] Test MCP search functionality
+- [ ] Remove SuperMemory integration code
+- [ ] Cancel SuperMemory subscription (if applicable)
+
+#### Phase 8.3: BYOK Pipeline Updates
+- [ ] Add encryption utilities (`packages/core/src/encryption.ts`)
+- [ ] Add embedding utilities (`packages/core/src/embeddings.ts`)
+- [ ] Update digest generation to use per-user keys
+- [ ] Update transcription webhook to generate embeddings
+- [ ] Update MCP server to fetch user's OpenAI key for search
+- [ ] Add key validation endpoint
+- [ ] Handle missing/invalid keys gracefully (skip user, log error)
+
+#### Phase 8.4: Settings UI (New App from Scratch)
+- [ ] Initialize project (`pnpm create vite podgest-ui --template react-ts`)
+- [ ] Install dependencies (Tailwind, React Query, Supabase client)
+- [ ] Set up Tailwind CSS
+- [ ] Create basic layout (header, nav, main content)
+- [ ] Implement Supabase Auth (Google OAuth)
+  - [ ] Login page
+  - [ ] OAuth callback handler
+  - [ ] Protected route wrapper
+- [ ] API Keys page
+  - [ ] Form for OpenAI, Anthropic, ElevenLabs keys
+  - [ ] Key validation on save (calls backend)
+  - [ ] Masked display of saved keys
+  - [ ] Status indicators (valid/invalid/not set)
+- [ ] Subscriptions page
+  - [ ] List current podcast subscriptions
+  - [ ] Add new subscription (RSS URL input)
+  - [ ] Remove subscription
+- [ ] Preferences page
+  - [ ] Timezone selector
+  - [ ] Digest time pickers (podcast, newsletter)
+  - [ ] TTS voice selector
+- [ ] Newsletter Setup page
+  - [ ] Display user's forwarding email with copy button
+  - [ ] Gmail filter setup instructions
+  - [ ] Inline guide with screenshots
+- [ ] Usage Statistics component
+  - [ ] Digests generated (podcast + newsletter)
+  - [ ] Episodes processed
+  - [ ] Estimated API costs breakdown
+- [ ] Deploy to Cloudflare Pages (`app.podgest.app`)
+- [ ] Configure CORS on API for UI domain
+
+#### Phase 8.5: Testing & Documentation
+- [ ] Test full flow with second user account
+- [ ] Verify data isolation (user A can't see user B's data)
+- [ ] Test key rotation (user updates keys)
+- [ ] Document onboarding flow
+- [ ] Document API key requirements
+- [ ] Update README with multi-user instructions
+
+#### Phase 8.6: Newsletter Edition
+- [ ] Register/configure `newsletters.podgest.app` subdomain
+- [ ] Enable Cloudflare Email Routing
+- [ ] Create `podgest-email-worker` (Cloudflare Worker)
+- [ ] Create database migration for `newsletters` table
+- [ ] Deploy email worker with catch-all route
+- [ ] Implement HTML-to-text extraction
+- [ ] Add topic extraction for newsletters (user's Anthropic key)
+- [ ] Add pgvector embedding for newsletters (user's OpenAI key)
+- [ ] Add newsletter digest generation endpoint
+- [ ] Add pg_cron job for newsletter digest (6:30 AM)
+- [ ] Create `/feed/{userId}/newsletters` RSS endpoint
+- [ ] Add MCP tools for newsletter queries
+- [ ] Display forwarding email in Settings UI
+- [ ] Add Gmail filter setup instructions to Settings UI
+
+### Cost Comparison
+
+| Component | Before (Single-User) | After (BYOK) |
+|-----------|---------------------|---------------|
+| OpenAI TTS | Shared key | User pays (~$3/mo) |
+| Anthropic | Shared key | User pays (~$5/mo) |
+| SuperMemory | $10-20/mo | $0 (removed) |
+| Embeddings | Included in SuperMemory | User pays (~$0.02/mo) |
+| **Operator cost** | ~$50/mo | ~$5/mo (Supabase + Modal) |
+| **User cost** | $0 | ~$8-10/mo |
+
+### Security Considerations
+
+| Concern | Mitigation |
+|---------|------------|
+| API key storage | AES-256-GCM encryption at rest |
+| Key transmission | HTTPS only, never logged |
+| Key exposure in logs | Keys masked in all outputs |
+| Cross-user access | RLS on all tables + user_id checks |
+| Encryption key rotation | Support for key versioning (future) |
+
+---
+
+#### 8.6 Newsletter Edition
+
+A separate "Newsletter Edition" podcast that transforms forwarded email newsletters into audio digests. Uses the same pipeline as podcasts but skips transcription (text is already available).
+
+#### Newsletter Key Decisions
+
+| Decision | Choice |
+|----------|--------|
+| **Separate podcast feed** | Yes - `/feed/{userId}/newsletters.xml` |
+| **Email per user** | Yes - `{userId}@newsletters.podgest.app` |
+| **Forwarding method** | Gmail auto-forward rules (one-time setup) |
+| **Curation** | All forwarded emails included (no filtering) |
+| **Embeddings** | pgvector (same as podcasts) |
+
+#### Newsletter Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        NEWSLETTER INGESTION FLOW                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────┐                                                         │
+│  │  User's Gmail   │                                                         │
+│  │  (auto-forward) │                                                         │
+│  └────────┬────────┘                                                         │
+│           │                                                                  │
+│           │  Filter: from:(substack.com OR beehiiv.com OR ...)              │
+│           │  Action: Forward to {userId}@newsletters.podgest.app            │
+│           ▼                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                    CLOUDFLARE EMAIL ROUTING                              ││
+│  │                                                                          ││
+│  │  Route: *@newsletters.podgest.app → podgest-email-worker                ││
+│  │                                                                          ││
+│  └────────────────────────────────────┬─────────────────────────────────────┘│
+│                                       │                                      │
+│                                       ▼                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                    CLOUDFLARE EMAIL WORKER                               ││
+│  │                                                                          ││
+│  │  1. Extract user_id from recipient address                               ││
+│  │  2. Parse email HTML → clean text                                        ││
+│  │  3. Extract metadata (sender, subject, date)                             ││
+│  │  4. Store in `newsletters` table                                         ││
+│  │  5. Trigger topic extraction (user's Claude key)                         ││
+│  │  6. Generate embeddings (user's OpenAI key) → pgvector                   ││
+│  │                                                                          ││
+│  └────────────────────────────────────┬─────────────────────────────────────┘│
+│                                       │                                      │
+│           ┌───────────────────────────┴────────────────────────┐             │
+│           │                                                    │             │
+│           ▼                                                    ▼             │
+│  ┌─────────────────┐                              ┌─────────────────┐        │
+│  │   Supabase      │                              │   pgvector      │        │
+│  │   newsletters   │                              │   newsletter_   │        │
+│  │   table         │                              │   embeddings    │        │
+│  └─────────────────┘                              └─────────────────┘        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Daily Newsletter Digest Flow
+
+```
+6:30 AM (User's Timezone) - 30 min after podcast digest
+         │
+         ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   pg_cron       │────▶│  Collect        │────▶│  Claude:        │
+│ newsletter-     │     │  newsletters    │     │  Generate       │
+│ digest-630am    │     │  from last 24h  │     │  script         │
+└─────────────────┘     └─────────────────┘     └────────┬────────┘
+                           (user's Anthropic key)        │
+         ┌───────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Modal: TTS     │────▶│  Upload audio   │────▶│  Update RSS     │
+│  (user's OpenAI)│     │  to Supabase    │     │  feed           │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+#### Newsletter Database Schema
+
+Note: The `newsletter_embeddings` table is already defined in Phase 8.3 above.
+
+```sql
+-- ============================================
+-- NEWSLETTERS
+-- ============================================
+
+CREATE TABLE public.newsletters (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
+  
+  -- Email metadata
+  sender_email TEXT NOT NULL,
+  sender_name TEXT,
+  subject TEXT NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL,
+  
+  -- Content
+  raw_html TEXT,                    -- Original HTML (for debugging)
+  clean_text TEXT NOT NULL,         -- Extracted text content
+  word_count INTEGER,
+  
+  -- Processing (embedding stored in newsletter_embeddings table)
+  
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_newsletters_user_date ON public.newsletters(user_id, received_at DESC);
+
+-- ============================================
+-- NEWSLETTER TOPIC EXTRACTIONS
+-- ============================================
+
+CREATE TABLE public.newsletter_topic_extractions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  newsletter_id UUID REFERENCES public.newsletters(id) ON DELETE CASCADE UNIQUE,
+  topics JSONB NOT NULL,  -- Same format as podcast topics
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ============================================
+-- NEWSLETTER DIGESTS (separate from podcast digests)
+-- ============================================
+
+CREATE TABLE public.newsletter_digests (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
+  digest_date DATE NOT NULL,
+  status TEXT DEFAULT 'pending',
+  
+  -- Content
+  topic_clusters JSONB,
+  script_text TEXT,
+  audio_url TEXT,
+  duration_seconds INTEGER,
+  
+  -- Sources
+  newsletters_included UUID[],
+  
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  completed_at TIMESTAMPTZ,
+  UNIQUE(user_id, digest_date)
+);
+
+-- ============================================
+-- RLS POLICIES
+-- ============================================
+
+ALTER TABLE public.newsletters ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.newsletter_digests ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users own their newsletters" ON public.newsletters
+  FOR ALL USING (auth.uid() = user_id);
+
+CREATE POLICY "Users own their newsletter digests" ON public.newsletter_digests
+  FOR ALL USING (auth.uid() = user_id);
+```
+
+#### Email Worker Implementation
+
+```typescript
+// apps/worker/podgest-email/src/index.ts
+
+export interface Env {
+  SUPABASE_URL: string;
+  SUPABASE_SERVICE_ROLE_KEY: string;
+  ANTHROPIC_API_KEY: string;
+  SUPERMEMORY_API_KEY: string;
+}
+
+export default {
+  async email(message: EmailMessage, env: Env): Promise<void> {
+    // 1. Extract user_id from recipient
+    // Format: {userId}@newsletters.podgest.app
+    const recipient = message.to;
+    const userId = recipient.split('@')[0];
+    
+    // 2. Validate user exists
+    const userExists = await validateUser(env, userId);
+    if (!userExists) {
+      // Silently drop - invalid recipient
+      return;
+    }
+    
+    // 3. Parse email
+    const rawHtml = await message.raw.text();
+    const cleanText = extractTextFromHtml(rawHtml);
+    
+    // 4. Store newsletter
+    const newsletter = await storeNewsletter(env, {
+      user_id: userId,
+      sender_email: message.from,
+      sender_name: extractSenderName(message.headers),
+      subject: message.headers.get('subject') || 'No Subject',
+      received_at: new Date().toISOString(),
+      raw_html: rawHtml,
+      clean_text: cleanText,
+      word_count: cleanText.split(/\s+/).length,
+    });
+    
+    // 5. Extract topics (async)
+    await extractNewsletterTopics(env, newsletter.id, cleanText, apiKeys.anthropicKey);
+    
+    // 6. Generate embeddings and store in pgvector (user's OpenAI key)
+    await embedNewsletter(env, newsletter, cleanText, apiKeys.openaiKey);
+  },
+};
+
+function extractTextFromHtml(html: string): string {
+  // Remove script/style tags
+  let text = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+  text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+  
+  // Convert common elements to text
+  text = text.replace(/<br\s*\/?>/gi, '\n');
+  text = text.replace(/<\/p>/gi, '\n\n');
+  text = text.replace(/<\/div>/gi, '\n');
+  text = text.replace(/<\/h[1-6]>/gi, '\n\n');
+  
+  // Remove all remaining HTML tags
+  text = text.replace(/<[^>]+>/g, ' ');
+  
+  // Decode HTML entities
+  text = text.replace(/&nbsp;/g, ' ');
+  text = text.replace(/&amp;/g, '&');
+  text = text.replace(/&lt;/g, '<');
+  text = text.replace(/&gt;/g, '>');
+  text = text.replace(/&quot;/g, '"');
+  
+  // Clean up whitespace
+  text = text.replace(/\s+/g, ' ');
+  text = text.replace(/\n\s+/g, '\n');
+  text = text.trim();
+  
+  return text;
+}
+```
+
+#### Cloudflare Email Routing Setup
+
+1. **Add domain to Cloudflare** (if not already)
+   - `newsletters.podgest.app` or subdomain of existing domain
+
+2. **Enable Email Routing**
+   - Cloudflare Dashboard → Email → Email Routing → Enable
+
+3. **Create catch-all route**
+   - Destination: Worker (`podgest-email-worker`)
+   - This routes `*@newsletters.podgest.app` to the worker
+
+4. **DNS Records** (auto-configured by Cloudflare)
+   ```
+   MX    newsletters.podgest.app    route1.mx.cloudflare.net    10
+   MX    newsletters.podgest.app    route2.mx.cloudflare.net    20
+   MX    newsletters.podgest.app    route3.mx.cloudflare.net    30
+   TXT   newsletters.podgest.app    "v=spf1 include:_spf.mx.cloudflare.net ~all"
+   ```
+
+#### User Setup Flow (Newsletter Forwarding)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        USER ONBOARDING (ONE-TIME)                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. User authenticates with Podgest (existing OAuth flow)                   │
+│                                                                              │
+│  2. System generates unique email address:                                   │
+│     → 18f513bd-8ecf-4922-84b7-4ab7c7cc14df@newsletters.podgest.app          │
+│     → Displayed in Podgest settings / MCP tool                               │
+│                                                                              │
+│  3. User sets up Gmail auto-forward rule:                                    │
+│     ┌─────────────────────────────────────────────────────────────────────┐ │
+│     │  Gmail → Settings → Filters → Create new filter                     │ │
+│     │                                                                      │ │
+│     │  From: (substack.com OR beehiiv.com OR ghost.io OR convertkit.com)  │ │
+│     │                                                                      │ │
+│     │  Action: Forward to {userId}@newsletters.podgest.app                │ │
+│     │                                                                      │ │
+│     │  ☑ Also apply to matching conversations                             │ │
+│     └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  4. Gmail sends verification email to Podgest address                        │
+│     → Email worker receives it, stores as regular newsletter                │
+│     → User clicks confirm link in Gmail                                      │
+│                                                                              │
+│  5. Auto-forwarding active - newsletters flow to Podgest                     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Newsletter MCP Integration
+
+New MCP tools for newsletter queries (uses pgvector `search_all_content` function):
+
+```typescript
+// Tool: search_newsletters
+{
+  name: "search_newsletters",
+  description: "Semantic search across all newsletter content",
+  parameters: {
+    query: "string - natural language question",
+    date_range: "optional - filter by date",
+    sender: "optional - filter by newsletter sender"
+  }
+}
+
+// Tool: list_newsletters
+{
+  name: "list_newsletters",
+  description: "List recent newsletters received",
+  parameters: {
+    limit: "number - default 20",
+    sender: "optional - filter by sender"
+  }
+}
+
+// Tool: get_newsletter
+{
+  name: "get_newsletter",
+  description: "Get full content of a specific newsletter",
+  parameters: {
+    newsletter_id: "string"
+  }
+}
+```
+
+#### Newsletter RSS Feed Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/feed/{userId}` | Podcast digest (existing) |
+| `/feed/{userId}/newsletters` | Newsletter digest (new) |
+| `/feed/{userId}/combined` | Both digests interleaved (future) |
+
+#### Newsletter Digest Script Style
+
+Newsletter digests use a slightly different tone:
+
+```typescript
+const newsletterSystemPrompt = `You are Alex Chen, host of Podgest Newsletter Edition.
+Your style is similar to the podcast edition but focused on written content.
+
+Key differences from podcast digest:
+- Reference "newsletters" not "podcasts"
+- Attribution: "According to Matt Levine's Money Stuff..." or "In Stratechery this week..."
+- More focus on analysis and insight (newsletters tend to be more opinion-heavy)
+- Can include more direct quotes (newsletters are written for reading)
+
+Format:
+1. Opening: "Good morning! This is the Podgest Newsletter Edition for [date]..."
+2. Sections: Group by theme (Markets, Tech, Culture, etc.)
+3. Closing: "That's your newsletter roundup. The full editions are in your inbox if you want to dive deeper."
+`;
+```
+
+#### Newsletter Cost Impact (User Pays via BYOK)
+
+| Component | Cost to User |
+|-----------|--------------|
+| Cloudflare Email Routing | Free (we pay) |
+| Email Worker | Free (we pay) |
+| OpenAI Embeddings | ~$0.001 per newsletter |
+| Anthropic (topic extraction) | ~$0.01 per newsletter |
+| OpenAI TTS | ~$0.09 per digest (~6000 chars) |
+| **Total per newsletter** | ~$0.01 |
+| **Total per daily digest** | ~$0.10 |
+
+*Implementation checklist is in the main Phase 8 checklist above (see "Phase 8.6: Newsletter Edition").*
+
+#### Common Newsletter Platforms (Filter Patterns)
+
+```
+from:(substack.com) OR 
+from:(beehiiv.com) OR 
+from:(ghost.io) OR 
+from:(convertkit.com) OR 
+from:(mailchimp.com) OR 
+from:(buttondown.email) OR
+from:(revue.co) OR
+from:(getrevue.co) OR
+from:(paragraph.xyz)
+```
+
+Users can also add specific sender emails:
+```
+from:(matt@levine.com) OR from:(ben@stratechery.com)
+```
+
+---
+
 ## References
 
 - [Supabase pg_cron](https://supabase.com/docs/guides/database/extensions/pg_cron) - Database cron scheduling
