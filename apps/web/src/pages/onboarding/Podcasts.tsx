@@ -193,6 +193,33 @@ export function OnboardingPodcasts() {
           </p>
         </div>
 
+        {/* ListenNotes Recommendation */}
+        <div className="mb-8 bg-indigo-50 rounded-lg border border-indigo-200 p-5">
+          <div className="flex items-start gap-4">
+            <div className="flex-shrink-0 w-10 h-10 bg-indigo-100 rounded-lg flex items-center justify-center">
+              <svg className="w-6 h-6 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+              </svg>
+            </div>
+            <div className="flex-1">
+              <h3 className="text-sm font-semibold text-indigo-900">Recommended: Use ListenNotes</h3>
+              <p className="mt-1 text-sm text-indigo-700">
+                The easiest way to add podcasts is with{' '}
+                <a 
+                  href="https://www.listennotes.com/listen/" 
+                  target="_blank" 
+                  rel="noopener noreferrer"
+                  className="font-medium underline hover:text-indigo-900"
+                >
+                  ListenNotes Listen Later
+                </a>
+                . Search for podcasts, add them to your playlist, then paste the single RSS feed URL below. 
+                No need to hunt for individual feed URLs!
+              </p>
+            </div>
+          </div>
+        </div>
+
         {error && (
           <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg text-red-800">
             {error}

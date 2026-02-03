@@ -146,15 +146,42 @@ export function Subscriptions() {
         </div>
       )}
 
+      {/* ListenNotes Recommendation */}
+      <section className="bg-indigo-50 rounded-lg border border-indigo-200 p-6">
+        <div className="flex items-start gap-4">
+          <div className="flex-shrink-0 w-10 h-10 bg-indigo-100 rounded-lg flex items-center justify-center">
+            <svg className="w-6 h-6 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+            </svg>
+          </div>
+          <div className="flex-1">
+            <h3 className="text-sm font-semibold text-indigo-900">Pro Tip: Use ListenNotes to curate your feed</h3>
+            <p className="mt-1 text-sm text-indigo-700">
+              Instead of adding podcasts one by one, use{' '}
+              <a 
+                href="https://www.listennotes.com/listen/" 
+                target="_blank" 
+                rel="noopener noreferrer"
+                className="font-medium underline hover:text-indigo-900"
+              >
+                ListenNotes Listen Later
+              </a>
+              {' '}to create a custom playlist. Add all your favorite podcasts there, then paste just one RSS feed URL here. 
+              It's the easiest way to manage multiple podcasts!
+            </p>
+          </div>
+        </div>
+      </section>
+
       {/* Add Feed Section */}
       <section className="bg-white rounded-lg border border-gray-200 p-6">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">Add Podcast</h2>
+        <h2 className="text-lg font-semibold text-gray-900 mb-4">Add Podcast Feed</h2>
         <div className="flex gap-3">
           <input
             type="url"
             value={newFeedUrl}
             onChange={(e) => setNewFeedUrl(e.target.value)}
-            placeholder="Enter podcast RSS feed URL"
+            placeholder="Paste RSS feed URL from ListenNotes or any podcast"
             className="flex-1 px-3 py-2 border border-gray-300 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm"
             onKeyDown={(e) => e.key === 'Enter' && handleAddFeed()}
           />
@@ -166,9 +193,6 @@ export function Subscriptions() {
             {adding ? 'Adding...' : 'Add'}
           </button>
         </div>
-        <p className="mt-3 text-xs text-gray-500">
-          Tip: You can find RSS feed URLs on podcast websites or services like ListenNotes
-        </p>
       </section>
 
       {/* Subscriptions List */}
