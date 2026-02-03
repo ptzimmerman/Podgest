@@ -134,35 +134,35 @@ export function Subscriptions() {
   return (
     <div className="space-y-8">
       <div>
-        <h1 className="text-2xl font-bold text-gray-900">Subscriptions</h1>
-        <p className="mt-1 text-sm text-gray-600">
+        <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Subscriptions</h1>
+        <p className="mt-1 text-sm text-gray-600 dark:text-gray-400">
           Manage your podcast subscriptions. New episodes will be automatically transcribed and included in your daily digest.
         </p>
       </div>
 
       {message && (
-        <div className={`p-4 rounded-lg ${message.type === 'success' ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-red-50 text-red-800 border border-red-200'}`}>
+        <div className={`p-4 rounded-lg ${message.type === 'success' ? 'bg-green-50 dark:bg-green-900/30 text-green-800 dark:text-green-300 border border-green-200 dark:border-green-800' : 'bg-red-50 dark:bg-red-900/30 text-red-800 dark:text-red-300 border border-red-200 dark:border-red-800'}`}>
           {message.text}
         </div>
       )}
 
       {/* ListenNotes Recommendation */}
-      <section className="bg-indigo-50 rounded-lg border border-indigo-200 p-6">
+      <section className="bg-indigo-50 dark:bg-indigo-900/30 rounded-lg border border-indigo-200 dark:border-indigo-800 p-6">
         <div className="flex items-start gap-4">
-          <div className="flex-shrink-0 w-10 h-10 bg-indigo-100 rounded-lg flex items-center justify-center">
-            <svg className="w-6 h-6 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <div className="flex-shrink-0 w-10 h-10 bg-indigo-100 dark:bg-indigo-900/50 rounded-lg flex items-center justify-center">
+            <svg className="w-6 h-6 text-indigo-600 dark:text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
             </svg>
           </div>
           <div className="flex-1">
-            <h3 className="text-sm font-semibold text-indigo-900">Pro Tip: Use ListenNotes to curate your feed</h3>
-            <p className="mt-1 text-sm text-indigo-700">
+            <h3 className="text-sm font-semibold text-indigo-900 dark:text-indigo-300">Pro Tip: Use ListenNotes to curate your feed</h3>
+            <p className="mt-1 text-sm text-indigo-700 dark:text-indigo-400">
               Instead of adding podcasts one by one, use{' '}
               <a 
                 href="https://www.listennotes.com/listen/" 
                 target="_blank" 
                 rel="noopener noreferrer"
-                className="font-medium underline hover:text-indigo-900"
+                className="font-medium underline hover:text-indigo-900 dark:hover:text-indigo-200"
               >
                 ListenNotes Listen Later
               </a>
@@ -174,15 +174,15 @@ export function Subscriptions() {
       </section>
 
       {/* Add Feed Section */}
-      <section className="bg-white rounded-lg border border-gray-200 p-6">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">Add Podcast Feed</h2>
+      <section className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+        <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Add Podcast Feed</h2>
         <div className="flex gap-3">
           <input
             type="url"
             value={newFeedUrl}
             onChange={(e) => setNewFeedUrl(e.target.value)}
             placeholder="Paste RSS feed URL from ListenNotes or any podcast"
-            className="flex-1 px-3 py-2 border border-gray-300 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm"
+            className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm bg-white dark:bg-gray-900 dark:text-white"
             onKeyDown={(e) => e.key === 'Enter' && handleAddFeed()}
           />
           <button
@@ -196,10 +196,10 @@ export function Subscriptions() {
       </section>
 
       {/* Subscriptions List */}
-      <section className="bg-white rounded-lg border border-gray-200">
-        <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-gray-900">Your Podcasts</h2>
-          <span className="text-sm text-gray-500">{subscriptions.length} subscriptions</span>
+      <section className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
+        <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Your Podcasts</h2>
+          <span className="text-sm text-gray-500 dark:text-gray-400">{subscriptions.length} subscriptions</span>
         </div>
         
         {subscriptions.length === 0 ? (
@@ -207,17 +207,17 @@ export function Subscriptions() {
             <svg className="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
             </svg>
-            <h3 className="mt-2 text-sm font-medium text-gray-900">No subscriptions</h3>
-            <p className="mt-1 text-sm text-gray-500">Get started by adding a podcast RSS feed above.</p>
+            <h3 className="mt-2 text-sm font-medium text-gray-900 dark:text-white">No subscriptions</h3>
+            <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">Get started by adding a podcast RSS feed above.</p>
           </div>
         ) : (
-          <ul className="divide-y divide-gray-200">
+          <ul className="divide-y divide-gray-200 dark:divide-gray-700">
             {subscriptions.map((sub) => (
               <li key={sub.id} className="px-6 py-4 flex items-center justify-between">
                 <div className="flex items-center space-x-4 flex-1 min-w-0">
                   <button
                     onClick={() => handleToggleActive(sub.id, sub.is_active)}
-                    className={`flex-shrink-0 w-10 h-6 rounded-full transition-colors ${sub.is_active ? 'bg-indigo-600' : 'bg-gray-200'}`}
+                    className={`flex-shrink-0 w-10 h-6 rounded-full transition-colors ${sub.is_active ? 'bg-indigo-600' : 'bg-gray-200 dark:bg-gray-600'}`}
                     title={sub.is_active ? 'Click to pause' : 'Click to activate'}
                   >
                     <span
@@ -225,14 +225,14 @@ export function Subscriptions() {
                     />
                   </button>
                   <div className="min-w-0 flex-1">
-                    <h3 className={`text-sm font-medium truncate ${sub.is_active ? 'text-gray-900' : 'text-gray-500'}`}>
+                    <h3 className={`text-sm font-medium truncate ${sub.is_active ? 'text-gray-900 dark:text-white' : 'text-gray-500 dark:text-gray-400'}`}>
                       {sub.podcast_title}
                     </h3>
                     <p className="mt-0.5 text-xs text-gray-400 truncate">{sub.feed_url}</p>
                   </div>
                 </div>
                 <button
-                  className="ml-4 text-sm text-red-600 hover:text-red-800 transition-colors"
+                  className="ml-4 text-sm text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 transition-colors"
                   onClick={() => handleRemove(sub.id, sub.podcast_title)}
                 >
                   Remove
@@ -244,8 +244,8 @@ export function Subscriptions() {
       </section>
 
       {/* Popular Feeds */}
-      <section className="bg-gray-50 rounded-lg border border-gray-200 p-6">
-        <h3 className="text-sm font-medium text-gray-700 mb-3">Popular Podcast Feeds</h3>
+      <section className="bg-gray-50 dark:bg-gray-800/50 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+        <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">Popular Podcast Feeds</h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-sm">
           {[
             { name: 'Lex Fridman Podcast', url: 'https://lexfridman.com/feed/podcast/' },
