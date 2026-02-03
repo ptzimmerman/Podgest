@@ -11,9 +11,10 @@ type UserInfo = {
 export function Layout() {
   const navigate = useNavigate()
   const [user, setUser] = useState<UserInfo | null>(null)
+  const [userId, setUserId] = useState<string | null>(null)
   const [menuOpen, setMenuOpen] = useState(false)
   const [darkMode, setDarkMode] = useState(() => {
-    // Initialize from localStorage
+    // Initialize from localStorage as fallback
     if (typeof window !== 'undefined') {
       return localStorage.getItem('darkMode') === 'true'
     }
@@ -28,8 +29,27 @@ export function Layout() {
     } else {
       document.documentElement.classList.remove('dark')
     }
+    // Also keep localStorage as fallback
     localStorage.setItem('darkMode', String(darkMode))
   }, [darkMode])
+
+  // Save dark mode preference to database when it changes
+  useEffect(() => {
+    if (!userId) return
+    
+    const saveDarkMode = async () => {
+      try {
+        await supabase
+          .from('profiles')
+          .update({ dark_mode: darkMode })
+          .eq('id', userId)
+      } catch (err) {
+        console.error('Failed to save dark mode preference:', err)
+      }
+    }
+    
+    saveDarkMode()
+  }, [darkMode, userId])
 
   useEffect(() => {
     const fetchUser = async () => {
@@ -37,11 +57,27 @@ export function Layout() {
       if (session?.user) {
         const email = session.user.email || ''
         const metadata = session.user.user_metadata || {}
+        setUserId(session.user.id)
         setUser({
           email,
           displayName: metadata.full_name || metadata.name || null,
           avatarUrl: metadata.avatar_url || metadata.picture || null,
         })
+        
+        // Fetch dark mode preference from database
+        try {
+          const { data } = await supabase
+            .from('profiles')
+            .select('dark_mode')
+            .eq('id', session.user.id)
+            .single()
+          
+          if (data?.dark_mode !== null && data?.dark_mode !== undefined) {
+            setDarkMode(data.dark_mode)
+          }
+        } catch (err) {
+          console.error('Failed to fetch dark mode preference:', err)
+        }
       }
     }
     fetchUser()
