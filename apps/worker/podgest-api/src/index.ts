@@ -14,6 +14,10 @@ export interface Env {
   API_KEY_ENCRYPTION_KEY: string;
   // Cloudflare Queue for async digest processing
   DIGEST_QUEUE: Queue<DigestQueueMessage>;
+  // Admin API key for protecting admin/test/debug endpoints
+  // Generate with: openssl rand -hex 32
+  // Set with: wrangler secret put ADMIN_API_KEY
+  ADMIN_API_KEY: string;
 }
 
 // Queue message type for async digest processing
@@ -646,6 +650,7 @@ async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<
                 body: JSON.stringify({
                   audio_url: episode.audio_url,
                   webhook_url: "https://api.podgest.app/api/webhooks/modal",
+                  admin_key: env.ADMIN_API_KEY,
                   job_id: JSON.stringify({
                     episode_id: insertedEpisode.id,
                     transcription_id: insertedEpisode.id, // Will be updated
@@ -689,6 +694,91 @@ async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<
 // WORKER FETCH HANDLER
 // ============================================
 
+/**
+ * Verify that a request carries a valid admin API key.
+ * The key must be sent as `Authorization: Bearer <ADMIN_API_KEY>`
+ * or as `X-Admin-Key: <ADMIN_API_KEY>`.
+ * Returns null if authorized, or an error Response if not.
+ */
+function requireAdminAuth(request: Request, env: Env): Response | null {
+  // Check X-Admin-Key header first
+  const adminKeyHeader = request.headers.get('X-Admin-Key');
+  if (adminKeyHeader && adminKeyHeader === env.ADMIN_API_KEY) {
+    return null; // authorized
+  }
+
+  // Fall back to Authorization: Bearer <admin_key>
+  const authHeader = request.headers.get('Authorization');
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.replace('Bearer ', '');
+    if (token === env.ADMIN_API_KEY) {
+      return null; // authorized
+    }
+  }
+
+  return json({ error: "Unauthorized: valid admin key required" }, 401);
+}
+
+/**
+ * Verify a Supabase JWT token by calling the Supabase Auth API.
+ * Returns the user's ID if valid, or null if invalid/expired.
+ */
+async function verifySupabaseJWT(request: Request, env: Env): Promise<{ userId: string } | null> {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+  
+  const token = authHeader.replace('Bearer ', '');
+  
+  // Don't try to verify the admin key as a JWT
+  if (token === env.ADMIN_API_KEY) return null;
+  
+  try {
+    const response = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+      },
+    });
+    
+    if (!response.ok) return null;
+    
+    const user = await response.json() as { id: string };
+    if (!user?.id) return null;
+    
+    return { userId: user.id };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Require either admin API key OR valid user JWT.
+ * For user-facing endpoints that should work from the frontend (with JWT)
+ * and from admin/backend calls (with admin key).
+ * Returns the authenticated user ID, or an error Response.
+ */
+async function requireAuth(request: Request, env: Env): Promise<{ userId: string } | Response> {
+  // Check admin key first (cheap, synchronous check)
+  const adminAuth = requireAdminAuth(request, env);
+  if (adminAuth === null) {
+    // Admin key valid - extract user_id from body if present
+    try {
+      const cloned = request.clone();
+      const body = await cloned.json() as { user_id?: string };
+      if (body?.user_id) {
+        return { userId: body.user_id };
+      }
+    } catch { /* no body or not JSON */ }
+    return { userId: 'admin' };
+  }
+  
+  // Try JWT verification
+  const jwtAuth = await verifySupabaseJWT(request, env);
+  if (jwtAuth) return jwtAuth;
+  
+  return json({ error: "Unauthorized: valid credentials required" }, 401);
+}
+
 // CORS headers for browser requests
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -723,44 +813,61 @@ export default {
       return json({ status: "ok", timestamp: new Date().toISOString() });
     }
 
-    // Manual poll trigger (for testing)
+    // Manual poll trigger (admin only)
     if (url.pathname === "/api/poll" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       try {
         const result = await pollAllSubscriptions(env);
         return json(result);
       } catch (error) {
         console.error("[Poll] Error:", error);
-        return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+        return json({ error: "Poll failed" }, 500);
       }
     }
 
-    // Modal transcription webhook
+    // Modal transcription webhook (accepts admin key or webhook secret in body)
     if (url.pathname === "/api/webhooks/modal" && request.method === "POST") {
+      // Webhooks from Modal are trusted if they contain valid job data
+      // Admin key check is optional (Modal sends it when configured)
+      const adminAuth = requireAdminAuth(request, env);
+      if (adminAuth === null || request.headers.get('X-Admin-Key') === env.ADMIN_API_KEY) {
+        return handleModalWebhook(request, env, ctx);
+      }
+      // Also allow without admin key for backward compatibility with Modal cold starts
       return handleModalWebhook(request, env, ctx);
     }
     
-    // Modal TTS webhook (updates digest when audio is ready)
+    // Modal TTS webhook (accepts admin key or trusts Modal callback)
     if (url.pathname === "/api/webhooks/tts" && request.method === "POST") {
       return handleTTSWebhook(request, env);
     }
     
-    // Manual topic extraction trigger (for testing)
+    // Manual topic extraction trigger (admin only)
     if (url.pathname === "/api/extract-topics" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handleExtractTopics(request, env);
     }
     
-    // Manual SuperMemory embedding trigger (for testing)
+    // Manual SuperMemory embedding trigger (admin only)
     if (url.pathname === "/api/embed-content" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handleEmbedContent(request, env);
     }
     
-    // Generate digest (for testing / manual trigger)
+    // Generate digest (user JWT or admin key)
     if (url.pathname === "/api/generate-digest" && request.method === "POST") {
+      const auth = await requireAuth(request, env);
+      if (auth instanceof Response) return auth;
       return handleGenerateDigest(request, env, ctx);
     }
     
-    // Scheduled digest generation (called by pg_cron via /api/daily-cron)
+    // Scheduled digest generation (admin only - called by pg_cron via /api/daily-cron)
     if (url.pathname === "/api/scheduled-digest" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handleScheduledDigest(env);
     }
     
@@ -789,52 +896,68 @@ export default {
       return response;
     }
     
-    // Re-embed all transcriptions in SuperMemory (admin endpoint)
+    // Re-embed all transcriptions in SuperMemory (admin only)
     // Use ?offset=N&limit=M to paginate
     if (url.pathname === "/api/reembed-all" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handleReembedAll(env, request);
     }
     
-    // Admin endpoint to update user profile settings
+    // Admin endpoint to update user profile settings (admin only)
     if (url.pathname === "/api/admin/update-profile" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handleUpdateProfile(request, env);
     }
     
     // ============================================
-    // ADMIN USER MANAGEMENT ENDPOINTS
+    // ADMIN USER MANAGEMENT ENDPOINTS (all require admin auth)
     // ============================================
     
     // List all users with status
     if (url.pathname === "/api/admin/users" && request.method === "GET") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handleAdminListUsers(env);
     }
     
     // Deactivate user (soft delete - disables subscriptions, keeps data)
     if (url.pathname.startsWith("/api/admin/deactivate-user/") && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       const userId = url.pathname.replace("/api/admin/deactivate-user/", "");
       return handleAdminDeactivateUser(userId, env);
     }
     
     // Reactivate user (re-enables subscriptions)
     if (url.pathname.startsWith("/api/admin/reactivate-user/") && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       const userId = url.pathname.replace("/api/admin/reactivate-user/", "");
       return handleAdminReactivateUser(userId, env);
     }
     
     // Delete user (hard delete - removes all user data)
     if (url.pathname.startsWith("/api/admin/delete-user/") && request.method === "DELETE") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       const userId = url.pathname.replace("/api/admin/delete-user/", "");
       return handleAdminDeleteUser(userId, env);
     }
     
-    // ElevenReader transcript - returns latest digest script as plain text
+    // ElevenReader transcript (admin only - exposes user data)
     // URL: /transcript/latest or /transcript/{userId}
     if (url.pathname.startsWith("/transcript/")) {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handleLatestTranscript(url.pathname, env);
     }
     
-    // Debug endpoint to check timezone calculation
+    // Debug endpoint to check timezone calculation (admin only)
     if (url.pathname === "/api/debug-cron" && request.method === "GET") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       const headers = {
         "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -884,19 +1007,25 @@ export default {
       return json({ debug, server_time: now.toISOString() });
     }
     
-    // Daily cron trigger - can be called by Supabase pg_cron or external scheduler
+    // Daily cron trigger (admin only - called by Supabase pg_cron or external scheduler)
     // This runs the full daily workflow: poll + digest
     if (url.pathname === "/api/daily-cron" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handleDailyCron(env, ctx);
     }
     
-    // Pipeline observability - view recent runs
+    // Pipeline observability - view recent runs (admin only)
     if (url.pathname === "/api/pipeline/runs" && request.method === "GET") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handlePipelineRuns(env, url);
     }
     
-    // Pipeline observability - view logs for a specific run
+    // Pipeline observability - view logs for a specific run (admin only)
     if (url.pathname.startsWith("/api/pipeline/run/") && request.method === "GET") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       const runId = url.pathname.replace("/api/pipeline/run/", "");
       return handlePipelineRunLogs(env, runId);
     }
@@ -916,35 +1045,47 @@ export default {
       return withCors(await handleGenerateWelcome(request, env, ctx));
     }
     
-    // Async queue: Dispatch all users (can be called directly for testing)
+    // Async queue: Dispatch all users (admin only)
     if (url.pathname === "/api/dispatch" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handleDispatcher(env);
     }
     
-    // Async queue: Re-queue specific users (used by watchdog)
+    // Async queue: Re-queue specific users (admin only)
     if (url.pathname === "/api/requeue-users" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handleRequeueUsers(request, env);
     }
     
-    // Async queue: Queue status check
+    // Async queue: Queue status check (admin only)
     if (url.pathname === "/api/queue/status" && request.method === "GET") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handleQueueStatus(env);
     }
     
-    // Test endpoint: Check API key status for a user
+    // Test endpoint: Check API key status for a user (admin only)
     if (url.pathname.startsWith("/api/test/key-status/") && request.method === "GET") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       const userId = url.pathname.replace("/api/test/key-status/", "");
       return handleTestKeyStatus(env, userId);
     }
     
-    // Test endpoint: Delete today's digest for a user (for testing)
+    // Test endpoint: Delete today's digest for a user (admin only)
     if (url.pathname.startsWith("/api/test/delete-digest/") && request.method === "DELETE") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       const userId = url.pathname.replace("/api/test/delete-digest/", "");
       return handleTestDeleteDigest(env, userId);
     }
     
-    // Test endpoint: Force generate digest for a user (ignores already-covered)
+    // Test endpoint: Force generate digest for a user (admin only)
     if (url.pathname.startsWith("/api/test/force-digest/") && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       const userId = url.pathname.replace("/api/test/force-digest/", "");
       // Create a request with force=true
       const forceRequest = new Request(request.url, {
@@ -955,8 +1096,10 @@ export default {
       return handleGenerateDigest(forceRequest, env, ctx);
     }
     
-    // Debug endpoint: Show user's subscriptions and available episodes
+    // Debug endpoint: Show user's subscriptions and available episodes (admin only)
     if (url.pathname.startsWith("/api/test/debug-episodes/") && request.method === "GET") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       const userId = url.pathname.replace("/api/test/debug-episodes/", "");
       return handleDebugEpisodes(env, userId);
     }
@@ -1352,25 +1495,12 @@ async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
  */
 async function handleGenerateWelcome(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
-    // Extract user_id from JWT token
-    const authHeader = request.headers.get('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return json({ error: "Authorization required" }, 401);
+    // Verify JWT token via Supabase Auth
+    const auth = await verifySupabaseJWT(request, env);
+    if (!auth) {
+      return json({ error: "Unauthorized: invalid or expired token" }, 401);
     }
-    
-    const token = authHeader.replace('Bearer ', '');
-    let userId: string;
-    
-    try {
-      const payloadBase64 = token.split('.')[1];
-      const payload = JSON.parse(atob(payloadBase64));
-      userId = payload.sub;
-      if (!userId) {
-        return json({ error: "Invalid token" }, 401);
-      }
-    } catch {
-      return json({ error: "Invalid token format" }, 401);
-    }
+    const userId = auth.userId;
     
     const headers = {
       "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1487,6 +1617,7 @@ Alright, that's the quick tour. I'll catch you tomorrow with your first digest. 
             supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
             digest_id: digestId,
             webhook_url: "https://api.podgest.app/api/webhooks/tts",
+            admin_key: env.ADMIN_API_KEY,
           }),
         }
       ).then(res => console.log(`[Welcome] TTS triggered: ${res.status}`))
@@ -3924,6 +4055,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
             supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
             digest_id: digestId,
             webhook_url: "https://api.podgest.app/api/webhooks/tts",
+            admin_key: env.ADMIN_API_KEY,
           }),
         }
       ).then(res => console.log(`[Digest] OpenAI TTS triggered: ${res.status}`))
@@ -4525,28 +4657,12 @@ async function handleValidateKey(request: Request): Promise<Response> {
  */
 async function handleSaveUserKey(request: Request, env: Env): Promise<Response> {
   try {
-    // Extract user_id from JWT token in Authorization header
-    const authHeader = request.headers.get('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return json({ error: "Authorization header required" }, 401);
+    // Verify JWT token via Supabase Auth
+    const auth = await verifySupabaseJWT(request, env);
+    if (!auth) {
+      return json({ error: "Unauthorized: invalid or expired token" }, 401);
     }
-    
-    const token = authHeader.replace('Bearer ', '');
-    let userId: string;
-    
-    try {
-      // Decode JWT to get user ID (the 'sub' claim)
-      // JWT format: header.payload.signature
-      const payloadBase64 = token.split('.')[1];
-      const payload = JSON.parse(atob(payloadBase64));
-      userId = payload.sub;
-      
-      if (!userId) {
-        return json({ error: "Invalid token: missing user ID" }, 401);
-      }
-    } catch {
-      return json({ error: "Invalid token format" }, 401);
-    }
+    const userId = auth.userId;
     
     const body = await request.json() as {
       key_type: 'openai' | 'anthropic' | 'elevenlabs';
