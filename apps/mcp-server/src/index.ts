@@ -1167,7 +1167,18 @@ function renderOAuthCallbackPage(state: string): string {
 </html>`;
 }
 
+/** Escape HTML special characters to prevent XSS */
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
 function renderErrorPage(message: string): string {
+  const safeMessage = escapeHtml(message);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1187,7 +1198,7 @@ function renderErrorPage(message: string): string {
   </style>
 </head>
 <body>
-  <div class="error">${message}</div>
+  <div class="error">${safeMessage}</div>
 </body>
 </html>`;
 }

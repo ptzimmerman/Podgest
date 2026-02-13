@@ -689,16 +689,36 @@ async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<
 // WORKER FETCH HANDLER
 // ============================================
 
-// CORS headers for browser requests
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
-};
+// Allowed CORS origins for browser requests
+const ALLOWED_ORIGINS = [
+  "https://dash.podgest.app",
+  "https://podgest.app",
+  "http://localhost:5173",    // Local dev
+  "http://localhost:3000",    // Local dev
+];
+
+// Get CORS headers for a specific request origin
+function getCorsHeaders(request: Request): Record<string, string> {
+  const origin = request.headers.get("Origin") || "";
+  const allowedOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+  
+  return {
+    "Access-Control-Allow-Origin": allowedOrigin,
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Key",
+    "Vary": "Origin",
+  };
+}
 
 // Helper to add CORS headers to response
-function withCors(response: Response): Response {
+function withCors(response: Response, request?: Request): Response {
   const newHeaders = new Headers(response.headers);
+  const corsHeaders = request ? getCorsHeaders(request) : {
+    "Access-Control-Allow-Origin": ALLOWED_ORIGINS[0],
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Key",
+    "Vary": "Origin",
+  };
   Object.entries(corsHeaders).forEach(([key, value]) => {
     newHeaders.set(key, value);
   });
@@ -715,7 +735,7 @@ export default {
 
     // Handle CORS preflight requests
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders });
+      return new Response(null, { status: 204, headers: getCorsHeaders(request) });
     }
 
     // Health check
@@ -767,6 +787,10 @@ export default {
     // RSS feed for Spotify (support both GET and HEAD for podcast apps)
     if (url.pathname.startsWith("/feed/") && (request.method === "GET" || request.method === "HEAD")) {
       const userId = url.pathname.replace("/feed/", "").replace(".xml", "");
+      // Validate userId is a UUID to prevent path traversal / injection
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId)) {
+        return new Response("Invalid feed ID", { status: 400 });
+      }
       const baseUrl = `${url.protocol}//${url.host}`;
       
       // Check if request is from a social media crawler (for rich link previews)
@@ -903,17 +927,17 @@ export default {
     
     // BYOK: Validate API key (for Settings UI)
     if (url.pathname === "/api/validate-key" && request.method === "POST") {
-      return withCors(await handleValidateKey(request));
+      return withCors(await handleValidateKey(request), request);
     }
     
     // BYOK: Save user API keys
     if (url.pathname === "/api/user-keys" && request.method === "POST") {
-      return withCors(await handleSaveUserKey(request, env));
+      return withCors(await handleSaveUserKey(request, env), request);
     }
     
     // Generate welcome episode for new user
     if (url.pathname === "/api/generate-welcome" && request.method === "POST") {
-      return withCors(await handleGenerateWelcome(request, env, ctx));
+      return withCors(await handleGenerateWelcome(request, env, ctx), request);
     }
     
     // Async queue: Dispatch all users (can be called directly for testing)
@@ -964,7 +988,7 @@ export default {
     // Parse feed endpoint: Analyzes RSS feed and detects ListenNotes aggregator
     // Returns feed info, detected podcasts (if aggregator), and frequency data
     if (url.pathname === "/api/parse-feed" && request.method === "POST") {
-      return withCors(await handleParseFeed(request, env));
+      return withCors(await handleParseFeed(request, env), request);
     }
 
     return json({ error: "Not found" }, 404);
@@ -1177,6 +1201,16 @@ function json(data: unknown, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+/** Escape HTML special characters to prevent XSS in dynamic HTML output */
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
 }
 
 async function handleModalWebhook(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -4341,9 +4375,11 @@ async function handleFeedOGPreview(userId: string, env: Env, baseUrl: string): P
       }
     }
     
-    const feedUrl = `${baseUrl}/feed/${userId}.xml`;
+    const feedUrl = `${baseUrl}/feed/${encodeURIComponent(userId)}.xml`;
     const ogImage = "https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/og-image.png";
-    const title = `Podgest - ${userName} AI Podcast Digest`;
+    // Escape user-controlled data for safe HTML embedding
+    const safeUserName = escapeHtml(userName);
+    const title = `Podgest - ${safeUserName} AI Podcast Digest`;
     const description = "Personalized daily podcast digest, powered by AI. Never miss the highlights from your favorite shows.";
     
     const html = `<!DOCTYPE html>
