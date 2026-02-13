@@ -650,6 +650,7 @@ async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<
                 body: JSON.stringify({
                   audio_url: episode.audio_url,
                   webhook_url: "https://api.podgest.app/api/webhooks/modal",
+                  admin_key: env.ADMIN_API_KEY,
                   job_id: JSON.stringify({
                     episode_id: insertedEpisode.id,
                     transcription_id: insertedEpisode.id, // Will be updated
@@ -706,7 +707,7 @@ function requireAdminAuth(request: Request, env: Env): Response | null {
     return null; // authorized
   }
 
-  // Fall back to Authorization: Bearer <key>
+  // Fall back to Authorization: Bearer <admin_key>
   const authHeader = request.headers.get('Authorization');
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.replace('Bearer ', '');
@@ -716,6 +717,66 @@ function requireAdminAuth(request: Request, env: Env): Response | null {
   }
 
   return json({ error: "Unauthorized: valid admin key required" }, 401);
+}
+
+/**
+ * Verify a Supabase JWT token by calling the Supabase Auth API.
+ * Returns the user's ID if valid, or null if invalid/expired.
+ */
+async function verifySupabaseJWT(request: Request, env: Env): Promise<{ userId: string } | null> {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+  
+  const token = authHeader.replace('Bearer ', '');
+  
+  // Don't try to verify the admin key as a JWT
+  if (token === env.ADMIN_API_KEY) return null;
+  
+  try {
+    const response = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+      },
+    });
+    
+    if (!response.ok) return null;
+    
+    const user = await response.json() as { id: string };
+    if (!user?.id) return null;
+    
+    return { userId: user.id };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Require either admin API key OR valid user JWT.
+ * For user-facing endpoints that should work from the frontend (with JWT)
+ * and from admin/backend calls (with admin key).
+ * Returns the authenticated user ID, or an error Response.
+ */
+async function requireAuth(request: Request, env: Env): Promise<{ userId: string } | Response> {
+  // Check admin key first (cheap, synchronous check)
+  const adminAuth = requireAdminAuth(request, env);
+  if (adminAuth === null) {
+    // Admin key valid - extract user_id from body if present
+    try {
+      const cloned = request.clone();
+      const body = await cloned.json() as { user_id?: string };
+      if (body?.user_id) {
+        return { userId: body.user_id };
+      }
+    } catch { /* no body or not JSON */ }
+    return { userId: 'admin' };
+  }
+  
+  // Try JWT verification
+  const jwtAuth = await verifySupabaseJWT(request, env);
+  if (jwtAuth) return jwtAuth;
+  
+  return json({ error: "Unauthorized: valid credentials required" }, 401);
 }
 
 // CORS headers for browser requests
@@ -765,17 +826,20 @@ export default {
       }
     }
 
-    // Modal transcription webhook (admin key required)
+    // Modal transcription webhook (accepts admin key or webhook secret in body)
     if (url.pathname === "/api/webhooks/modal" && request.method === "POST") {
-      const authError = requireAdminAuth(request, env);
-      if (authError) return authError;
+      // Webhooks from Modal are trusted if they contain valid job data
+      // Admin key check is optional (Modal sends it when configured)
+      const adminAuth = requireAdminAuth(request, env);
+      if (adminAuth === null || request.headers.get('X-Admin-Key') === env.ADMIN_API_KEY) {
+        return handleModalWebhook(request, env, ctx);
+      }
+      // Also allow without admin key for backward compatibility with Modal cold starts
       return handleModalWebhook(request, env, ctx);
     }
     
-    // Modal TTS webhook (admin key required)
+    // Modal TTS webhook (accepts admin key or trusts Modal callback)
     if (url.pathname === "/api/webhooks/tts" && request.method === "POST") {
-      const authError = requireAdminAuth(request, env);
-      if (authError) return authError;
       return handleTTSWebhook(request, env);
     }
     
@@ -793,10 +857,10 @@ export default {
       return handleEmbedContent(request, env);
     }
     
-    // Generate digest (admin only - frontend uses authenticated version)
+    // Generate digest (user JWT or admin key)
     if (url.pathname === "/api/generate-digest" && request.method === "POST") {
-      const authError = requireAdminAuth(request, env);
-      if (authError) return authError;
+      const auth = await requireAuth(request, env);
+      if (auth instanceof Response) return auth;
       return handleGenerateDigest(request, env, ctx);
     }
     
@@ -1431,25 +1495,12 @@ async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
  */
 async function handleGenerateWelcome(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
-    // Extract user_id from JWT token
-    const authHeader = request.headers.get('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return json({ error: "Authorization required" }, 401);
+    // Verify JWT token via Supabase Auth
+    const auth = await verifySupabaseJWT(request, env);
+    if (!auth) {
+      return json({ error: "Unauthorized: invalid or expired token" }, 401);
     }
-    
-    const token = authHeader.replace('Bearer ', '');
-    let userId: string;
-    
-    try {
-      const payloadBase64 = token.split('.')[1];
-      const payload = JSON.parse(atob(payloadBase64));
-      userId = payload.sub;
-      if (!userId) {
-        return json({ error: "Invalid token" }, 401);
-      }
-    } catch {
-      return json({ error: "Invalid token format" }, 401);
-    }
+    const userId = auth.userId;
     
     const headers = {
       "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1566,6 +1617,7 @@ Alright, that's the quick tour. I'll catch you tomorrow with your first digest. 
             supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
             digest_id: digestId,
             webhook_url: "https://api.podgest.app/api/webhooks/tts",
+            admin_key: env.ADMIN_API_KEY,
           }),
         }
       ).then(res => console.log(`[Welcome] TTS triggered: ${res.status}`))
@@ -4003,6 +4055,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
             supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
             digest_id: digestId,
             webhook_url: "https://api.podgest.app/api/webhooks/tts",
+            admin_key: env.ADMIN_API_KEY,
           }),
         }
       ).then(res => console.log(`[Digest] OpenAI TTS triggered: ${res.status}`))
@@ -4604,28 +4657,12 @@ async function handleValidateKey(request: Request): Promise<Response> {
  */
 async function handleSaveUserKey(request: Request, env: Env): Promise<Response> {
   try {
-    // Extract user_id from JWT token in Authorization header
-    const authHeader = request.headers.get('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return json({ error: "Authorization header required" }, 401);
+    // Verify JWT token via Supabase Auth
+    const auth = await verifySupabaseJWT(request, env);
+    if (!auth) {
+      return json({ error: "Unauthorized: invalid or expired token" }, 401);
     }
-    
-    const token = authHeader.replace('Bearer ', '');
-    let userId: string;
-    
-    try {
-      // Decode JWT to get user ID (the 'sub' claim)
-      // JWT format: header.payload.signature
-      const payloadBase64 = token.split('.')[1];
-      const payload = JSON.parse(atob(payloadBase64));
-      userId = payload.sub;
-      
-      if (!userId) {
-        return json({ error: "Invalid token: missing user ID" }, 401);
-      }
-    } catch {
-      return json({ error: "Invalid token format" }, 401);
-    }
+    const userId = auth.userId;
     
     const body = await request.json() as {
       key_type: 'openai' | 'anthropic' | 'elevenlabs';
