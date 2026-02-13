@@ -15,7 +15,7 @@ import path from "path";
 import os from "os";
 import open from "open";
 
-const MCP_SERVER_URL = "https://podgest-mcp.pztest.workers.dev";
+const MCP_SERVER_URL = "https://mcp.podgest.app";
 const CALLBACK_PORT = 9876;
 const TOKEN_DIR = path.join(os.homedir(), ".podgest");
 const API_KEY_FILE = path.join(TOKEN_DIR, "api_key");

@@ -4,7 +4,7 @@
       "command": "/bin/bash",
       "args": [
         "-c",
-        "export PATH=/Users/pete/.nvm/versions/node/v20.19.3/bin:$PATH && npx -y mcp-remote https://podgest-mcp.pztest.workers.dev/sse"
+        "export PATH=/Users/pete/.nvm/versions/node/v20.19.3/bin:$PATH && npx -y mcp-remote https://mcp.podgest.app/sse"
       ]
     }
   }

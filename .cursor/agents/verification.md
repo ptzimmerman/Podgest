@@ -7,7 +7,7 @@ Verify system functionality, API endpoints, data integrity, and end-to-end flows
 ## API Endpoints
 
 ### Podgest API Worker
-- **Base URL**: `https://podgest-api.pztest.workers.dev`
+- **Base URL**: `https://api.podgest.app`
 
 Key endpoints:
 - `GET /health` - Health check
@@ -20,7 +20,7 @@ Key endpoints:
 - `POST /api/generate-digest` - Trigger digest generation
 
 ### MCP Server
-- **Base URL**: `https://podgest-mcp.pztest.workers.dev`
+- **Base URL**: `https://mcp.podgest.app`
 
 ## Database Verification
 

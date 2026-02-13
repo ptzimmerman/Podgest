@@ -25,7 +25,7 @@ export interface Env {
   OAUTH_PROVIDER: OAuthHelpers;
 }
 
-const MCP_SERVER_URL = "https://podgest-mcp.pztest.workers.dev";
+const MCP_SERVER_URL = "https://mcp.podgest.app";
 
 // Extract original podcast name from ListenNotes episode description
 function extractOriginalPodcastName(description: string): string | null {

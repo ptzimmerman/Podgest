@@ -2,12 +2,30 @@ import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../../lib/supabase'
 
-const API_URL = import.meta.env.VITE_API_URL || 'https://podgest-api.pztest.workers.dev'
+const API_URL = import.meta.env.VITE_API_URL || 'https://api.podgest.app'
 
 type Subscription = {
   id: string
   podcast_title: string
   feed_url: string
+  publication_frequency_days?: number | null
+}
+
+type ParsedPodcast = {
+  title: string
+  feed_url: string
+  artwork_url?: string
+  publication_frequency_days: number | null
+}
+
+type ParseFeedResponse = {
+  feed_title: string
+  feed_url: string
+  artwork_url?: string
+  episode_count: number
+  publication_frequency_days: number | null
+  is_aggregator: boolean
+  detected_podcasts: ParsedPodcast[]
 }
 
 const POPULAR_PODCASTS = [
@@ -61,37 +79,68 @@ export function OnboardingPodcasts() {
       const { data: { session } } = await supabase.auth.getSession()
       if (!session) throw new Error('Not authenticated')
 
-      // Try to fetch the feed title if not provided
-      let podcastTitle = title || 'Unknown Podcast'
-      if (!title) {
-        try {
-          const proxyUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(feedUrl)}`
-          const res = await fetch(proxyUrl)
-          if (res.ok) {
-            const data = await res.json()
-            podcastTitle = data.feed?.title || 'Unknown Podcast'
-          }
-        } catch {
-          // Use URL as fallback
-          podcastTitle = new URL(feedUrl).hostname
-        }
+      // Use our parse-feed endpoint to analyze the feed
+      const parseRes = await fetch(`${API_URL}/api/parse-feed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ feed_url: feedUrl }),
+      })
+      
+      if (!parseRes.ok) {
+        const err = await parseRes.json() as { error?: string }
+        throw new Error(err.error || 'Failed to parse feed')
       }
-
-      const { error } = await supabase
-        .from('subscriptions')
-        .insert({
-          user_id: session.user.id,
-          feed_url: feedUrl,
-          podcast_title: podcastTitle,
-          is_active: true,
-          priority: 1,
-        })
-
-      if (error) {
-        if (error.code === '23505') {
-          throw new Error('Already subscribed to this podcast')
+      
+      const feedData = await parseRes.json() as ParseFeedResponse
+      
+      // If it's an aggregator (like ListenNotes Listen Later), add all detected podcasts
+      if (feedData.is_aggregator && feedData.detected_podcasts.length > 0) {
+        let addedCount = 0
+        
+        for (const podcast of feedData.detected_podcasts) {
+          // Skip podcasts where we couldn't get the original RSS URL
+          if (podcast.feed_url.includes('listennotes.com')) continue
+          
+          const { error } = await supabase
+            .from('subscriptions')
+            .insert({
+              user_id: session.user.id,
+              feed_url: podcast.feed_url,
+              podcast_title: podcast.title,
+              artwork_url: podcast.artwork_url,
+              publication_frequency_days: podcast.publication_frequency_days,
+              is_active: true,
+              priority: 1,
+            })
+          
+          if (!error) addedCount++
         }
-        throw error
+        
+        if (addedCount === 0) {
+          throw new Error('Could not resolve any podcast RSS URLs from aggregator feed')
+        }
+      } else {
+        // Regular feed - add single subscription
+        const podcastTitle = title || feedData.feed_title || 'Unknown Podcast'
+        
+        const { error } = await supabase
+          .from('subscriptions')
+          .insert({
+            user_id: session.user.id,
+            feed_url: feedData.feed_url,
+            podcast_title: podcastTitle,
+            artwork_url: feedData.artwork_url,
+            publication_frequency_days: feedData.publication_frequency_days,
+            is_active: true,
+            priority: 1,
+          })
+
+        if (error) {
+          if (error.code === '23505') {
+            throw new Error('Already subscribed to this podcast')
+          }
+          throw error
+        }
       }
 
       setNewFeedUrl('')

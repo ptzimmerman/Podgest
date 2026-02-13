@@ -1,7 +1,34 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 
-const API_URL = import.meta.env.VITE_API_URL || 'https://podgest-api.pztest.workers.dev'
+const API_URL = import.meta.env.VITE_API_URL || 'https://api.podgest.app'
+
+const TIMEZONES = [
+  { value: 'America/New_York', label: 'Eastern Time (ET)' },
+  { value: 'America/Chicago', label: 'Central Time (CT)' },
+  { value: 'America/Denver', label: 'Mountain Time (MT)' },
+  { value: 'America/Los_Angeles', label: 'Pacific Time (PT)' },
+  { value: 'America/Anchorage', label: 'Alaska Time (AKT)' },
+  { value: 'Pacific/Honolulu', label: 'Hawaii Time (HT)' },
+  { value: 'Europe/London', label: 'London (GMT/BST)' },
+  { value: 'Europe/Paris', label: 'Paris (CET)' },
+  { value: 'Europe/Berlin', label: 'Berlin (CET)' },
+  { value: 'Asia/Tokyo', label: 'Tokyo (JST)' },
+  { value: 'Asia/Shanghai', label: 'Shanghai (CST)' },
+  { value: 'Australia/Sydney', label: 'Sydney (AEST)' },
+  { value: 'UTC', label: 'UTC' },
+]
+
+// Generate 30-minute increments from 00:00 to 23:30
+const DIGEST_TIMES = Array.from({ length: 48 }, (_, i) => {
+  const hours = Math.floor(i / 2)
+  const minutes = (i % 2) * 30
+  const value = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`
+  const hour12 = hours === 0 ? 12 : hours > 12 ? hours - 12 : hours
+  const ampm = hours < 12 ? 'AM' : 'PM'
+  const label = `${hour12}:${minutes.toString().padStart(2, '0')} ${ampm}`
+  return { value, label }
+})
 
 type KeyStatus = {
   openai: { configured: boolean; valid: boolean | null }
@@ -20,10 +47,138 @@ export function Settings() {
   const [userId, setUserId] = useState<string | null>(null)
   const [copiedFeed, setCopiedFeed] = useState(false)
   const [copiedMcp, setCopiedMcp] = useState(false)
+  const [digestLength, setDigestLength] = useState(5)
+  const [digestTime, setDigestTime] = useState('06:00')
+  const [timezone, setTimezone] = useState('America/Chicago')
+  const [savingDigestPrefs, setSavingDigestPrefs] = useState(false)
+  const [validating, setValidating] = useState<{ openai: boolean; anthropic: boolean; elevenlabs: boolean }>({
+    openai: false, anthropic: false, elevenlabs: false
+  })
+  const [validationResult, setValidationResult] = useState<{ 
+    openai?: { valid: boolean; error?: string };
+    anthropic?: { valid: boolean; error?: string };
+    elevenlabs?: { valid: boolean; error?: string };
+  }>({})
+  const [generatingDigest, setGeneratingDigest] = useState(false)
+  const [currentDigestId, setCurrentDigestId] = useState<string | null>(null)
+  const [digestStatus, setDigestStatus] = useState<string | null>(null)
+  const [lastDigestError, setLastDigestError] = useState<string | null>(null)
+  const [toastVisible, setToastVisible] = useState(false)
+  
+  // Show toast with auto-dismiss
+  const showToast = (type: 'success' | 'error', text: string) => {
+    setMessage({ type, text })
+    setToastVisible(true)
+    setTimeout(() => {
+      setToastVisible(false)
+      setTimeout(() => setMessage(null), 300) // Wait for slide-out animation
+    }, 3000)
+  }
 
   useEffect(() => {
     fetchKeyStatus()
+    fetchDigestPreferences()
+    checkInProgressDigest()
   }, [])
+  
+  // Poll for digest status while generating
+  useEffect(() => {
+    if (!currentDigestId || !generatingDigest) return
+    
+    const pollInterval = setInterval(async () => {
+      const { data, error } = await supabase
+        .from('digests')
+        .select('status, error_message')
+        .eq('id', currentDigestId)
+        .single()
+      
+      if (error) {
+        console.error('Error polling digest status:', error)
+        return
+      }
+      
+      setDigestStatus(data.status)
+      
+      if (data.status === 'completed') {
+        setGeneratingDigest(false)
+        showToast('success', 'Digest generated successfully!')
+        clearInterval(pollInterval)
+      } else if (data.status === 'failed') {
+        setGeneratingDigest(false)
+        setLastDigestError(data.error_message || 'Generation failed')
+        showToast('error', data.error_message || 'Digest generation failed')
+        clearInterval(pollInterval)
+      }
+    }, 3000) // Poll every 3 seconds
+    
+    return () => clearInterval(pollInterval)
+  }, [currentDigestId, generatingDigest])
+  
+  const checkInProgressDigest = async () => {
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) return
+      
+      // Check for any pending or processing digests for this user
+      const { data, error } = await supabase
+        .from('digests')
+        .select('id, status, error_message')
+        .eq('user_id', session.user.id)
+        .in('status', ['pending', 'processing', 'transcribing', 'generating_script', 'generating_audio'])
+        .order('created_at', { ascending: false })
+        .limit(1)
+      
+      if (error) throw error
+      
+      if (data && data.length > 0) {
+        setCurrentDigestId(data[0].id)
+        setDigestStatus(data[0].status)
+        setGeneratingDigest(true)
+      }
+    } catch (err) {
+      console.error('Error checking in-progress digest:', err)
+    }
+  }
+  
+  const handleGenerateDigest = async () => {
+    if (generatingDigest) return
+    
+    setGeneratingDigest(true)
+    setLastDigestError(null)
+    setMessage(null)
+    
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) throw new Error('Not authenticated')
+      
+      const res = await fetch(`${API_URL}/api/generate-digest`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ 
+          user_id: session.user.id,
+          hours_back: 48, // Look back 48 hours for content
+          force: true // Generate even if recent digest exists
+        }),
+      })
+      
+      const data = await res.json() as { digest_id?: string; error?: string }
+      
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to start digest generation')
+      }
+      
+      if (data.digest_id) {
+        setCurrentDigestId(data.digest_id)
+        setDigestStatus('pending')
+        showToast('success', 'Digest generation started...')
+      }
+    } catch (err) {
+      setGeneratingDigest(false)
+      showToast('error', err instanceof Error ? err.message : 'Failed to generate digest')
+    }
+  }
 
   const fetchKeyStatus = async () => {
     try {
@@ -60,6 +215,120 @@ export function Settings() {
       console.error('Error fetching key status:', err)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const fetchDigestPreferences = async () => {
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) return
+
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('digest_length_minutes, timezone, digest_time')
+        .eq('id', session.user.id)
+        .single()
+
+      if (error) throw error
+      if (data?.digest_length_minutes) {
+        setDigestLength(data.digest_length_minutes)
+      }
+      if (data?.timezone) {
+        setTimezone(data.timezone)
+      }
+      if (data?.digest_time) {
+        // digest_time is stored as HH:MM:SS, convert to HH:MM
+        setDigestTime(data.digest_time.substring(0, 5))
+      }
+    } catch (err) {
+      console.error('Error fetching digest preferences:', err)
+    }
+  }
+
+  const saveDigestPreferences = async (updates: { 
+    digest_length_minutes?: number; 
+    timezone?: string; 
+    digest_time?: string;
+  }) => {
+    setSavingDigestPrefs(true)
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) throw new Error('Not authenticated')
+
+      // Convert time to HH:MM:SS format if provided
+      const updateData = {
+        ...updates,
+        digest_time: updates.digest_time ? `${updates.digest_time}:00` : undefined
+      }
+      
+      // Remove undefined values
+      Object.keys(updateData).forEach(key => {
+        if (updateData[key as keyof typeof updateData] === undefined) {
+          delete updateData[key as keyof typeof updateData]
+        }
+      })
+
+      const { error } = await supabase
+        .from('profiles')
+        .update(updateData)
+        .eq('id', session.user.id)
+
+      if (error) throw error
+      showToast('success', 'Preferences saved')
+    } catch (err) {
+      console.error('Error saving preferences:', err)
+      showToast('error', 'Failed to save preferences')
+    } finally {
+      setSavingDigestPrefs(false)
+    }
+  }
+
+  const handleDigestLengthChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = parseInt(e.target.value)
+    setDigestLength(value)
+  }
+
+  const handleDigestLengthCommit = () => {
+    saveDigestPreferences({ digest_length_minutes: digestLength })
+  }
+  
+  const handleTimezoneChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const value = e.target.value
+    setTimezone(value)
+    saveDigestPreferences({ timezone: value })
+  }
+  
+  const handleDigestTimeChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const value = e.target.value
+    setDigestTime(value)
+    saveDigestPreferences({ digest_time: value })
+  }
+
+  const validateKey = async (keyType: 'openai' | 'anthropic' | 'elevenlabs', key: string) => {
+    if (!key) {
+      setValidationResult(prev => ({ ...prev, [keyType]: { valid: false, error: 'Please enter a key first' } }))
+      return
+    }
+
+    setValidating(prev => ({ ...prev, [keyType]: true }))
+    setValidationResult(prev => ({ ...prev, [keyType]: undefined }))
+
+    try {
+      const res = await fetch(`${API_URL}/api/validate-key`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key_type: keyType, key }),
+      })
+
+      const result = await res.json() as { valid: boolean; error?: string; errorCode?: string }
+      setValidationResult(prev => ({ ...prev, [keyType]: result }))
+    } catch (err) {
+      setValidationResult(prev => ({ 
+        ...prev, 
+        [keyType]: { valid: false, error: 'Failed to validate key' } 
+      }))
+    } finally {
+      setValidating(prev => ({ ...prev, [keyType]: false }))
     }
   }
 
@@ -142,15 +411,32 @@ export function Settings() {
         }
       }
 
-      if (results.length > 0) {
-        setMessage({ type: 'success', text: `Saved: ${results.join(', ')}` })
-      }
       if (errors.length > 0) {
-        setMessage({ type: 'error', text: errors.join('; ') })
+        showToast('error', errors.join('; '))
+      } else if (results.length > 0) {
+        showToast('success', `Saved: ${results.join(', ')}`)
       }
 
       // Refresh status
       await fetchKeyStatus()
+      
+      // If we just saved an OpenAI key (required for TTS), try to generate welcome episode
+      // This handles users who skipped onboarding and added keys later
+      if (results.includes('OpenAI')) {
+        const { data: { session } } = await supabase.auth.getSession()
+        if (session) {
+          // Fire and forget - don't block on this
+          fetch(`${API_URL}/api/generate-welcome`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${session.access_token}`,
+            },
+          }).catch(() => {
+            // Silently ignore errors - welcome episode is optional
+          })
+        }
+      }
     } finally {
       setSaving(false)
     }
@@ -206,7 +492,7 @@ export function Settings() {
 
   const allKeysConfigured = keyStatus?.openai.configured && keyStatus?.anthropic.configured
   const rssFeedUrl = userId ? `${API_URL}/feed/${userId}.xml` : ''
-  const mcpServerUrl = 'https://podgest-mcp.pztest.workers.dev'
+  const mcpServerUrl = 'https://mcp.podgest.app'
 
   return (
     <div className="space-y-8">
@@ -217,9 +503,29 @@ export function Settings() {
         </p>
       </div>
 
+      {/* Toast notification */}
       {message && (
-        <div className={`p-4 rounded-lg ${message.type === 'success' ? 'bg-green-50 dark:bg-green-900/30 text-green-800 dark:text-green-300 border border-green-200 dark:border-green-800' : 'bg-red-50 dark:bg-red-900/30 text-red-800 dark:text-red-300 border border-red-200 dark:border-red-800'}`}>
-          {message.text}
+        <div 
+          className={`fixed top-4 left-1/2 -translate-x-1/2 z-50 px-6 py-3 rounded-lg shadow-lg transition-all duration-300 ease-out ${
+            toastVisible ? 'translate-y-0 opacity-100' : '-translate-y-full opacity-0'
+          } ${
+            message.type === 'success' 
+              ? 'bg-green-600 text-white' 
+              : 'bg-red-600 text-white'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            {message.type === 'success' ? (
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              </svg>
+            ) : (
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            )}
+            {message.text}
+          </div>
         </div>
       )}
 
@@ -276,6 +582,145 @@ export function Settings() {
               <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
                 Paste this URL into your podcast app's "Add by URL" or "Add RSS Feed" option.
               </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Digest Preferences Section */}
+      <section className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+        <div className="flex items-start gap-4">
+          <div className="flex-shrink-0 w-10 h-10 bg-indigo-100 dark:bg-indigo-900/50 rounded-lg flex items-center justify-center">
+            <svg className="w-6 h-6 text-indigo-600 dark:text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+          </div>
+          <div className="flex-1">
+            <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Digest Preferences</h2>
+            <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+              Customize your daily podcast digest
+            </p>
+            
+            <div className="mt-6">
+              <div className="flex items-center justify-between mb-2">
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                  Digest Length
+                </label>
+                <span className="text-2xl font-bold text-indigo-600 dark:text-indigo-400">
+                  {digestLength} min
+                </span>
+              </div>
+              
+              <input
+                type="range"
+                min="5"
+                max="20"
+                step="1"
+                value={digestLength}
+                onChange={handleDigestLengthChange}
+                onMouseUp={handleDigestLengthCommit}
+                onTouchEnd={handleDigestLengthCommit}
+                className="w-full h-2 bg-gray-200 dark:bg-gray-700 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+              />
+              
+              <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400 mt-1">
+                <span>5 min</span>
+                <span>10 min</span>
+                <span>15 min</span>
+                <span>20 min</span>
+              </div>
+              
+              <p className="mt-3 text-xs text-gray-500 dark:text-gray-400">
+                Longer digests include more content and use more API tokens.
+              </p>
+            </div>
+            
+            {/* Schedule Settings */}
+            <div className="mt-6 pt-6 border-t border-gray-200 dark:border-gray-700">
+              <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-4">Daily Schedule</h3>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">
+                    Time
+                  </label>
+                  <select
+                    value={digestTime}
+                    onChange={handleDigestTimeChange}
+                    className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm bg-white dark:bg-gray-900 dark:text-white"
+                  >
+                    {DIGEST_TIMES.map(t => (
+                      <option key={t.value} value={t.value}>{t.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">
+                    Timezone
+                  </label>
+                  <select
+                    value={timezone}
+                    onChange={handleTimezoneChange}
+                    className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm bg-white dark:bg-gray-900 dark:text-white"
+                  >
+                    {TIMEZONES.map(tz => (
+                      <option key={tz.value} value={tz.value}>{tz.label}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              {savingDigestPrefs && (
+                <p className="mt-2 text-xs text-indigo-600 dark:text-indigo-400">Saving...</p>
+              )}
+            </div>
+            
+            {/* Generate Now Button */}
+            <div className="mt-6 pt-6 border-t border-gray-200 dark:border-gray-700">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300">Generate Now</h3>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                    Manually create a {digestLength}-minute digest from recent episodes
+                  </p>
+                </div>
+                <button
+                  onClick={handleGenerateDigest}
+                  disabled={generatingDigest || !allKeysConfigured}
+                  className="px-4 py-2 bg-green-600 text-white text-sm font-medium rounded-lg hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                >
+                  {generatingDigest ? (
+                    <>
+                      <svg className="animate-spin w-4 h-4" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                      {digestStatus === 'pending' ? 'Starting...' : 
+                       digestStatus === 'processing' ? 'Processing...' :
+                       digestStatus === 'transcribing' ? 'Transcribing...' :
+                       digestStatus === 'generating_script' ? 'Writing script...' :
+                       digestStatus === 'generating_audio' ? 'Generating audio...' :
+                       'Generating...'}
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      Generate
+                    </>
+                  )}
+                </button>
+              </div>
+              {!allKeysConfigured && (
+                <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+                  Configure your API keys below to enable digest generation.
+                </p>
+              )}
+              {lastDigestError && (
+                <p className="mt-2 text-xs text-red-600 dark:text-red-400">
+                  Last error: {lastDigestError}
+                </p>
+              )}
             </div>
           </div>
         </div>
@@ -451,14 +896,29 @@ export function Settings() {
             <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
               Required for embeddings (semantic search)
             </p>
-            <input
-              type="password"
-              id="openai-key"
-              value={openaiKey}
-              onChange={(e) => setOpenaiKey(e.target.value)}
-              placeholder={keyStatus?.openai.configured ? 'Enter new key to replace' : 'sk-...'}
-              className="mt-2 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm bg-white dark:bg-gray-900 dark:text-white"
-            />
+            <div className="mt-2 flex gap-2">
+              <input
+                type="password"
+                id="openai-key"
+                value={openaiKey}
+                onChange={(e) => { setOpenaiKey(e.target.value); setValidationResult(prev => ({ ...prev, openai: undefined })) }}
+                placeholder={keyStatus?.openai.configured ? 'Enter new key to replace' : 'sk-...'}
+                className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm bg-white dark:bg-gray-900 dark:text-white"
+              />
+              <button
+                type="button"
+                onClick={() => validateKey('openai', openaiKey)}
+                disabled={!openaiKey || validating.openai}
+                className="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {validating.openai ? 'Testing...' : 'Test'}
+              </button>
+            </div>
+            {validationResult.openai && (
+              <p className={`mt-2 text-sm ${validationResult.openai.valid ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                {validationResult.openai.valid ? '✓ Key is valid' : `✗ ${validationResult.openai.error || 'Invalid key'}`}
+              </p>
+            )}
           </div>
 
           {/* Anthropic Key */}
@@ -472,14 +932,29 @@ export function Settings() {
             <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
               Required for summarization and script generation
             </p>
-            <input
-              type="password"
-              id="anthropic-key"
-              value={anthropicKey}
-              onChange={(e) => setAnthropicKey(e.target.value)}
-              placeholder={keyStatus?.anthropic.configured ? 'Enter new key to replace' : 'sk-ant-...'}
-              className="mt-2 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm bg-white dark:bg-gray-900 dark:text-white"
-            />
+            <div className="mt-2 flex gap-2">
+              <input
+                type="password"
+                id="anthropic-key"
+                value={anthropicKey}
+                onChange={(e) => { setAnthropicKey(e.target.value); setValidationResult(prev => ({ ...prev, anthropic: undefined })) }}
+                placeholder={keyStatus?.anthropic.configured ? 'Enter new key to replace' : 'sk-ant-...'}
+                className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm bg-white dark:bg-gray-900 dark:text-white"
+              />
+              <button
+                type="button"
+                onClick={() => validateKey('anthropic', anthropicKey)}
+                disabled={!anthropicKey || validating.anthropic}
+                className="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {validating.anthropic ? 'Testing...' : 'Test'}
+              </button>
+            </div>
+            {validationResult.anthropic && (
+              <p className={`mt-2 text-sm ${validationResult.anthropic.valid ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                {validationResult.anthropic.valid ? '✓ Key is valid' : `✗ ${validationResult.anthropic.error || 'Invalid key'}`}
+              </p>
+            )}
           </div>
 
           {/* ElevenLabs Key */}
@@ -494,14 +969,29 @@ export function Settings() {
             <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
               Premium TTS provider for high-quality voices
             </p>
-            <input
-              type="password"
-              id="elevenlabs-key"
-              value={elevenLabsKey}
-              onChange={(e) => setElevenLabsKey(e.target.value)}
-              placeholder={keyStatus?.elevenlabs.configured ? 'Enter new key to replace' : 'xi-...'}
-              className="mt-2 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm bg-white dark:bg-gray-900 dark:text-white"
-            />
+            <div className="mt-2 flex gap-2">
+              <input
+                type="password"
+                id="elevenlabs-key"
+                value={elevenLabsKey}
+                onChange={(e) => { setElevenLabsKey(e.target.value); setValidationResult(prev => ({ ...prev, elevenlabs: undefined })) }}
+                placeholder={keyStatus?.elevenlabs.configured ? 'Enter new key to replace' : 'xi-...'}
+                className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm bg-white dark:bg-gray-900 dark:text-white"
+              />
+              <button
+                type="button"
+                onClick={() => validateKey('elevenlabs', elevenLabsKey)}
+                disabled={!elevenLabsKey || validating.elevenlabs}
+                className="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {validating.elevenlabs ? 'Testing...' : 'Test'}
+              </button>
+            </div>
+            {validationResult.elevenlabs && (
+              <p className={`mt-2 text-sm ${validationResult.elevenlabs.valid ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                {validationResult.elevenlabs.valid ? '✓ Key is valid' : `✗ ${validationResult.elevenlabs.error || 'Invalid key'}`}
+              </p>
+            )}
           </div>
         </div>
 

@@ -1,116 +1,132 @@
 # Podgest
 
-> **Daily podcast digest + AI-powered Q&A for podcast content**
+> **Your personal AI podcast digest - delivered daily to your favorite podcast app**
 
-Transform hours of daily podcasts into a 5-minute professional news recap, and query all your podcast knowledge via Claude or ChatGPT (desktop & mobile).
+Podgest transforms your podcast subscriptions into personalized daily audio digests. Subscribe to unlimited podcasts, and each morning receive a professionally narrated summary of what matters most - delivered directly to Apple Podcasts, Spotify, or any podcast app via your personal RSS feed.
 
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Design Principles](#design-principles)
-- [Architecture](#architecture)
-- [Phase 1: Daily Podcast Digest](#phase-1-daily-podcast-digest)
-- [Phase 2: Interactive Q&A (MCP Server)](#phase-2-interactive-qa-mcp-server)
-- [Technology Decisions](#technology-decisions)
-- [Database Schema](#database-schema)
-- [Pipeline Timing](#pipeline-timing)
-- [Cost Estimates](#cost-estimates)
-- [Project Structure](#project-structure)
-- [Implementation Roadmap](#implementation-roadmap)
-- [Open Questions](#open-questions)
+**Live at [dash.podgest.app](https://dash.podgest.app)**
 
 ---
 
-## Overview
+## Architecture
 
-### The Problem
+```mermaid
+flowchart TB
+    subgraph User["👤 User"]
+        PodcastApp["Podcast App<br/>(Apple/Spotify/etc)"]
+        Dashboard["Web Dashboard<br/>dash.podgest.app"]
+    end
 
-You subscribe to many podcasts but don't have time to listen to them all. Hours of valuable content goes unconsumed daily.
+    subgraph Cloudflare["☁️ Cloudflare"]
+        API["podgest-api Worker"]
+        MCP["podgest-mcp Worker"]
+        Pages["Cloudflare Pages"]
+        Queue["Cloudflare Queue"]
+    end
 
-### The Solution
+    subgraph Supabase["🗄️ Supabase"]
+        DB[(PostgreSQL)]
+        Storage["Storage<br/>(audio files)"]
+        Cron["pg_cron<br/>(daily triggers)"]
+    end
 
-**Podgest** ingests your podcast subscriptions, transcribes them, clusters by topic, summarizes into a professional 30-minute daily digest, and exposes an MCP server for natural language Q&A.
+    subgraph Modal["⚡ Modal (GPU)"]
+        Whisper["faster-whisper<br/>Transcription"]
+        TTS["OpenAI/ElevenLabs<br/>Text-to-Speech"]
+    end
 
-### Key Features
+    subgraph AI["🤖 AI Services"]
+        Claude["Claude<br/>(script generation)"]
+        OpenAI["OpenAI<br/>(TTS & embeddings)"]
+    end
+
+    Dashboard --> Pages
+    Pages --> API
+    PodcastApp -->|RSS Feed| API
+    
+    Cron -->|6 AM daily| Queue
+    Queue --> API
+    
+    API --> DB
+    API --> Storage
+    API --> Whisper
+    API --> Claude
+    API --> TTS
+    
+    Whisper --> Storage
+    TTS --> Storage
+    
+    MCP --> DB
+    MCP --> OpenAI
+```
+
+---
+
+## Key Features
 
 | Feature | Description |
 |---------|-------------|
-| **RSS Aggregation** | Subscribe to any podcast via RSS (or ListenNotes playlists) |
-| **Auto-Transcription** | GPU-accelerated transcription via Modal (faster-whisper) |
-| **Topic Extraction** | Claude extracts topics, themes, key points per episode |
-| **Daily Digest** | 5-min professional news recap via ElevenLabs (expandable later) |
-| **Smart Citations** | Host cites original source podcasts naturally |
-| **Spotify Distribution** | Listen in your existing podcast app |
-| **MCP Q&A** | Ask questions about any podcast content via Claude or ChatGPT |
-| **Multi-tenant** | Supports multiple users with isolated data |
-| **Cross-Platform** | Works on desktop and mobile (Claude, ChatGPT, Cursor) |
+| **🎧 Personal RSS Feed** | Subscribe in any podcast app - Apple Podcasts, Spotify, Overcast, etc. |
+| **⏱️ Configurable Length** | Choose digest length from 5-20 minutes based on your commute |
+| **🕐 Custom Schedule** | Pick your delivery time and timezone (6 AM default) |
+| **📡 Any Podcast RSS** | Add any podcast via RSS URL or browse popular feeds |
+| **🔗 ListenNotes Integration** | Import your Listen Later playlist - auto-detects individual podcasts |
+| **🎯 Smart Prioritization** | Less frequent podcasts (weekly shows) get priority over daily ones |
+| **🔐 BYOK (Bring Your Own Keys)** | Use your own OpenAI, Anthropic, and ElevenLabs API keys |
+| **🔒 Encrypted Storage** | API keys encrypted at rest with AES-256-GCM |
+| **👥 Multi-tenant** | Each user has isolated data and personalized digests |
+| **🎙️ MCP Server** | Query your podcast knowledge via Claude Desktop or Cursor |
 
 ---
 
-## System Architecture
+## How It Works
+
+1. **Subscribe** - Add your favorite podcasts via RSS URL in the dashboard
+2. **Configure** - Set your preferred digest length (5-20 min), delivery time, and timezone  
+3. **Add API Keys** - Provide your OpenAI and Anthropic keys (encrypted and stored securely)
+4. **Listen** - Add your personal RSS feed to any podcast app
+5. **Enjoy** - Wake up to a personalized audio digest every morning
+
+### Daily Pipeline
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              SUPABASE CLOUD                                  │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────────────┐  │
-│  │   PostgreSQL    │  │     Storage     │  │         pg_cron             │  │
-│  │  - profiles     │  │  - transcripts  │  │  ┌─────────────────────┐    │  │
-│  │  - episodes     │  │  - audio files  │  │  │ daily-digest-6am    │    │  │
-│  │  - digests      │  │  - cover art    │  │  │ (0 12 * * * UTC)    │────┼──┼───┐
-│  │  - subscriptions│  │                 │  │  ├─────────────────────┤    │  │   │
-│  │  - transcripts  │  │                 │  │  │ watchdog-hourly     │    │  │   │
-│  └────────┬────────┘  └────────┬────────┘  │  │ (30 * * * * UTC)    │────┼──┼───┤
-│           │                    │           │  └─────────────────────┘    │  │   │
-│           │                    │           └─────────────────────────────┘  │   │
-└───────────┼────────────────────┼────────────────────────────────────────────┘   │
-            │                    │                                                 │
-            │  Supabase REST API │                                                 │
-            ▼                    ▼                                                 │
-┌─────────────────────────────────────────────────────────────────────────────┐   │
-│                        CLOUDFLARE WORKERS                                    │   │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │   │
-│  │                     podgest-api Worker                               │◄───┼───┘
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  │    │
-│  │  │ /api/poll   │  │/api/generate│  │/api/daily-  │  │/transcript/│  │    │
-│  │  │             │  │  -digest    │  │    cron     │  │  latest    │  │    │
-│  │  │ RSS polling │  │ Script gen  │  │ Full flow   │  │ For Reader │  │    │
-│  │  └──────┬──────┘  └──────┬──────┘  └─────────────┘  └────────────┘  │    │
-│  └─────────┼────────────────┼──────────────────────────────────────────┘    │
-│            │                │                                                │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │                     podgest-mcp Worker                               │    │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  │    │
-│  │  │search_pods  │  │get_episode  │  │compare_takes│  │listen_to_  │  │    │
-│  │  │             │  │             │  │             │  │  episode   │  │    │
-│  │  │ SuperMemory │  │ Full detail │  │ Topic views │  │ Deep links │  │    │
-│  │  └─────────────┘  └─────────────┘  └─────────────┘  └────────────┘  │    │
-│  └──────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────┘
-            │                │
-            │                │ Webhook callbacks
-            ▼                ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              MODAL                                           │
-│  ┌─────────────────────────────┐  ┌─────────────────────────────────────┐   │
-│  │     Transcriber (GPU)       │  │         TTS Generator               │   │
-│  │  - Download audio           │  │  - ElevenLabs API calls             │   │
-│  │  - ffmpeg preprocessing     │  │  - Audio chunking & concatenation   │   │
-│  │  - faster-whisper (A10G)    │  │  - Upload to Supabase Storage       │   │
-│  │  - Webhook on completion    │  │  - Webhook on completion            │   │
-│  └─────────────────────────────┘  └─────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           SUPERMEMORY                                        │
-│  - Semantic embeddings of all transcripts                                    │
-│  - Filtered by user_id (containerTags)                                       │
-│  - Metadata: podcast_title, episode_title, published_at                      │
-│  - Enables cross-episode Q&A queries                                         │
-└─────────────────────────────────────────────────────────────────────────────┘
+6:00 AM (your timezone)
+    │
+    ▼
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Poll RSS   │────▶│ Transcribe  │────▶│  Extract    │
+│   Feeds     │     │   (Modal)   │     │   Topics    │
+└─────────────┘     └─────────────┘     └─────────────┘
+                                               │
+    ┌──────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Generate   │────▶│  Text-to-   │────▶│  Publish    │
+│   Script    │     │   Speech    │     │  to RSS     │
+│  (Claude)   │     │ (OpenAI)    │     │             │
+└─────────────┘     └─────────────┘     └─────────────┘
 ```
+
+---
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|------------|
+| **Frontend** | React + TypeScript + Tailwind (Cloudflare Pages) |
+| **API** | Cloudflare Workers (TypeScript) |
+| **Database** | Supabase PostgreSQL |
+| **Storage** | Supabase Storage (audio files) |
+| **Scheduling** | pg_cron + Cloudflare Queues |
+| **Transcription** | Modal (faster-whisper on GPU) |
+| **Script Generation** | Claude (Anthropic) |
+| **Text-to-Speech** | OpenAI TTS (ElevenLabs optional) |
+| **Auth** | Supabase Auth (Magic Link) |
+
+---
+
+## Detailed Architecture
 
 ### Daily Digest Flow
 
@@ -156,10 +172,10 @@ You subscribe to many podcasts but don't have time to listen to them all. Hours 
 │                        CONSUMER ENDPOINTS                         │
 │                                                                   │
 │  📻 RSS Feed (Spotify/Overcast/Apple Podcasts):                   │
-│     https://podgest-api.pztest.workers.dev/feed/{user_id}.xml    │
+│     https://api.podgest.app/feed/{user_id}.xml    │
 │                                                                   │
 │  📝 ElevenReader Transcript (overwritten daily):                  │
-│     https://podgest-api.pztest.workers.dev/transcript/latest     │
+│     https://api.podgest.app/transcript/latest     │
 │     → Returns full script_text as plain text                      │
 │     → Always serves the most recent completed digest              │
 │                                                                   │
@@ -188,6 +204,303 @@ BEGIN
 END;
 $$;
 ```
+
+### Async Queue Architecture (Planned Improvement)
+
+The current synchronous architecture has a fundamental limitation: **Cloudflare Workers timeout after 30 seconds**. When the cron job fires, the worker must poll all RSS feeds, process episodes, and complete digest generation within this window. As the user base grows or feeds become slow, this becomes unreliable.
+
+#### The Problem
+
+```
+Current Flow (Synchronous - Fragile):
+┌─────────────┐    ┌─────────────────────────────────────────────────────┐
+│  pg_cron    │───▶│         Single Worker (30s timeout)                 │
+│  fires      │    │  ┌──────────┬──────────┬──────────┬──────────────┐  │
+└─────────────┘    │  │ Poll RSS │ Poll RSS │ Poll RSS │ Generate     │  │
+                   │  │ Feed 1   │ Feed 2   │ Feed N   │ Digest       │  │
+                   │  │ (3s)     │ (5s)     │ (2s)     │ (???)        │  │
+                   │  └──────────┴──────────┴──────────┴──────────────┘  │
+                   │                                                     │
+                   │  ⚠️ If total time > 30s, worker is KILLED           │
+                   └─────────────────────────────────────────────────────┘
+```
+
+**Failure modes:**
+- Slow RSS feeds cause timeout
+- Many subscriptions cause timeout
+- Network latency causes timeout
+- No visibility into where failure occurred
+
+#### The Solution: Cloudflare Queues
+
+```
+Async Flow (Queue-Based - Robust):
+
+6:00 AM CDMX
+     │
+     ▼
+┌────────────────┐
+│   pg_cron      │
+│   fires        │
+└───────┬────────┘
+        │
+        ▼
+┌────────────────┐      ┌─────────────────────────────────────────────────┐
+│   Dispatcher   │      │              Cloudflare Queue                    │
+│   Worker       │─────▶│  ┌─────────┐ ┌─────────┐ ┌─────────┐           │
+│   (<1 second)  │      │  │ user_id │ │ user_id │ │ user_id │  ...      │
+└────────────────┘      │  │ = abc   │ │ = xyz   │ │ = 123   │           │
+        │               │  └─────────┘ └─────────┘ └─────────┘           │
+        │               └──────────────────┬──────────────────────────────┘
+        │                                  │
+        ▼                                  ▼
+┌────────────────┐      ┌─────────────────────────────────────────────────┐
+│  Returns       │      │          Consumer Worker (per message)           │
+│  immediately   │      │                                                  │
+│  ✅ No timeout │      │   Each user processed independently:             │
+└────────────────┘      │   ┌──────────────────────────────────────────┐  │
+                        │   │  1. Poll user's subscriptions (5-10s)    │  │
+                        │   │  2. Queue transcription jobs (1s)        │  │
+                        │   │  3. Wait for transcription callback      │  │
+                        │   │  4. Generate digest (10-15s)             │  │
+                        │   │  5. Generate TTS (webhook callback)      │  │
+                        │   │  6. Log completion ✅                    │  │
+                        │   └──────────────────────────────────────────┘  │
+                        │                                                  │
+                        │   ⏱️ Each message has own 30s window             │
+                        │   🔄 Auto-retry on failure (3 attempts)          │
+                        │   📊 Dead-letter queue for debugging             │
+                        └──────────────────────────────────────────────────┘
+```
+
+#### Benefits
+
+| Aspect | Current (Sync) | Improved (Async) |
+|--------|----------------|------------------|
+| **Timeout Risk** | High - all work in 30s | Low - work distributed |
+| **User Isolation** | None - one slow user blocks all | Full - each user independent |
+| **Scalability** | 10-20 users max | 1000s of users |
+| **Retry Logic** | Manual watchdog | Built-in per-message |
+| **Debugging** | Hard - no visibility | Easy - per-user logs |
+| **Parallelism** | None | Automatic |
+
+#### Observability & Logging
+
+Every step writes to `pipeline_logs` with structured data:
+
+```sql
+-- Pipeline log entry structure
+INSERT INTO pipeline_logs (user_id, event_type, metadata, created_at)
+VALUES (
+  '97bf7aed-...',
+  'queue_message_received',
+  '{
+    "message_id": "msg_abc123",
+    "attempt": 1,
+    "stage": "polling",
+    "subscriptions_count": 5
+  }',
+  NOW()
+);
+```
+
+**Event Types (in order):**
+
+| Event Type | Stage | What It Means |
+|------------|-------|---------------|
+| `dispatcher_started` | Dispatch | Cron fired, dispatcher running |
+| `dispatcher_queued_user` | Dispatch | Message pushed for user |
+| `dispatcher_completed` | Dispatch | All messages queued |
+| `queue_message_received` | Consumer | Worker picked up message |
+| `polling_started` | Polling | Fetching RSS feeds |
+| `polling_feed_success` | Polling | Individual feed fetched |
+| `polling_feed_error` | Polling | Individual feed failed (includes error) |
+| `polling_completed` | Polling | All feeds done, N new episodes |
+| `transcription_queued` | Transcription | Modal job started |
+| `transcription_callback` | Transcription | Modal returned transcript |
+| `digest_generation_started` | Digest | Claude API called |
+| `digest_generation_completed` | Digest | Script generated |
+| `tts_queued` | TTS | ElevenLabs job started |
+| `tts_callback` | TTS | Audio file received |
+| `digest_published` | Complete | Audio uploaded, RSS updated |
+| `queue_message_failed` | Error | Message failed all retries → DLQ |
+
+**Debugging queries:**
+
+```sql
+-- Find where today's digest failed for a user
+SELECT event_type, metadata, created_at
+FROM pipeline_logs
+WHERE user_id = '97bf7aed-...'
+  AND created_at > CURRENT_DATE
+ORDER BY created_at;
+
+-- Find all failed messages in last 24h
+SELECT user_id, metadata->>'error' as error, created_at
+FROM pipeline_logs
+WHERE event_type = 'queue_message_failed'
+  AND created_at > NOW() - INTERVAL '24 hours';
+
+-- Pipeline stage timing analysis
+SELECT 
+  event_type,
+  COUNT(*) as occurrences,
+  AVG(EXTRACT(EPOCH FROM (
+    LEAD(created_at) OVER (PARTITION BY user_id ORDER BY created_at) - created_at
+  ))) as avg_duration_seconds
+FROM pipeline_logs
+WHERE created_at > CURRENT_DATE
+GROUP BY event_type;
+```
+
+#### Implementation Components
+
+**1. Cloudflare Queue Setup:**
+```toml
+# wrangler.toml additions
+[[queues.producers]]
+queue = "podgest-digest-queue"
+binding = "DIGEST_QUEUE"
+
+[[queues.consumers]]
+queue = "podgest-digest-queue"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "podgest-digest-dlq"
+```
+
+**2. Dispatcher (replaces current cron handler):**
+```typescript
+async function handleDailyCron(env: Env): Promise<Response> {
+  const startTime = Date.now();
+  
+  // Log dispatcher start
+  await logPipelineEvent(env, null, 'dispatcher_started', {
+    triggered_at: new Date().toISOString()
+  });
+  
+  // Get all active users
+  const { data: users } = await supabase
+    .from('profiles')
+    .select('id, email, timezone')
+    .eq('active', true);
+  
+  // Queue one message per user
+  for (const user of users) {
+    await env.DIGEST_QUEUE.send({
+      user_id: user.id,
+      triggered_at: new Date().toISOString()
+    });
+    
+    await logPipelineEvent(env, user.id, 'dispatcher_queued_user', {
+      email: user.email,
+      timezone: user.timezone
+    });
+  }
+  
+  await logPipelineEvent(env, null, 'dispatcher_completed', {
+    users_queued: users.length,
+    duration_ms: Date.now() - startTime
+  });
+  
+  return new Response(JSON.stringify({
+    status: 'dispatched',
+    users: users.length
+  }));
+}
+```
+
+**3. Queue Consumer:**
+```typescript
+export default {
+  async queue(batch: MessageBatch<DigestMessage>, env: Env): Promise<void> {
+    for (const message of batch.messages) {
+      const { user_id, triggered_at } = message.body;
+      
+      try {
+        await logPipelineEvent(env, user_id, 'queue_message_received', {
+          message_id: message.id,
+          attempt: message.attempts,
+          triggered_at
+        });
+        
+        // Process this user's digest
+        await processUserDigest(env, user_id);
+        
+        message.ack();
+      } catch (error) {
+        await logPipelineEvent(env, user_id, 'queue_message_error', {
+          message_id: message.id,
+          attempt: message.attempts,
+          error: error.message,
+          stack: error.stack
+        });
+        
+        if (message.attempts >= 3) {
+          // Will go to dead-letter queue
+          await logPipelineEvent(env, user_id, 'queue_message_failed', {
+            message_id: message.id,
+            final_error: error.message
+          });
+        }
+        
+        message.retry();
+      }
+    }
+  }
+};
+```
+
+#### Watchdog Integration
+
+The watchdog remains as a safety net, but now checks per-user:
+
+```sql
+CREATE OR REPLACE FUNCTION watchdog_check_digests()
+RETURNS jsonb AS $$
+DECLARE
+  missing_users jsonb;
+BEGIN
+  -- Find users who should have a digest today but don't
+  SELECT jsonb_agg(jsonb_build_object(
+    'user_id', p.id,
+    'email', p.email
+  ))
+  INTO missing_users
+  FROM profiles p
+  LEFT JOIN digests d ON d.user_id = p.id 
+    AND d.digest_date = CURRENT_DATE
+    AND d.status = 'completed'
+  WHERE p.active = true
+    AND d.id IS NULL;
+  
+  IF missing_users IS NOT NULL THEN
+    -- Re-queue missing users
+    PERFORM net.http_post(
+      'https://podgest-api.../api/requeue-users',
+      missing_users,
+      '{}'::jsonb,
+      '{}'::jsonb
+    );
+    RETURN jsonb_build_object(
+      'status', 'requeued',
+      'users', missing_users
+    );
+  END IF;
+  
+  RETURN '{"status": "all_complete"}'::jsonb;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+#### Migration Path
+
+1. **Phase A:** Add Cloudflare Queue (no behavior change yet)
+2. **Phase B:** Add pipeline_logs events to current sync flow
+3. **Phase C:** Deploy dispatcher + consumer (feature-flagged)
+4. **Phase D:** Enable for test user, monitor
+5. **Phase E:** Enable for all users, disable sync path
+6. **Phase F:** Update watchdog to per-user model
 
 ---
 
@@ -1525,6 +1838,128 @@ Modal-based transcription is the primary (and only) transcription method.
 - [ ] Topic filtering (e.g., "skip politics today")
 - [ ] Priority podcasts get more airtime
 
+#### 6.4 Spotify Integration (OAuth)
+
+Enable users to connect their Spotify account for enhanced personalization and subscription management.
+
+**Core Flow:**
+1. User clicks "Connect to Spotify" in Settings UI
+2. OAuth 2.0 flow with Spotify (PKCE)
+3. Spotify settings panel becomes active (previously greyed out)
+4. User can configure Spotify-specific options
+
+**Spotify Settings Panel (unlocked after OAuth):**
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| **Display Name Source** | Use Spotify display name for podcast title | Off (use manual name) |
+| **Podcast Cover Art** | Use Spotify profile picture as podcast cover | Off (use default Podgest cover) |
+| **Import Subscriptions** | One-click import of podcasts user follows on Spotify | Manual trigger |
+| **Subscription Suggestions** | Suggest new podcasts based on Spotify listening history | On |
+
+**OAuth Scopes Required:**
+```
+user-read-private        # Display name, profile picture
+user-read-email          # Email (for account matching)
+user-library-read        # Followed podcasts (shows)
+user-read-playback-position  # Recently played (for suggestions)
+```
+
+**Implementation Notes:**
+- OAuth tokens stored encrypted in `user_spotify_tokens` table
+- Refresh tokens used to maintain connection
+- "Disconnect Spotify" option to revoke and clear tokens
+- Display name from Spotify is editable (user can override)
+- Podcast cover art: resize Spotify profile pic to 3000x3000 or use as-is with fallback
+
+**Database Schema:**
+```sql
+CREATE TABLE public.user_spotify_tokens (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE UNIQUE,
+  access_token_encrypted TEXT NOT NULL,
+  refresh_token_encrypted TEXT NOT NULL,
+  spotify_user_id TEXT NOT NULL,
+  spotify_display_name TEXT,
+  spotify_email TEXT,
+  spotify_profile_image_url TEXT,
+  scopes TEXT[],
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**Settings UI Mockup:**
+```
+┌─────────────────────────────────────────────────────────────┐
+│  SPOTIFY INTEGRATION                                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  [🟢 Connected as "Peter Zimmerman"]  [Disconnect]           │
+│                                                              │
+│  ─────────────────────────────────────────────────────────  │
+│                                                              │
+│  Podcast Name                                                │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ Peter                                            [✎]│    │
+│  └─────────────────────────────────────────────────────┘    │
+│  ☑ Use Spotify display name                                  │
+│                                                              │
+│  ─────────────────────────────────────────────────────────  │
+│                                                              │
+│  Podcast Cover Art                                           │
+│  ┌──────┐                                                    │
+│  │ 🎨   │  ○ Default Podgest cover                          │
+│  │      │  ● Use my Spotify profile picture                 │
+│  └──────┘                                                    │
+│                                                              │
+│  ─────────────────────────────────────────────────────────  │
+│                                                              │
+│  Subscription Management                                     │
+│                                                              │
+│  [Import from Spotify]  Found 12 podcasts you follow         │
+│                                                              │
+│  ☑ Suggest new podcasts based on my Spotify listening        │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Import Flow:**
+1. User clicks "Import from Spotify"
+2. Fetch user's followed shows via `GET /me/shows`
+3. For each show, attempt to find RSS feed URL:
+   - Check if we already have the podcast in our system
+   - Use podcast search APIs (ListenNotes, Podcast Index) to find RSS
+   - Present list with checkboxes for user to confirm
+4. Add selected podcasts to user's subscriptions
+
+**Suggestion Flow:**
+1. Periodically fetch user's recently played podcasts
+2. Identify podcasts they listen to but haven't subscribed to in Podgest
+3. Show as "Suggested" in subscription management UI
+4. One-click to add suggested podcast
+
+**Important Limitations:**
+- Spotify OAuth does NOT allow programmatic RSS feed submission
+- Users must still manually submit their Podgest feed to Spotify for Podcasters
+- OAuth is for personalization and subscription sync only
+
+**Checklist:**
+- [ ] Register Spotify Developer App (get client ID/secret)
+- [ ] Add Spotify OAuth endpoints to `podgest-api`
+- [ ] Create `user_spotify_tokens` migration
+- [ ] Add "Connect to Spotify" button to Settings UI
+- [ ] Implement token encryption/storage
+- [ ] Implement token refresh logic
+- [ ] Add Spotify settings panel (greyed until connected)
+- [ ] Implement display name sync
+- [ ] Implement profile picture as cover art option
+- [ ] Implement "Import from Spotify" feature
+- [ ] Implement subscription suggestions
+- [ ] Add "Disconnect Spotify" functionality
+- [ ] Test full OAuth flow
+
 ---
 
 ## Spotify Submission Guide
@@ -1558,11 +1993,13 @@ https://api.podgest.yourdomain.com/feed/{userId}
 4. **Fill in Details**
    | Field | Value |
    |-------|-------|
-   | Name | Podgest Daily |
+   | Name | Podgest - {Your Name}'s Daily Digest (auto-populated from RSS) |
    | Description | Your personalized daily podcast digest - AI-curated summaries from your favorite shows |
    | Category | News > Daily News |
    | Language | English |
    | Explicit | No |
+   
+   > **Note:** The podcast name is personalized per user (e.g., "Podgest - Peter's Daily Digest") to ensure uniqueness on Spotify. This is pulled from your display name in Settings, or your Spotify display name if connected.
 
 5. **Set Visibility**
    - Choose **"Not searchable"** to keep it private
@@ -1608,16 +2045,16 @@ https://api.podgest.yourdomain.com/feed/{userId}
 | `/api/webhooks/tts` | POST | Modal TTS completion callback |
 | `/feed/{userId}` | GET | RSS feed for Spotify/podcatchers |
 
-**Base URL:** `https://podgest-api.pztest.workers.dev`
+**Base URL:** `https://api.podgest.app`
 
 **Example RSS Feed:**
 ```
-https://podgest-api.pztest.workers.dev/feed/18f513bd-8ecf-4922-84b7-4ab7c7cc14df
+https://api.podgest.app/feed/18f513bd-8ecf-4922-84b7-4ab7c7cc14df
 ```
 
 ### MCP Server (Fully Remote)
 
-**Base URL:** `https://podgest-mcp.pztest.workers.dev`
+**Base URL:** `https://mcp.podgest.app`
 
 | Tool | Description |
 |------|-------------|
@@ -1639,7 +2076,7 @@ This opens browser for Google OAuth, generates an API key, and updates `.cursor/
 {
   "mcpServers": {
     "podgest": {
-      "url": "https://podgest-mcp.pztest.workers.dev/sse",
+      "url": "https://mcp.podgest.app/sse",
       "headers": {
         "Authorization": "Bearer pk_YOUR_API_KEY"
       }
