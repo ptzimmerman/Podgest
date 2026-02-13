@@ -2302,7 +2302,8 @@ async function handleUpdateProfile(request: Request, env: Env): Promise<Response
     
     if (!response.ok) {
       const error = await response.text();
-      return json({ error: "Failed to update profile", details: error }, 500);
+      console.error("[UpdateProfile] Supabase error:", error);
+      return json({ error: "Failed to update profile" }, 500);
     }
     
     const updated = await response.json();
@@ -2310,7 +2311,7 @@ async function handleUpdateProfile(request: Request, env: Env): Promise<Response
     
   } catch (error) {
     console.error("[UpdateProfile] Error:", error);
-    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+    return json({ error: "Failed to update profile" }, 500);
   }
 }
 
@@ -2422,7 +2423,8 @@ async function handleAdminDeactivateUser(userId: string, env: Env): Promise<Resp
     );
     
     if (!response.ok) {
-      return json({ error: "Failed to deactivate subscriptions", details: await response.text() }, 500);
+      console.error("[AdminDeactivateUser] Error:", await response.text());
+      return json({ error: "Failed to deactivate subscriptions" }, 500);
     }
     
     const deactivated = await response.json() as unknown[];
@@ -2474,7 +2476,8 @@ async function handleAdminReactivateUser(userId: string, env: Env): Promise<Resp
     );
     
     if (!response.ok) {
-      return json({ error: "Failed to reactivate subscriptions", details: await response.text() }, 500);
+      console.error("[AdminReactivateUser] Error:", await response.text());
+      return json({ error: "Failed to reactivate subscriptions" }, 500);
     }
     
     const reactivated = await response.json() as unknown[];
@@ -4173,7 +4176,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     if (!insertDigestResponse.ok) {
       const errorText = await insertDigestResponse.text();
       console.error(`[Digest] Failed to save record: ${errorText}`);
-      return json({ error: "Failed to save digest record", details: errorText }, 500);
+      return json({ error: "Failed to save digest record" }, 500);
     }
     
     console.log(`[Digest] Saved pending digest ${digestId}`);
@@ -4223,7 +4226,12 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     
   } catch (error) {
     console.error("[Digest] Error:", error);
-    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+    // Return user-friendly errors for known issues, generic message for unknown
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("API key") || message.includes("quota") || message.includes("rate limit")) {
+      return json({ error: message }, 500);
+    }
+    return json({ error: "Digest generation failed. Please try again later." }, 500);
   }
 }
 
@@ -4749,6 +4757,9 @@ async function handlePipelineRunLogs(env: Env, runId: string): Promise<Response>
  * Validate an API key by testing it against the provider's API.
  * POST /api/validate-key
  * Body: { key_type: 'openai' | 'anthropic' | 'elevenlabs', key: string }
+ * 
+ * Basic format validation is performed before making external API calls
+ * to avoid being used as an oracle for brute-forcing API keys.
  */
 async function handleValidateKey(request: Request): Promise<Response> {
   try {
@@ -4761,23 +4772,38 @@ async function handleValidateKey(request: Request): Promise<Response> {
       return json({ valid: false, error: "key_type and key are required" }, 400);
     }
     
+    // Basic format validation to reject obviously invalid keys
+    // before making external API calls (prevents abuse as a key-testing oracle)
+    const key = body.key.trim();
+    if (key.length < 10 || key.length > 256) {
+      return json({ valid: false, error: "Invalid key format", errorCode: 'invalid_key' }, 400);
+    }
+    
+    // Validate key format matches expected provider patterns
+    if (body.key_type === 'openai' && !key.startsWith('sk-')) {
+      return json({ valid: false, error: "OpenAI keys should start with 'sk-'", errorCode: 'invalid_key' }, 400);
+    }
+    if (body.key_type === 'anthropic' && !key.startsWith('sk-')) {
+      return json({ valid: false, error: "Anthropic keys should start with 'sk-'", errorCode: 'invalid_key' }, 400);
+    }
+    
     let result: { valid: boolean; error?: string; errorCode?: string };
     
     switch (body.key_type) {
       case 'openai':
-        result = await validateOpenAIKeyDetailed(body.key);
+        result = await validateOpenAIKeyDetailed(key);
         break;
         
       case 'anthropic':
-        result = await validateAnthropicKeyDetailed(body.key);
+        result = await validateAnthropicKeyDetailed(key);
         break;
         
       case 'elevenlabs':
-        result = await validateElevenLabsKeyDetailed(body.key);
+        result = await validateElevenLabsKeyDetailed(key);
         break;
         
       default:
-        return json({ valid: false, error: `Invalid key_type: ${body.key_type}` }, 400);
+        return json({ valid: false, error: "Invalid key_type" }, 400);
     }
     
     return json(result);
@@ -4786,7 +4812,7 @@ async function handleValidateKey(request: Request): Promise<Response> {
     console.error("[ValidateKey] Error:", error);
     return json({ 
       valid: false, 
-      error: error instanceof Error ? error.message : "Validation failed",
+      error: "Validation failed",
       errorCode: 'unknown'
     }, 500);
   }
@@ -4905,7 +4931,8 @@ async function handleSaveUserKey(request: Request, env: Env): Promise<Response> 
       
       if (!updateResponse.ok) {
         const err = await updateResponse.text();
-        return json({ error: `Failed to update key: ${err}` }, 500);
+        console.error("[SaveUserKey] Update failed:", err);
+        return json({ error: "Failed to save key" }, 500);
       }
       
       return json({ success: true, action: "updated" });
@@ -4927,7 +4954,8 @@ async function handleSaveUserKey(request: Request, env: Env): Promise<Response> 
       
       if (!insertResponse.ok) {
         const err = await insertResponse.text();
-        return json({ error: `Failed to save key: ${err}` }, 500);
+        console.error("[SaveUserKey] Insert failed:", err);
+        return json({ error: "Failed to save key" }, 500);
       }
       
       return json({ success: true, action: "created" });
@@ -4935,9 +4963,7 @@ async function handleSaveUserKey(request: Request, env: Env): Promise<Response> 
     
   } catch (error) {
     console.error("[SaveUserKey] Error:", error);
-    return json({ 
-      error: error instanceof Error ? error.message : "Failed to save key" 
-    }, 500);
+    return json({ error: "Failed to save key" }, 500);
   }
 }
 
