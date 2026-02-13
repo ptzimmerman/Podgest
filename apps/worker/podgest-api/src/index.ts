@@ -28,6 +28,31 @@ interface DigestQueueMessage {
 }
 // Note: Inngest removed - now using Supabase pg_cron for scheduling
 
+/**
+ * Simple per-user rate limiter for expensive endpoints.
+ * Tracks timestamps of recent calls per user. Resets on worker restart.
+ * This is best-effort protection - not a substitute for proper rate limiting
+ * at the edge, but prevents casual abuse of costly AI API calls.
+ */
+const rateLimitMap = new Map<string, number[]>();
+
+function checkRateLimit(userId: string, maxCalls: number, windowMs: number): boolean {
+  const now = Date.now();
+  const timestamps = rateLimitMap.get(userId) || [];
+  
+  // Remove timestamps outside the window
+  const recent = timestamps.filter(t => now - t < windowMs);
+  
+  if (recent.length >= maxCalls) {
+    rateLimitMap.set(userId, recent);
+    return false; // Rate limited
+  }
+  
+  recent.push(now);
+  rateLimitMap.set(userId, recent);
+  return true; // Allowed
+}
+
 // Voice ID for news broadcaster style
 const VOICE_BROADCASTER = "cjVigY5qzO86Huf0OWal"; // Eric - Smooth, Trustworthy
 
@@ -779,6 +804,28 @@ async function requireAuth(request: Request, env: Env): Promise<{ userId: string
   return json({ error: "Unauthorized: valid credentials required" }, 401);
 }
 
+/**
+ * Validate that a string is a valid UUID v4 format.
+ * Prevents PostgREST filter injection when interpolating into query strings.
+ */
+function isValidUUID(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+/**
+ * Validate that a URL belongs to our Supabase Storage domain.
+ * Prevents content injection via webhook audio_url spoofing.
+ */
+function isAllowedAudioUrl(audioUrl: string, env: Env): boolean {
+  try {
+    const url = new URL(audioUrl);
+    const supabaseUrl = new URL(env.SUPABASE_URL);
+    return url.hostname === supabaseUrl.hostname;
+  } catch {
+    return false;
+  }
+}
+
 // CORS headers for browser requests
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -826,20 +873,17 @@ export default {
       }
     }
 
-    // Modal transcription webhook (accepts admin key or webhook secret in body)
+    // Modal transcription webhook (admin key required)
     if (url.pathname === "/api/webhooks/modal" && request.method === "POST") {
-      // Webhooks from Modal are trusted if they contain valid job data
-      // Admin key check is optional (Modal sends it when configured)
-      const adminAuth = requireAdminAuth(request, env);
-      if (adminAuth === null || request.headers.get('X-Admin-Key') === env.ADMIN_API_KEY) {
-        return handleModalWebhook(request, env, ctx);
-      }
-      // Also allow without admin key for backward compatibility with Modal cold starts
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handleModalWebhook(request, env, ctx);
     }
     
-    // Modal TTS webhook (accepts admin key or trusts Modal callback)
+    // Modal TTS webhook (admin key required)
     if (url.pathname === "/api/webhooks/tts" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
       return handleTTSWebhook(request, env);
     }
     
@@ -861,6 +905,17 @@ export default {
     if (url.pathname === "/api/generate-digest" && request.method === "POST") {
       const auth = await requireAuth(request, env);
       if (auth instanceof Response) return auth;
+      
+      // Rate limit: max 3 digest generations per user per hour (costs ~$0.10-0.50 each in AI API calls)
+      // Admin key bypasses rate limit for cron/automated calls
+      const isAdminCall = requireAdminAuth(request, env) === null;
+      if (!isAdminCall) {
+        const rateLimitUserId = 'userId' in auth ? auth.userId : 'unknown';
+        if (!checkRateLimit(`digest:${rateLimitUserId}`, 3, 60 * 60 * 1000)) {
+          return json({ error: "Rate limited: max 3 digest generations per hour" }, 429);
+        }
+      }
+      
       return handleGenerateDigest(request, env, ctx);
     }
     
@@ -874,6 +929,9 @@ export default {
     // RSS feed for Spotify (support both GET and HEAD for podcast apps)
     if (url.pathname.startsWith("/feed/") && (request.method === "GET" || request.method === "HEAD")) {
       const userId = url.pathname.replace("/feed/", "").replace(".xml", "");
+      if (!isValidUUID(userId)) {
+        return json({ error: "Invalid feed ID" }, 400);
+      }
       const baseUrl = `${url.protocol}//${url.host}`;
       
       // Check if request is from a social media crawler (for rich link previews)
@@ -1343,12 +1401,34 @@ async function handleModalWebhook(request: Request, env: Env, ctx: ExecutionCont
       return json({ error: "Invalid job_id" }, 400);
     }
 
+    // Validate episode_id is a proper UUID to prevent PostgREST filter injection
+    if (!isValidUUID(jobData.episode_id)) {
+      return json({ error: "Invalid episode_id format" }, 400);
+    }
+
     const headers = {
       "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
       "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
       "Content-Type": "application/json",
       "Prefer": "return=minimal",
     };
+
+    // State check: verify the transcription exists and is in "processing" state
+    const checkResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${jobData.episode_id}&select=episode_id,status`,
+      { headers }
+    );
+    if (checkResponse.ok) {
+      const existing = await checkResponse.json() as Array<{ episode_id: string; status: string }>;
+      if (!existing.length) {
+        console.warn(`[Webhook] No transcription found for episode: ${jobData.episode_id}`);
+        return json({ error: "Transcription record not found" }, 404);
+      }
+      if (existing[0].status === "completed") {
+        console.warn(`[Webhook] Transcription for ${jobData.episode_id} already completed - ignoring duplicate`);
+        return json({ error: "Already completed" }, 409);
+      }
+    }
 
     if (payload.status === "completed" && payload.text) {
       // Upload transcript to storage
@@ -1437,6 +1517,11 @@ async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
       return json({ error: "digest_id required" }, 400);
     }
 
+    // Validate digest_id is a proper UUID to prevent PostgREST filter injection
+    if (!isValidUUID(payload.digest_id)) {
+      return json({ error: "Invalid digest_id format" }, 400);
+    }
+
     const headers = {
       "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
       "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -1444,7 +1529,30 @@ async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
       "Prefer": "return=minimal",
     };
 
+    // State check: only accept webhooks for digests currently in "generating" state
+    const checkResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests?id=eq.${payload.digest_id}&select=id,status`,
+      { headers }
+    );
+    if (checkResponse.ok) {
+      const existing = await checkResponse.json() as Array<{ id: string; status: string }>;
+      if (!existing.length) {
+        console.warn(`[TTS Webhook] No digest found for id: ${payload.digest_id}`);
+        return json({ error: "Digest not found" }, 404);
+      }
+      if (existing[0].status !== "generating") {
+        console.warn(`[TTS Webhook] Digest ${payload.digest_id} is in state '${existing[0].status}', not 'generating' - ignoring`);
+        return json({ error: "Digest not in generating state" }, 409);
+      }
+    }
+
     if (payload.status === "completed" && payload.audio_url) {
+      // Validate audio_url domain - only accept URLs from our Supabase Storage
+      if (!isAllowedAudioUrl(payload.audio_url, env)) {
+        console.error(`[TTS Webhook] Rejected audio_url from untrusted domain: ${payload.audio_url}`);
+        return json({ error: "Untrusted audio_url domain" }, 400);
+      }
+
       // Update digest record with audio URL
       await fetch(
         `${env.SUPABASE_URL}/rest/v1/digests?id=eq.${payload.digest_id}`,
@@ -3771,6 +3879,11 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     
     const hoursBack = body.hours_back || 24;
     const userId = body.user_id || "00000000-0000-0000-0000-000000000000";
+    
+    // Validate user_id is a proper UUID
+    if (!isValidUUID(userId)) {
+      return json({ error: "Invalid user_id format" }, 400);
+    }
     
     // Fetch user's digest length preference (default 5 minutes)
     let maxLengthMinutes = 5;
