@@ -85,11 +85,12 @@ class Transcriber:
             return input_path
 
     @modal.method()
-    def transcribe(self, audio_url: str, webhook_url: str | None = None, job_id: str | None = None) -> dict:
+    def transcribe(self, audio_url: str, webhook_url: str | None = None, job_id: str | None = None, admin_key: str | None = None) -> dict:
         """
         Transcribe audio from URL.
         
         If webhook_url is provided, POSTs result there instead of returning.
+        If admin_key is provided, includes it as X-Admin-Key header in webhook calls.
         """
         import tempfile
         import os
@@ -155,7 +156,10 @@ class Transcriber:
             # If webhook provided, POST result there
             if webhook_url:
                 print(f"📤 Sending to webhook: {webhook_url}")
-                requests.post(webhook_url, json=result, timeout=30)
+                webhook_headers = {"Content-Type": "application/json"}
+                if admin_key:
+                    webhook_headers["X-Admin-Key"] = admin_key
+                requests.post(webhook_url, json=result, headers=webhook_headers, timeout=30)
                 return {"status": "sent_to_webhook"}
             
             return result
@@ -172,7 +176,10 @@ class Transcriber:
             }
             
             if webhook_url:
-                requests.post(webhook_url, json=error_result, timeout=30)
+                webhook_headers = {"Content-Type": "application/json"}
+                if admin_key:
+                    webhook_headers["X-Admin-Key"] = admin_key
+                requests.post(webhook_url, json=error_result, headers=webhook_headers, timeout=30)
                 return {"status": "error_sent_to_webhook"}
             
             return error_result
@@ -214,6 +221,7 @@ class TextToSpeech:
         supabase_key: str | None = None,
         digest_id: str | None = None,
         webhook_url: str | None = None,
+        admin_key: str | None = None,
     ) -> dict:
         """
         Generate audio from script text.
@@ -310,9 +318,12 @@ class TextToSpeech:
             # Send to webhook if provided
             if webhook_url:
                 print(f"📤 Sending to webhook: {webhook_url}")
+                webhook_headers = {"Content-Type": "application/json"}
+                if admin_key:
+                    webhook_headers["X-Admin-Key"] = admin_key
                 # Don't include base64 in webhook (too large)
                 webhook_result = {k: v for k, v in result.items() if k != "audio_base64"}
-                requests.post(webhook_url, json=webhook_result, timeout=30)
+                requests.post(webhook_url, json=webhook_result, headers=webhook_headers, timeout=30)
             
             return result
             
@@ -328,7 +339,10 @@ class TextToSpeech:
             }
             
             if webhook_url:
-                requests.post(webhook_url, json=error_result, timeout=30)
+                webhook_headers = {"Content-Type": "application/json"}
+                if admin_key:
+                    webhook_headers["X-Admin-Key"] = admin_key
+                requests.post(webhook_url, json=error_result, headers=webhook_headers, timeout=30)
             
             return error_result
     
@@ -442,6 +456,7 @@ class OpenAITTS:
         supabase_key: str | None = None,
         digest_id: str | None = None,
         webhook_url: str | None = None,
+        admin_key: str | None = None,
     ) -> dict:
         """
         Generate audio from script text using OpenAI TTS.
@@ -542,7 +557,10 @@ class OpenAITTS:
             # Send to webhook if provided
             if webhook_url:
                 print(f"📤 Sending to webhook: {webhook_url}")
-                requests.post(webhook_url, json=result, timeout=30)
+                webhook_headers = {"Content-Type": "application/json"}
+                if admin_key:
+                    webhook_headers["X-Admin-Key"] = admin_key
+                requests.post(webhook_url, json=result, headers=webhook_headers, timeout=30)
             
             return result
             
@@ -559,7 +577,10 @@ class OpenAITTS:
             }
             
             if webhook_url:
-                requests.post(webhook_url, json=error_result, timeout=30)
+                webhook_headers = {"Content-Type": "application/json"}
+                if admin_key:
+                    webhook_headers["X-Admin-Key"] = admin_key
+                requests.post(webhook_url, json=error_result, headers=webhook_headers, timeout=30)
             
             return error_result
     
@@ -657,6 +678,7 @@ def openai_tts_web(request: dict) -> dict:
         supabase_key=request.get("supabase_key"),
         digest_id=request.get("digest_id"),
         webhook_url=request.get("webhook_url"),
+        admin_key=request.get("admin_key"),
     )
 
 
@@ -696,6 +718,7 @@ def tts_web(request: dict) -> dict:
         supabase_key=request.get("supabase_key"),
         digest_id=request.get("digest_id"),
         webhook_url=request.get("webhook_url"),
+        admin_key=request.get("admin_key"),
     )
 
 
@@ -874,9 +897,11 @@ def transcribe_web(request: dict) -> dict:
     if not audio_url:
         return {"error": "audio_url is required"}
     
+    admin_key = request.get("admin_key")
+    
     # Spawn async transcription (don't wait for result)
     transcriber = Transcriber()
-    transcriber.transcribe.spawn(audio_url, webhook_url, job_id)
+    transcriber.transcribe.spawn(audio_url, webhook_url, job_id, admin_key)
     
     return {
         "status": "accepted",
