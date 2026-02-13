@@ -6,6 +6,28 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
     "enabled": true
+  },
+  // Keep workers.dev URL active as fallback
+  "workers_dev": true,
+  // Note: Custom domain (api.podgest.app) is configured via Cloudflare dashboard
+  // Cloudflare Queues for async digest processing
+  // This decouples the cron trigger from the actual processing
+  // Each user gets their own queue message with independent retry/timeout
+  "queues": {
+    "producers": [
+      {
+        "queue": "podgest-digest-queue",
+        "binding": "DIGEST_QUEUE"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "podgest-digest-queue",
+        "max_batch_size": 1,
+        "max_retries": 3,
+        "dead_letter_queue": "podgest-digest-dlq"
+      }
+    ]
   }
   // Note: Cron triggers removed - now using Supabase pg_cron for scheduling
 }

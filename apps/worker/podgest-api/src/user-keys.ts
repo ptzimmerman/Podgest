@@ -251,13 +251,21 @@ export async function getApiKeyStatus(
 }
 
 /**
- * Validate an OpenAI API key by making a test API call.
- * 
- * @param apiKey - The API key to validate
- * @returns True if valid, false otherwise
+ * Detailed validation result with specific error information
  */
-export async function validateOpenAIKey(apiKey: string): Promise<boolean> {
-  if (!apiKey) return false;
+export interface KeyValidationResult {
+  valid: boolean;
+  error?: string;
+  errorCode?: 'invalid_key' | 'quota_exceeded' | 'rate_limited' | 'network_error' | 'unknown';
+}
+
+/**
+ * Validate an OpenAI API key with detailed error reporting.
+ */
+export async function validateOpenAIKeyDetailed(apiKey: string): Promise<KeyValidationResult> {
+  if (!apiKey) {
+    return { valid: false, error: "API key is required", errorCode: 'invalid_key' };
+  }
 
   try {
     const response = await fetch('https://api.openai.com/v1/models', {
@@ -267,23 +275,43 @@ export async function validateOpenAIKey(apiKey: string): Promise<boolean> {
       },
     });
 
-    return response.ok;
-  } catch {
-    return false;
+    if (response.ok) {
+      return { valid: true };
+    }
+
+    // Parse error response
+    try {
+      const errorData = await response.json() as { error?: { message?: string; code?: string; type?: string } };
+      const errorMsg = errorData.error?.message || `HTTP ${response.status}`;
+      const errorType = errorData.error?.type || errorData.error?.code;
+
+      if (response.status === 401) {
+        return { valid: false, error: "Invalid API key", errorCode: 'invalid_key' };
+      }
+      if (response.status === 429 || errorType === 'insufficient_quota') {
+        if (errorMsg.includes('quota') || errorType === 'insufficient_quota') {
+          return { valid: false, error: "API key quota exceeded. Please add credits to your OpenAI account.", errorCode: 'quota_exceeded' };
+        }
+        return { valid: false, error: "Rate limited. Please try again later.", errorCode: 'rate_limited' };
+      }
+      return { valid: false, error: errorMsg, errorCode: 'unknown' };
+    } catch {
+      return { valid: false, error: `HTTP ${response.status}`, errorCode: 'unknown' };
+    }
+  } catch (e) {
+    return { valid: false, error: "Network error - could not reach OpenAI", errorCode: 'network_error' };
   }
 }
 
 /**
- * Validate an Anthropic API key by making a test API call.
- * 
- * @param apiKey - The API key to validate
- * @returns True if valid, false otherwise
+ * Validate an Anthropic API key with detailed error reporting.
  */
-export async function validateAnthropicKey(apiKey: string): Promise<boolean> {
-  if (!apiKey) return false;
+export async function validateAnthropicKeyDetailed(apiKey: string): Promise<KeyValidationResult> {
+  if (!apiKey) {
+    return { valid: false, error: "API key is required", errorCode: 'invalid_key' };
+  }
 
   try {
-    // Use a minimal completion to test the key
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -298,32 +326,118 @@ export async function validateAnthropicKey(apiKey: string): Promise<boolean> {
       }),
     });
 
-    // 200 = valid, 400 = valid but bad request (key works), 401 = invalid
-    return response.ok || response.status === 400;
-  } catch {
-    return false;
+    // 200 = valid
+    if (response.ok) {
+      return { valid: true };
+    }
+
+    try {
+      const errorData = await response.json() as { error?: { message?: string; type?: string } };
+      const errorMsg = errorData.error?.message || `HTTP ${response.status}`;
+      const errorType = errorData.error?.type;
+
+      // Check for credit/billing issues in any response (including 400)
+      if (errorMsg.toLowerCase().includes('credit balance') || errorMsg.toLowerCase().includes('billing')) {
+        return { valid: false, error: "API key has no credits. Please add credits to your Anthropic account.", errorCode: 'quota_exceeded' };
+      }
+      
+      // 400 with other errors = valid key but bad request
+      if (response.status === 400 && errorType !== 'invalid_request_error') {
+        return { valid: true };
+      }
+      // 400 with invalid_request_error but not credit related = probably valid key
+      if (response.status === 400 && !errorMsg.toLowerCase().includes('credit')) {
+        return { valid: true };
+      }
+
+      if (response.status === 401 || errorType === 'authentication_error') {
+        return { valid: false, error: "Invalid API key", errorCode: 'invalid_key' };
+      }
+      if (response.status === 429) {
+        return { valid: false, error: "Rate limited. Please try again later.", errorCode: 'rate_limited' };
+      }
+      return { valid: false, error: errorMsg, errorCode: 'unknown' };
+    } catch {
+      return { valid: false, error: `HTTP ${response.status}`, errorCode: 'unknown' };
+    }
+  } catch (e) {
+    return { valid: false, error: "Network error - could not reach Anthropic", errorCode: 'network_error' };
   }
 }
 
 /**
- * Validate an ElevenLabs API key by making a test API call.
- * 
- * @param apiKey - The API key to validate
- * @returns True if valid, false otherwise
+ * Validate an ElevenLabs API key with detailed error reporting.
  */
-export async function validateElevenLabsKey(apiKey: string): Promise<boolean> {
-  if (!apiKey) return false;
+export async function validateElevenLabsKeyDetailed(apiKey: string): Promise<KeyValidationResult> {
+  if (!apiKey) {
+    return { valid: false, error: "API key is required", errorCode: 'invalid_key' };
+  }
 
   try {
-    const response = await fetch('https://api.elevenlabs.io/v1/user', {
+    const response = await fetch('https://api.elevenlabs.io/v1/user/subscription', {
       method: 'GET',
       headers: {
         'xi-api-key': apiKey,
       },
     });
 
-    return response.ok;
-  } catch {
-    return false;
+    if (response.ok) {
+      // Check subscription status
+      try {
+        const data = await response.json() as { 
+          character_count?: number; 
+          character_limit?: number;
+          status?: string;
+        };
+        
+        // Check if they have characters remaining
+        if (data.character_limit !== undefined && data.character_count !== undefined) {
+          const remaining = data.character_limit - data.character_count;
+          if (remaining <= 0) {
+            return { valid: false, error: "ElevenLabs character quota exhausted. Please upgrade your plan.", errorCode: 'quota_exceeded' };
+          }
+        }
+        return { valid: true };
+      } catch {
+        return { valid: true }; // Key works, couldn't parse subscription details
+      }
+    }
+
+    if (response.status === 401) {
+      return { valid: false, error: "Invalid API key", errorCode: 'invalid_key' };
+    }
+    if (response.status === 429) {
+      return { valid: false, error: "Rate limited. Please try again later.", errorCode: 'rate_limited' };
+    }
+    return { valid: false, error: `HTTP ${response.status}`, errorCode: 'unknown' };
+  } catch (e) {
+    return { valid: false, error: "Network error - could not reach ElevenLabs", errorCode: 'network_error' };
   }
+}
+
+/**
+ * Validate an OpenAI API key by making a test API call.
+ * @deprecated Use validateOpenAIKeyDetailed for better error messages
+ */
+export async function validateOpenAIKey(apiKey: string): Promise<boolean> {
+  const result = await validateOpenAIKeyDetailed(apiKey);
+  return result.valid;
+}
+
+/**
+ * Validate an Anthropic API key by making a test API call.
+ * @deprecated Use validateAnthropicKeyDetailed for better error messages
+ */
+export async function validateAnthropicKey(apiKey: string): Promise<boolean> {
+  const result = await validateAnthropicKeyDetailed(apiKey);
+  return result.valid;
+}
+
+/**
+ * Validate an ElevenLabs API key by making a test API call.
+ * @deprecated Use validateElevenLabsKeyDetailed for better error messages
+ */
+export async function validateElevenLabsKey(apiKey: string): Promise<boolean> {
+  const result = await validateElevenLabsKeyDetailed(apiKey);
+  return result.valid;
 }

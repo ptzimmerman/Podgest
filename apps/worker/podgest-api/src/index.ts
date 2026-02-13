@@ -1,6 +1,6 @@
-import { getUserApiKeys, validateOpenAIKey, validateAnthropicKey, validateElevenLabsKey } from './user-keys';
+import { getUserApiKeys, validateOpenAIKey, validateAnthropicKey, validateElevenLabsKey, validateOpenAIKeyDetailed, validateAnthropicKeyDetailed, validateElevenLabsKeyDetailed } from './user-keys';
 import { generateChunkedEmbeddings } from './embeddings';
-import { encryptApiKey } from './encryption';
+import { encryptApiKey, decryptApiKey } from './encryption';
 
 export interface Env {
   SUPABASE_URL: string;
@@ -12,6 +12,15 @@ export interface Env {
   // Phase 8: BYOK encryption key for user API keys
   // Generate with: openssl rand -hex 32
   API_KEY_ENCRYPTION_KEY: string;
+  // Cloudflare Queue for async digest processing
+  DIGEST_QUEUE: Queue<DigestQueueMessage>;
+}
+
+// Queue message type for async digest processing
+interface DigestQueueMessage {
+  user_id: string;
+  triggered_at: string;
+  run_id: string;
 }
 // Note: Inngest removed - now using Supabase pg_cron for scheduling
 
@@ -261,6 +270,45 @@ async function downloadTranscript(transcriptInfo: TranscriptInfo): Promise<strin
 const rssUrlCache = new Map<string, string | null>();
 
 // ============================================
+// PUBLICATION FREQUENCY CALCULATION
+// ============================================
+
+// Calculate average days between episodes from a list of episode dates
+function calculatePublicationFrequency(episodeDates: Date[]): number | null {
+  if (episodeDates.length < 2) return null;
+  
+  // Sort dates descending (newest first)
+  const sorted = [...episodeDates].sort((a, b) => b.getTime() - a.getTime());
+  
+  // Take up to last 20 episodes for calculation (to avoid old data skewing results)
+  const recent = sorted.slice(0, 20);
+  
+  if (recent.length < 2) return null;
+  
+  // Calculate intervals between consecutive episodes
+  const intervals: number[] = [];
+  for (let i = 0; i < recent.length - 1; i++) {
+    const daysBetween = (recent[i].getTime() - recent[i + 1].getTime()) / (1000 * 60 * 60 * 24);
+    intervals.push(daysBetween);
+  }
+  
+  // Average interval
+  const avgDays = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+  
+  // Round to 1 decimal place
+  return Math.round(avgDays * 10) / 10;
+}
+
+// Calculate frequency from RSS feed XML
+function calculateFrequencyFromRSS(episodes: Array<{ published_at: string | Date | null }>): number | null {
+  const dates = episodes
+    .map(ep => ep.published_at ? new Date(ep.published_at) : null)
+    .filter((d): d is Date => d !== null && !isNaN(d.getTime()));
+  
+  return calculatePublicationFrequency(dates);
+}
+
+// ============================================
 // RSS PARSING
 // ============================================
 
@@ -282,6 +330,17 @@ interface RSSFeed {
 async function parseRSSFeed(feedUrl: string): Promise<RSSFeed> {
   console.log(`[RSS] Fetching: ${feedUrl}`);
   
+  // Check for common non-RSS URL patterns
+  if (feedUrl.includes('embed.podcasts.apple.com') || feedUrl.includes('podcasts.apple.com/us/podcast')) {
+    throw new Error('This is an Apple Podcasts link, not an RSS feed. Please find the podcast\'s RSS feed URL instead.');
+  }
+  if (feedUrl.includes('open.spotify.com') || feedUrl.includes('spotify.com/show')) {
+    throw new Error('This is a Spotify link, not an RSS feed. Please find the podcast\'s RSS feed URL instead.');
+  }
+  if (feedUrl.includes('youtube.com') || feedUrl.includes('youtu.be')) {
+    throw new Error('This is a YouTube link, not an RSS feed. Please find the podcast\'s RSS feed URL instead.');
+  }
+  
   const response = await fetch(feedUrl, {
     headers: { "User-Agent": "Podgest/1.0 (podcast aggregator)" },
   });
@@ -291,6 +350,16 @@ async function parseRSSFeed(feedUrl: string): Promise<RSSFeed> {
   }
 
   const xml = await response.text();
+  
+  // Check if it's actually XML/RSS content
+  const trimmedXml = xml.trim();
+  if (trimmedXml.startsWith('<!DOCTYPE html') || trimmedXml.startsWith('<html') || trimmedXml.includes('<head>') && !trimmedXml.includes('<rss')) {
+    throw new Error('This URL returns HTML, not an RSS feed. Please find the podcast\'s direct RSS feed URL.');
+  }
+  
+  if (!trimmedXml.includes('<rss') && !trimmedXml.includes('<feed') && !trimmedXml.includes('<channel')) {
+    throw new Error('This URL does not appear to be a valid RSS feed.');
+  }
   
   // Simple XML parsing without external deps
   const getTag = (text: string, tag: string): string => {
@@ -407,7 +476,10 @@ async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<
       // Parse RSS feed
       const feed = await parseRSSFeed(sub.feed_url);
       
-      // Update subscription metadata
+      // Calculate publication frequency from episode dates
+      const publicationFrequency = calculateFrequencyFromRSS(feed.episodes);
+      
+      // Update subscription metadata including frequency
       await fetch(
         `${env.SUPABASE_URL}/rest/v1/subscriptions?id=eq.${sub.id}`,
         {
@@ -416,6 +488,7 @@ async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<
           body: JSON.stringify({
             artwork_url: feed.artwork_url,
             last_polled_at: new Date().toISOString(),
+            publication_frequency_days: publicationFrequency,
           }),
         }
       );
@@ -572,7 +645,7 @@ async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   audio_url: episode.audio_url,
-                  webhook_url: "https://podgest-api.pztest.workers.dev/api/webhooks/modal",
+                  webhook_url: "https://api.podgest.app/api/webhooks/modal",
                   job_id: JSON.stringify({
                     episode_id: insertedEpisode.id,
                     transcription_id: insertedEpisode.id, // Will be updated
@@ -691,10 +764,29 @@ export default {
       return handleScheduledDigest(env);
     }
     
-    // RSS feed for Spotify
-    if (url.pathname.startsWith("/feed/") && request.method === "GET") {
+    // RSS feed for Spotify (support both GET and HEAD for podcast apps)
+    if (url.pathname.startsWith("/feed/") && (request.method === "GET" || request.method === "HEAD")) {
       const userId = url.pathname.replace("/feed/", "").replace(".xml", "");
-      return handleRSSFeed(userId, env);
+      const baseUrl = `${url.protocol}//${url.host}`;
+      
+      // Check if request is from a social media crawler (for rich link previews)
+      const userAgent = request.headers.get("User-Agent") || "";
+      const isCrawler = /facebookexternalhit|Twitterbot|LinkedInBot|Slackbot|TelegramBot|WhatsApp|Discordbot|iMessageLinkBot/i.test(userAgent);
+      
+      if (isCrawler) {
+        // Return HTML with OG tags for social media previews
+        return handleFeedOGPreview(userId, env, baseUrl);
+      }
+      
+      const response = await handleRSSFeed(userId, env, baseUrl);
+      // For HEAD requests, return empty body but same headers
+      if (request.method === "HEAD") {
+        return new Response(null, {
+          status: response.status,
+          headers: response.headers,
+        });
+      }
+      return response;
     }
     
     // Re-embed all transcriptions in SuperMemory (admin endpoint)
@@ -706,6 +798,33 @@ export default {
     // Admin endpoint to update user profile settings
     if (url.pathname === "/api/admin/update-profile" && request.method === "POST") {
       return handleUpdateProfile(request, env);
+    }
+    
+    // ============================================
+    // ADMIN USER MANAGEMENT ENDPOINTS
+    // ============================================
+    
+    // List all users with status
+    if (url.pathname === "/api/admin/users" && request.method === "GET") {
+      return handleAdminListUsers(env);
+    }
+    
+    // Deactivate user (soft delete - disables subscriptions, keeps data)
+    if (url.pathname.startsWith("/api/admin/deactivate-user/") && request.method === "POST") {
+      const userId = url.pathname.replace("/api/admin/deactivate-user/", "");
+      return handleAdminDeactivateUser(userId, env);
+    }
+    
+    // Reactivate user (re-enables subscriptions)
+    if (url.pathname.startsWith("/api/admin/reactivate-user/") && request.method === "POST") {
+      const userId = url.pathname.replace("/api/admin/reactivate-user/", "");
+      return handleAdminReactivateUser(userId, env);
+    }
+    
+    // Delete user (hard delete - removes all user data)
+    if (url.pathname.startsWith("/api/admin/delete-user/") && request.method === "DELETE") {
+      const userId = url.pathname.replace("/api/admin/delete-user/", "");
+      return handleAdminDeleteUser(userId, env);
     }
     
     // ElevenReader transcript - returns latest digest script as plain text
@@ -796,9 +915,67 @@ export default {
     if (url.pathname === "/api/generate-welcome" && request.method === "POST") {
       return withCors(await handleGenerateWelcome(request, env, ctx));
     }
+    
+    // Async queue: Dispatch all users (can be called directly for testing)
+    if (url.pathname === "/api/dispatch" && request.method === "POST") {
+      return handleDispatcher(env);
+    }
+    
+    // Async queue: Re-queue specific users (used by watchdog)
+    if (url.pathname === "/api/requeue-users" && request.method === "POST") {
+      return handleRequeueUsers(request, env);
+    }
+    
+    // Async queue: Queue status check
+    if (url.pathname === "/api/queue/status" && request.method === "GET") {
+      return handleQueueStatus(env);
+    }
+    
+    // Test endpoint: Check API key status for a user
+    if (url.pathname.startsWith("/api/test/key-status/") && request.method === "GET") {
+      const userId = url.pathname.replace("/api/test/key-status/", "");
+      return handleTestKeyStatus(env, userId);
+    }
+    
+    // Test endpoint: Delete today's digest for a user (for testing)
+    if (url.pathname.startsWith("/api/test/delete-digest/") && request.method === "DELETE") {
+      const userId = url.pathname.replace("/api/test/delete-digest/", "");
+      return handleTestDeleteDigest(env, userId);
+    }
+    
+    // Test endpoint: Force generate digest for a user (ignores already-covered)
+    if (url.pathname.startsWith("/api/test/force-digest/") && request.method === "POST") {
+      const userId = url.pathname.replace("/api/test/force-digest/", "");
+      // Create a request with force=true
+      const forceRequest = new Request(request.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: userId, hours_back: 168, force: true }),  // 7 days
+      });
+      return handleGenerateDigest(forceRequest, env, ctx);
+    }
+    
+    // Debug endpoint: Show user's subscriptions and available episodes
+    if (url.pathname.startsWith("/api/test/debug-episodes/") && request.method === "GET") {
+      const userId = url.pathname.replace("/api/test/debug-episodes/", "");
+      return handleDebugEpisodes(env, userId);
+    }
+    
+    // Parse feed endpoint: Analyzes RSS feed and detects ListenNotes aggregator
+    // Returns feed info, detected podcasts (if aggregator), and frequency data
+    if (url.pathname === "/api/parse-feed" && request.method === "POST") {
+      return withCors(await handleParseFeed(request, env));
+    }
 
     return json({ error: "Not found" }, 404);
   },
+  
+  // Queue consumer for async digest processing
+  // Each message = one user's digest job with independent timeout/retry
+  async queue(batch: MessageBatch<DigestQueueMessage>, env: Env, ctx: ExecutionContext): Promise<void> {
+    await handleQueueBatch(batch, env, ctx);
+  },
+  
   // Note: Cron triggers removed - now using Supabase pg_cron via /api/daily-cron endpoint
 };
 
@@ -1309,7 +1486,7 @@ Alright, that's the quick tour. I'll catch you tomorrow with your first digest. 
             supabase_url: env.SUPABASE_URL,
             supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
             digest_id: digestId,
-            webhook_url: "https://podgest-api.pztest.workers.dev/api/webhooks/tts",
+            webhook_url: "https://api.podgest.app/api/webhooks/tts",
           }),
         }
       ).then(res => console.log(`[Welcome] TTS triggered: ${res.status}`))
@@ -1868,6 +2045,283 @@ async function handleUpdateProfile(request: Request, env: Env): Promise<Response
   }
 }
 
+// ============================================
+// ADMIN USER MANAGEMENT HANDLERS
+// ============================================
+
+// List all users with their status
+async function handleAdminListUsers(env: Env): Promise<Response> {
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  
+  try {
+    // Get all profiles
+    const profilesResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?select=id,email,display_name,timezone,created_at`,
+      { headers }
+    );
+    
+    if (!profilesResponse.ok) {
+      return json({ error: "Failed to fetch profiles" }, 500);
+    }
+    
+    const profiles = await profilesResponse.json() as Array<{
+      id: string;
+      email: string;
+      display_name: string | null;
+      timezone: string;
+      created_at: string;
+    }>;
+    
+    // Get subscription counts and status for each user
+    const users = await Promise.all(profiles.map(async (profile) => {
+      const subsResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${profile.id}&select=id,is_active`,
+        { headers }
+      );
+      const subs = await subsResponse.json() as Array<{ id: string; is_active: boolean }>;
+      
+      const digestsResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${profile.id}&select=id&limit=1&order=created_at.desc`,
+        { headers }
+      );
+      const digests = await digestsResponse.json() as Array<{ id: string }>;
+      
+      const apiKeysResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${profile.id}&select=anthropic_key_encrypted,openai_key_encrypted`,
+        { headers }
+      );
+      const apiKeys = await apiKeysResponse.json() as Array<{ anthropic_key_encrypted: string | null; openai_key_encrypted: string | null }>;
+      
+      const activeSubs = subs.filter(s => s.is_active).length;
+      const totalSubs = subs.length;
+      const hasApiKeys = apiKeys.length > 0 && !!(apiKeys[0].anthropic_key_encrypted || apiKeys[0].openai_key_encrypted);
+      
+      return {
+        id: profile.id,
+        email: profile.email,
+        display_name: profile.display_name,
+        timezone: profile.timezone,
+        created_at: profile.created_at,
+        status: activeSubs > 0 ? "active" : (totalSubs > 0 ? "deactivated" : "no_subscriptions"),
+        subscriptions: { active: activeSubs, total: totalSubs },
+        has_digests: digests.length > 0,
+        has_api_keys: hasApiKeys,
+      };
+    }));
+    
+    return json({ users, count: users.length });
+    
+  } catch (error) {
+    console.error("[AdminListUsers] Error:", error);
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+}
+
+// Deactivate user - soft delete (disables subscriptions, keeps all data)
+async function handleAdminDeactivateUser(userId: string, env: Env): Promise<Response> {
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+    "Prefer": "return=representation",
+  };
+  
+  try {
+    // Get user info first
+    const profileResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=email`,
+      { headers }
+    );
+    const profiles = await profileResponse.json() as Array<{ email: string }>;
+    
+    if (profiles.length === 0) {
+      return json({ error: "User not found" }, 404);
+    }
+    
+    // Deactivate all subscriptions
+    const response = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ is_active: false }),
+      }
+    );
+    
+    if (!response.ok) {
+      return json({ error: "Failed to deactivate subscriptions", details: await response.text() }, 500);
+    }
+    
+    const deactivated = await response.json() as unknown[];
+    
+    return json({
+      success: true,
+      action: "deactivated",
+      user_id: userId,
+      email: profiles[0].email,
+      subscriptions_deactivated: deactivated.length,
+      message: "User deactivated. All subscriptions disabled. Data preserved.",
+    });
+    
+  } catch (error) {
+    console.error("[AdminDeactivateUser] Error:", error);
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+}
+
+// Reactivate user - re-enables subscriptions
+async function handleAdminReactivateUser(userId: string, env: Env): Promise<Response> {
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+    "Prefer": "return=representation",
+  };
+  
+  try {
+    // Get user info first
+    const profileResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=email`,
+      { headers }
+    );
+    const profiles = await profileResponse.json() as Array<{ email: string }>;
+    
+    if (profiles.length === 0) {
+      return json({ error: "User not found" }, 404);
+    }
+    
+    // Reactivate all subscriptions
+    const response = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ is_active: true }),
+      }
+    );
+    
+    if (!response.ok) {
+      return json({ error: "Failed to reactivate subscriptions", details: await response.text() }, 500);
+    }
+    
+    const reactivated = await response.json() as unknown[];
+    
+    return json({
+      success: true,
+      action: "reactivated",
+      user_id: userId,
+      email: profiles[0].email,
+      subscriptions_reactivated: reactivated.length,
+      message: "User reactivated. All subscriptions enabled.",
+    });
+    
+  } catch (error) {
+    console.error("[AdminReactivateUser] Error:", error);
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+}
+
+// Delete user - hard delete (removes all user data permanently)
+async function handleAdminDeleteUser(userId: string, env: Env): Promise<Response> {
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  
+  try {
+    // Get user info first
+    const profileResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=email`,
+      { headers }
+    );
+    const profiles = await profileResponse.json() as Array<{ email: string }>;
+    
+    if (profiles.length === 0) {
+      return json({ error: "User not found" }, 404);
+    }
+    
+    const email = profiles[0].email;
+    const deletionLog: string[] = [];
+    
+    // 1. Get digest IDs to delete storage files
+    const digestsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&select=id`,
+      { headers }
+    );
+    const digests = await digestsResponse.json() as Array<{ id: string }>;
+    
+    // 2. Delete digest audio files from storage
+    for (const digest of digests) {
+      try {
+        await fetch(
+          `${env.SUPABASE_URL}/storage/v1/object/digests/${digest.id}/digest.mp3`,
+          { method: "DELETE", headers }
+        );
+      } catch {
+        // Storage deletion failures are non-fatal
+      }
+    }
+    deletionLog.push(`Deleted ${digests.length} digest audio files from storage`);
+    
+    // 3. Delete user_api_keys
+    const apiKeysResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${userId}`,
+      { method: "DELETE", headers }
+    );
+    if (apiKeysResponse.ok) {
+      deletionLog.push("Deleted user API keys");
+    }
+    
+    // 4. Delete digests
+    const digestDeleteResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}`,
+      { method: "DELETE", headers }
+    );
+    if (digestDeleteResponse.ok) {
+      deletionLog.push(`Deleted ${digests.length} digests`);
+    }
+    
+    // 5. Delete subscriptions
+    const subsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}`,
+      { method: "DELETE", headers }
+    );
+    if (subsResponse.ok) {
+      deletionLog.push("Deleted subscriptions");
+    }
+    
+    // 6. Delete profile (this removes the user from our system)
+    const profileDeleteResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}`,
+      { method: "DELETE", headers }
+    );
+    if (profileDeleteResponse.ok) {
+      deletionLog.push("Deleted user profile");
+    }
+    
+    // Note: auth.users record remains (managed by Supabase Auth)
+    // To fully delete the auth user, use Supabase Dashboard or Admin API
+    
+    return json({
+      success: true,
+      action: "deleted",
+      user_id: userId,
+      email: email,
+      deletion_log: deletionLog,
+      message: "User data deleted. Note: auth.users record may remain (delete via Supabase Dashboard if needed).",
+    });
+    
+  } catch (error) {
+    console.error("[AdminDeleteUser] Error:", error);
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+}
+
 // Serve the latest digest transcript for ElevenReader
 // URL: /transcript/latest or /transcript/{userId}
 async function handleLatestTranscript(pathname: string, env: Env): Promise<Response> {
@@ -1937,10 +2391,813 @@ https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/${dige
   });
 }
 
-// Daily cron trigger - can be called by Supabase pg_cron or any external scheduler
-// This runs: 1) Poll RSS feeds, 2) Generate digest for users who need one
-// Runs synchronously - pg_net should be configured with 60s+ timeout
+// ============================================
+// ASYNC QUEUE ARCHITECTURE
+// ============================================
+// The async queue system decouples cron triggering from processing:
+// 1. Dispatcher (fast, <1s): Queries users, pushes one message per user to queue
+// 2. Consumer (per-user, 30s each): Processes polling + digest for one user
+// This eliminates timeout issues when processing many users/feeds
+
+// Log pipeline event with user context for debugging
+async function logPipelineEvent(
+  env: Env,
+  userId: string | null,
+  eventType: string,
+  metadata: Record<string, unknown>
+): Promise<void> {
+  try {
+    // Include user_id in details since pipeline_logs doesn't have a user_id column
+    const details = {
+      ...metadata,
+      user_id: userId,
+    };
+    
+    await fetch(
+      `${env.SUPABASE_URL}/rest/v1/pipeline_logs`,
+      {
+        method: "POST",
+        headers: {
+          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          "Content-Type": "application/json",
+          "Prefer": "return=minimal",
+        },
+        body: JSON.stringify({
+          run_id: metadata.run_id || crypto.randomUUID(),
+          step: eventType,
+          status: metadata.status || 'completed',
+          details: details,
+          error: metadata.error || null,
+        }),
+      }
+    );
+  } catch (e) {
+    console.error(`[PipelineEvent] Failed to log ${eventType}:`, e);
+  }
+}
+
+// Dispatcher: Fast function that just queues users (called by cron)
+// This returns in <1 second, avoiding any timeout issues
+async function handleDispatcher(env: Env): Promise<Response> {
+  const runId = crypto.randomUUID();
+  const startTime = Date.now();
+  
+  console.log(`[Dispatcher] Starting dispatch, run_id=${runId}`);
+  await logPipelineEvent(env, null, 'dispatcher_started', {
+    run_id: runId,
+    triggered_at: new Date().toISOString(),
+  });
+  
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  
+  try {
+    // Get all active users
+    const profilesResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?select=id,email,timezone`,
+      { headers }
+    );
+    
+    if (!profilesResponse.ok) {
+      throw new Error("Failed to fetch profiles");
+    }
+    
+    const profiles = await profilesResponse.json() as Array<{
+      id: string;
+      email: string;
+      timezone: string;
+    }>;
+    
+    console.log(`[Dispatcher] Found ${profiles.length} users to queue`);
+    
+    // Queue one message per user
+    const queuedUsers: string[] = [];
+    for (const profile of profiles) {
+      const message: DigestQueueMessage = {
+        user_id: profile.id,
+        triggered_at: new Date().toISOString(),
+        run_id: runId,
+      };
+      
+      await env.DIGEST_QUEUE.send(message);
+      queuedUsers.push(profile.id);
+      
+      await logPipelineEvent(env, profile.id, 'dispatcher_queued_user', {
+        run_id: runId,
+        email: profile.email,
+        timezone: profile.timezone,
+      });
+      
+      console.log(`[Dispatcher] Queued user ${profile.id} (${profile.email})`);
+    }
+    
+    const duration = Date.now() - startTime;
+    await logPipelineEvent(env, null, 'dispatcher_completed', {
+      run_id: runId,
+      users_queued: profiles.length,
+      duration_ms: duration,
+    });
+    
+    console.log(`[Dispatcher] Completed in ${duration}ms, queued ${profiles.length} users`);
+    
+    return json({
+      success: true,
+      status: "dispatched",
+      run_id: runId,
+      users_queued: profiles.length,
+      duration_ms: duration,
+    });
+    
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.error(`[Dispatcher] Error: ${errorMsg}`);
+    
+    await logPipelineEvent(env, null, 'dispatcher_error', {
+      run_id: runId,
+      error: errorMsg,
+      status: 'failed',
+    });
+    
+    return json({
+      success: false,
+      error: errorMsg,
+      run_id: runId,
+    }, 500);
+  }
+}
+
+// Poll subscriptions for a single user (used by queue consumer)
+async function pollSubscriptionsForUser(
+  env: Env,
+  userId: string,
+  runId: string
+): Promise<{
+  subscriptions_polled: number;
+  new_episodes: number;
+  errors: string[];
+}> {
+  const errors: string[] = [];
+  let newEpisodesTotal = 0;
+  
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  
+  await logPipelineEvent(env, userId, 'polling_started', { run_id: runId });
+  
+  // Get user's subscriptions
+  const subscriptionsResponse = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&is_active=eq.true&select=id,feed_url,podcast_title`,
+    { headers }
+  );
+  
+  if (!subscriptionsResponse.ok) {
+    const errorBody = await subscriptionsResponse.text();
+    throw new Error(`Failed to fetch user subscriptions: ${subscriptionsResponse.status} - ${errorBody}`);
+  }
+  
+  const subscriptions = await subscriptionsResponse.json() as Array<{
+    id: string;
+    feed_url: string;
+    podcast_title: string;
+  }>;
+  
+  console.log(`[Poll-${userId.slice(0,8)}] Polling ${subscriptions.length} subscriptions`);
+  
+  for (const sub of subscriptions) {
+    try {
+      // Parse RSS feed
+      const feedResponse = await fetch(sub.feed_url, {
+        headers: { "User-Agent": "Podgest/1.0 (RSS Reader)" },
+      });
+      
+      if (!feedResponse.ok) {
+        errors.push(`${sub.podcast_title}: HTTP ${feedResponse.status}`);
+        await logPipelineEvent(env, userId, 'polling_feed_error', {
+          run_id: runId,
+          subscription_id: sub.id,
+          feed_name: sub.podcast_title,
+          error: `HTTP ${feedResponse.status}`,
+        });
+        continue;
+      }
+      
+      const feedText = await feedResponse.text();
+      
+      // Simple RSS parsing to extract items
+      const items: Array<{
+        title: string;
+        guid: string;
+        pubDate: string;
+        enclosure?: string;
+        description?: string;
+      }> = [];
+      
+      const itemMatches = feedText.match(/<item>[\s\S]*?<\/item>/gi) || [];
+      console.log(`[Poll-${userId.slice(0,8)}] Found ${itemMatches.length} items in ${sub.podcast_title} feed`);
+      for (const itemXml of itemMatches.slice(0, 10)) { // Latest 10 only
+        const title = itemXml.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i)?.[1]?.trim() || "";
+        const guid = itemXml.match(/<guid[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/guid>/i)?.[1]?.trim() || 
+                     itemXml.match(/<link>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/link>/i)?.[1]?.trim() || "";
+        const pubDate = itemXml.match(/<pubDate>([\s\S]*?)<\/pubDate>/i)?.[1]?.trim() || "";
+        // Match both single and double quotes for enclosure URL (consistent with parseRSSFeed)
+        const enclosure = itemXml.match(/<enclosure[^>]*url=["']([^"']+)["']/i)?.[1] || "";
+        const description = itemXml.match(/<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/i)?.[1]?.trim() || "";
+        
+        if (guid && title) {
+          items.push({ title, guid, pubDate, enclosure, description });
+        } else {
+          console.log(`[Poll-${userId.slice(0,8)}] Skipped item: guid=${!!guid}, title=${!!title}, enclosure=${!!enclosure}`);
+        }
+      }
+      
+      console.log(`[Poll-${userId.slice(0,8)}] Parsed ${items.length} valid items with guid+title`);
+      
+      // Check which episodes are new
+      for (const item of items) {
+        // Check if episode exists for THIS feed_url (not globally by guid)
+        // This allows the same episode content to exist in multiple feeds (e.g., direct subscription vs ListenNotes aggregator)
+        const existingResponse = await fetch(
+          `${env.SUPABASE_URL}/rest/v1/episodes?guid=eq.${encodeURIComponent(item.guid)}&feed_url=eq.${encodeURIComponent(sub.feed_url)}&select=id`,
+          { headers }
+        );
+        
+        const existing = await existingResponse.json() as Array<{ id: string }>;
+        
+        if (existing.length === 0 && item.enclosure) {
+          // Check exclusion list
+          if (shouldExcludeEpisode(item.title, item.description || "")) {
+            console.log(`[Poll-${userId.slice(0,8)}] Skipping excluded episode: ${item.title}`);
+            continue;
+          }
+          
+          // Insert new episode
+          const insertResponse = await fetch(
+            `${env.SUPABASE_URL}/rest/v1/episodes`,
+            {
+              method: "POST",
+              headers: { ...headers, "Prefer": "return=representation" },
+              body: JSON.stringify({
+                feed_url: sub.feed_url,  // Use feed_url to match subscription
+                title: item.title,
+                guid: item.guid,
+                audio_url: item.enclosure,
+                published_at: item.pubDate ? new Date(item.pubDate).toISOString() : new Date().toISOString(),
+                description: item.description || null,
+              }),
+            }
+          );
+          
+          if (insertResponse.ok) {
+            newEpisodesTotal++;
+            console.log(`[Poll-${userId.slice(0,8)}] New episode: ${item.title}`);
+          }
+        }
+      }
+      
+      await logPipelineEvent(env, userId, 'polling_feed_success', {
+        run_id: runId,
+        subscription_id: sub.id,
+        feed_name: sub.podcast_title,
+        items_found: items.length,
+      });
+      
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      errors.push(`${sub.podcast_title}: ${errorMsg}`);
+      await logPipelineEvent(env, userId, 'polling_feed_error', {
+        run_id: runId,
+        subscription_id: sub.id,
+        feed_name: sub.podcast_title,
+        error: errorMsg,
+      });
+    }
+  }
+  
+  await logPipelineEvent(env, userId, 'polling_completed', {
+    run_id: runId,
+    subscriptions_polled: subscriptions.length,
+    new_episodes: newEpisodesTotal,
+    errors_count: errors.length,
+  });
+  
+  return {
+    subscriptions_polled: subscriptions.length,
+    new_episodes: newEpisodesTotal,
+    errors,
+  };
+}
+
+// Process digest for a single user (called by queue consumer)
+async function processUserDigest(
+  env: Env,
+  ctx: ExecutionContext,
+  message: DigestQueueMessage
+): Promise<void> {
+  const { user_id, run_id, triggered_at } = message;
+  
+  console.log(`[Consumer-${user_id.slice(0,8)}] Processing digest, run_id=${run_id}`);
+  
+  await logPipelineEvent(env, user_id, 'queue_message_received', {
+    run_id,
+    triggered_at,
+  });
+  
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  
+  // Get user's timezone
+  const profileResponse = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${user_id}&select=timezone`,
+    { headers }
+  );
+  
+  if (!profileResponse.ok) {
+    throw new Error("Failed to fetch user profile");
+  }
+  
+  const profiles = await profileResponse.json() as Array<{ timezone: string }>;
+  if (profiles.length === 0) {
+    throw new Error("User not found");
+  }
+  
+  const timezone = profiles[0].timezone || "America/Mexico_City";
+  const dateFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: timezone });
+  const today = dateFormatter.format(new Date());
+  
+  // Step 1: Check if digest already exists for today
+  const existingResponse = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${user_id}&digest_date=eq.${today}&select=id`,
+    { headers }
+  );
+  
+  const existing = await existingResponse.json() as Array<{ id: string }>;
+  
+  if (existing.length > 0) {
+    console.log(`[Consumer-${user_id.slice(0,8)}] Digest already exists for ${today}, skipping`);
+    await logPipelineEvent(env, user_id, 'digest_skipped', {
+      run_id,
+      reason: 'already_exists',
+      today_date: today,
+    });
+    return;
+  }
+  
+  // Step 2: Poll user's RSS feeds
+  console.log(`[Consumer-${user_id.slice(0,8)}] Polling RSS feeds...`);
+  const pollResult = await pollSubscriptionsForUser(env, user_id, run_id);
+  
+  console.log(`[Consumer-${user_id.slice(0,8)}] Poll complete: ${pollResult.new_episodes} new episodes`);
+  
+  // Step 3: Generate digest
+  console.log(`[Consumer-${user_id.slice(0,8)}] Generating digest...`);
+  await logPipelineEvent(env, user_id, 'digest_generation_started', {
+    run_id,
+    today_date: today,
+  });
+  
+  const result = await generateDigestForUser(env, ctx, user_id, 24);
+  
+  if (result.success) {
+    console.log(`[Consumer-${user_id.slice(0,8)}] Digest generated successfully: ${result.digest_id}`);
+    await logPipelineEvent(env, user_id, 'digest_published', {
+      run_id,
+      digest_id: result.digest_id,
+      today_date: today,
+    });
+  } else {
+    console.error(`[Consumer-${user_id.slice(0,8)}] Digest generation failed: ${result.error}`);
+    await logPipelineEvent(env, user_id, 'digest_generation_failed', {
+      run_id,
+      error: result.error,
+      today_date: today,
+      status: 'failed',
+    });
+    throw new Error(result.error);
+  }
+}
+
+// Queue consumer handler - called by Cloudflare when messages arrive
+async function handleQueueBatch(
+  batch: MessageBatch<DigestQueueMessage>,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<void> {
+  for (const message of batch.messages) {
+    const { user_id, run_id } = message.body;
+    
+    try {
+      await processUserDigest(env, ctx, message.body);
+      message.ack();
+      
+      console.log(`[Queue] Successfully processed message for user ${user_id.slice(0,8)}`);
+      
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.error(`[Queue] Error processing user ${user_id.slice(0,8)}: ${errorMsg}`);
+      
+      await logPipelineEvent(env, user_id, 'queue_message_error', {
+        run_id,
+        attempt: message.attempts,
+        error: errorMsg,
+        status: 'failed',
+      });
+      
+      if (message.attempts >= 3) {
+        // Final failure - will go to dead-letter queue
+        await logPipelineEvent(env, user_id, 'queue_message_failed', {
+          run_id,
+          final_error: errorMsg,
+          attempts: message.attempts,
+          status: 'failed',
+        });
+        console.error(`[Queue] Message for user ${user_id.slice(0,8)} failed after ${message.attempts} attempts`);
+      }
+      
+      message.retry();
+    }
+  }
+}
+
+// Re-queue specific users (used by watchdog to retry failed digests)
+async function handleRequeueUsers(request: Request, env: Env): Promise<Response> {
+  const runId = crypto.randomUUID();
+  
+  try {
+    const body = await request.json() as Array<{ user_id: string; email?: string }>;
+    
+    if (!Array.isArray(body) || body.length === 0) {
+      return json({ error: "Expected array of users with user_id" }, 400);
+    }
+    
+    console.log(`[Requeue] Re-queuing ${body.length} users, run_id=${runId}`);
+    
+    const queuedUsers: string[] = [];
+    for (const user of body) {
+      if (!user.user_id) continue;
+      
+      const message: DigestQueueMessage = {
+        user_id: user.user_id,
+        triggered_at: new Date().toISOString(),
+        run_id: runId,
+      };
+      
+      await env.DIGEST_QUEUE.send(message);
+      queuedUsers.push(user.user_id);
+      
+      await logPipelineEvent(env, user.user_id, 'watchdog_requeued', {
+        run_id: runId,
+        email: user.email,
+      });
+      
+      console.log(`[Requeue] Queued user ${user.user_id}`);
+    }
+    
+    return json({
+      success: true,
+      status: "requeued",
+      run_id: runId,
+      users_queued: queuedUsers.length,
+    });
+    
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.error(`[Requeue] Error: ${errorMsg}`);
+    return json({ error: errorMsg, run_id: runId }, 500);
+  }
+}
+
+// Queue status check - shows recent queue activity
+async function handleQueueStatus(env: Env): Promise<Response> {
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  
+  try {
+    // Get recent pipeline events related to queue
+    const logsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/pipeline_logs?step=in.(dispatcher_started,dispatcher_completed,queue_message_received,queue_message_error,queue_message_failed,digest_published,digest_skipped)&order=created_at.desc&limit=50`,
+      { headers }
+    );
+    
+    if (!logsResponse.ok) {
+      throw new Error("Failed to fetch queue logs");
+    }
+    
+    const logs = await logsResponse.json() as Array<{
+      run_id: string;
+      step: string;
+      status: string;
+      user_id: string | null;
+      details: Record<string, unknown>;
+      created_at: string;
+    }>;
+    
+    // Get today's digest counts
+    const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'UTC' }).format(new Date());
+    const digestsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests?digest_date=eq.${today}&select=user_id,status`,
+      { headers }
+    );
+    
+    const todayDigests = await digestsResponse.json() as Array<{ user_id: string; status: string }>;
+    
+    // Get all users to check who's missing a digest
+    const profilesResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?select=id,email`,
+      { headers }
+    );
+    
+    const profiles = await profilesResponse.json() as Array<{ id: string; email: string }>;
+    
+    const usersWithDigest = new Set(todayDigests.map(d => d.user_id));
+    const missingDigests = profiles.filter(p => !usersWithDigest.has(p.id));
+    
+    return json({
+      queue_configured: !!env.DIGEST_QUEUE,
+      today_date: today,
+      digests_today: todayDigests.length,
+      users_total: profiles.length,
+      users_missing_digest: missingDigests,
+      recent_events: logs.slice(0, 20),
+    });
+    
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    return json({ error: errorMsg }, 500);
+  }
+}
+
+// Test endpoint: Check API key status for a user
+async function handleTestKeyStatus(env: Env, userId: string): Promise<Response> {
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  
+  try {
+    // Get user profile
+    const profileResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,email`,
+      { headers }
+    );
+    
+    const profiles = await profileResponse.json() as Array<{ id: string; email: string }>;
+    
+    if (profiles.length === 0) {
+      return json({ error: "User not found" }, 404);
+    }
+    
+    // Get API key status (encrypted keys and validation status)
+    const keysResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${userId}&select=*`,
+      { headers }
+    );
+    
+    const keysRows = await keysResponse.json() as Array<{
+      openai_key_encrypted: string | null;
+      anthropic_key_encrypted: string | null;
+      elevenlabs_key_encrypted: string | null;
+      openai_valid: boolean;
+      anthropic_valid: boolean;
+      elevenlabs_valid: boolean;
+    }>;
+    
+    const hasKeyRow = keysRows.length > 0;
+    const keyRow = keysRows[0];
+    
+    // Try to decrypt keys to verify they work
+    let decryptionStatus = { openai: 'not_set', anthropic: 'not_set', elevenlabs: 'not_set' };
+    
+    if (hasKeyRow) {
+      if (keyRow.openai_key_encrypted) {
+        try {
+          const key = await decryptApiKey(keyRow.openai_key_encrypted, env.API_KEY_ENCRYPTION_KEY);
+          decryptionStatus.openai = key ? `decrypted (${key.slice(0, 10)}...)` : 'decrypt_failed';
+        } catch (e) {
+          decryptionStatus.openai = `decrypt_error: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      }
+      
+      if (keyRow.anthropic_key_encrypted) {
+        try {
+          const key = await decryptApiKey(keyRow.anthropic_key_encrypted, env.API_KEY_ENCRYPTION_KEY);
+          decryptionStatus.anthropic = key ? `decrypted (${key.slice(0, 15)}...)` : 'decrypt_failed';
+        } catch (e) {
+          decryptionStatus.anthropic = `decrypt_error: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      }
+      
+      if (keyRow.elevenlabs_key_encrypted) {
+        try {
+          const key = await decryptApiKey(keyRow.elevenlabs_key_encrypted, env.API_KEY_ENCRYPTION_KEY);
+          decryptionStatus.elevenlabs = key ? `decrypted (${key.slice(0, 10)}...)` : 'decrypt_failed';
+        } catch (e) {
+          decryptionStatus.elevenlabs = `decrypt_error: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      }
+    }
+    
+    return json({
+      user: profiles[0],
+      has_key_row: hasKeyRow,
+      keys: hasKeyRow ? {
+        openai: {
+          encrypted_length: keyRow.openai_key_encrypted?.length || 0,
+          valid: keyRow.openai_valid,
+          decryption: decryptionStatus.openai,
+        },
+        anthropic: {
+          encrypted_length: keyRow.anthropic_key_encrypted?.length || 0,
+          valid: keyRow.anthropic_valid,
+          decryption: decryptionStatus.anthropic,
+        },
+        elevenlabs: {
+          encrypted_length: keyRow.elevenlabs_key_encrypted?.length || 0,
+          valid: keyRow.elevenlabs_valid,
+          decryption: decryptionStatus.elevenlabs,
+        },
+      } : null,
+    });
+    
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    return json({ error: errorMsg }, 500);
+  }
+}
+
+// Test endpoint: Delete today's digest for a user
+async function handleTestDeleteDigest(env: Env, userId: string): Promise<Response> {
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  
+  try {
+    const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'UTC' }).format(new Date());
+    
+    // Find today's digest for this user
+    const findResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=eq.${today}&select=id,status`,
+      { headers }
+    );
+    
+    const digests = await findResponse.json() as Array<{ id: string; status: string }>;
+    
+    if (digests.length === 0) {
+      return json({ message: "No digest found for today", user_id: userId, date: today });
+    }
+    
+    // Delete the digest
+    const deleteResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests?id=eq.${digests[0].id}`,
+      {
+        method: "DELETE",
+        headers,
+      }
+    );
+    
+    if (!deleteResponse.ok) {
+      return json({ error: "Failed to delete digest" }, 500);
+    }
+    
+    return json({
+      message: "Digest deleted",
+      user_id: userId,
+      date: today,
+      deleted_digest: digests[0],
+    });
+    
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    return json({ error: errorMsg }, 500);
+  }
+}
+
+// Debug endpoint: Show user's subscriptions and available episodes
+async function handleDebugEpisodes(env: Env, userId: string): Promise<Response> {
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+  
+  try {
+    // Get user's subscriptions
+    const subsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&is_active=eq.true&select=id,feed_url,podcast_title`,
+      { headers }
+    );
+    
+    const subscriptions = await subsResponse.json() as Array<{
+      id: string;
+      feed_url: string;
+      podcast_title: string;
+    }>;
+    
+    if (subscriptions.length === 0) {
+      return json({ error: "No subscriptions found", user_id: userId });
+    }
+    
+    const feedUrls = subscriptions.map(s => s.feed_url);
+    const feedUrlFilter = feedUrls.map(u => `"${u}"`).join(",");
+    
+    // Get ALL episodes from those feeds (no date filter)
+    const episodesResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/episodes?feed_url=in.(${feedUrlFilter})&select=id,title,feed_url,published_at,created_at&order=created_at.desc&limit=20`,
+      { headers }
+    );
+    
+    const episodes = await episodesResponse.json() as Array<{
+      id: string;
+      title: string;
+      feed_url: string;
+      published_at: string;
+      created_at: string;
+    }>;
+    
+    // Get already covered episodes
+    const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const digestsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=gte.${weekAgo}&select=id,digest_date,episodes_included`,
+      { headers }
+    );
+    
+    const recentDigests = await digestsResponse.json() as Array<{
+      id: string;
+      digest_date: string;
+      episodes_included: string[];
+    }>;
+    
+    const coveredEpisodeIds = new Set<string>();
+    for (const d of recentDigests) {
+      for (const epId of (d.episodes_included || [])) {
+        coveredEpisodeIds.add(epId);
+      }
+    }
+    
+    return json({
+      user_id: userId,
+      subscriptions: subscriptions.map(s => ({
+        podcast: s.podcast_title,
+        feed_url: s.feed_url,
+      })),
+      episodes_in_db: episodes.map(e => ({
+        id: e.id,
+        title: e.title.slice(0, 60) + (e.title.length > 60 ? '...' : ''),
+        feed_url: e.feed_url,
+        published_at: e.published_at,
+        created_at: e.created_at,
+        already_covered: coveredEpisodeIds.has(e.id),
+      })),
+      recent_digests: recentDigests.map(d => ({
+        id: d.id,
+        date: d.digest_date,
+        episodes_count: (d.episodes_included || []).length,
+      })),
+      summary: {
+        subscription_count: subscriptions.length,
+        total_episodes: episodes.length,
+        covered_episodes: coveredEpisodeIds.size,
+        recent_digest_count: recentDigests.length,
+      }
+    });
+    
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    return json({ error: errorMsg }, 500);
+  }
+}
+
+// Daily cron trigger - now routes to dispatcher (async) or legacy (sync)
+// The dispatcher is preferred as it avoids timeout issues
 async function handleDailyCron(env: Env, ctx: ExecutionContext): Promise<Response> {
+  // If queue is configured, use async dispatcher
+  if (env.DIGEST_QUEUE) {
+    console.log("[DailyCron] Using async queue dispatcher");
+    return handleDispatcher(env);
+  }
+  
+  // Legacy synchronous mode (fallback if queues not configured)
+  console.log("[DailyCron] Using legacy synchronous mode (no queue configured)");
+  return handleLegacyDailyCron(env, ctx);
+}
+
+// Legacy synchronous cron handler (kept for backwards compatibility)
+async function handleLegacyDailyCron(env: Env, ctx: ExecutionContext): Promise<Response> {
   const startTime = new Date().toISOString();
   const logger = createPipelineLogger(env);
   
@@ -2312,7 +3569,7 @@ async function handleScheduledDigest(env: Env): Promise<Response> {
           
           // Call the generate endpoint internally
           const generateResponse = await fetch(
-            `https://podgest-api.pztest.workers.dev/api/generate-digest`,
+            `https://api.podgest.app/api/generate-digest`,
             {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -2370,7 +3627,10 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     const body = await request.json() as { 
       user_id?: string; 
       hours_back?: number;
+      force?: boolean;  // Skip "already covered" check
     };
+    
+    const forceGenerate = body.force === true;
     
     const headers = {
       "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2381,8 +3641,22 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     const hoursBack = body.hours_back || 24;
     const userId = body.user_id || "00000000-0000-0000-0000-000000000000";
     
-    // Fixed at 5 minutes for now (avoids Cloudflare Worker CPU limits)
-    const maxLengthMinutes = 5;
+    // Fetch user's digest length preference (default 5 minutes)
+    let maxLengthMinutes = 5;
+    try {
+      const profileResponse = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=digest_length_minutes`,
+        { headers }
+      );
+      if (profileResponse.ok) {
+        const profiles = await profileResponse.json() as Array<{ digest_length_minutes?: number }>;
+        if (profiles.length > 0 && profiles[0].digest_length_minutes) {
+          maxLengthMinutes = profiles[0].digest_length_minutes;
+        }
+      }
+    } catch (e) {
+      console.log(`[Digest] Could not fetch digest length preference, using default ${maxLengthMinutes} minutes`);
+    }
     
     console.log(`[Digest] Generating ${maxLengthMinutes}-minute digest for last ${hoursBack} hours`);
     
@@ -2436,11 +3710,46 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     }
     console.log(`[Digest] Found ${alreadyCoveredEpisodes.size} episodes already covered in recent digests`);
     
-    // 2. Fetch recent episodes with their topic extractions
+    // 2. Get THIS USER's subscriptions first - only include episodes from podcasts they subscribe to
+    const userSubscriptionsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&is_active=eq.true&select=feed_url,podcast_title,publication_frequency_days`,
+      { headers }
+    );
+    
+    if (!userSubscriptionsResponse.ok) {
+      return json({ error: "Failed to fetch user subscriptions" }, 500);
+    }
+    
+    const userSubscriptions = await userSubscriptionsResponse.json() as Array<{ 
+      feed_url: string; 
+      podcast_title: string;
+      publication_frequency_days: number | null;
+    }>;
+    
+    if (userSubscriptions.length === 0) {
+      return json({ error: "No active subscriptions found for user" }, 404);
+    }
+    
+    // Build maps of user's subscribed feed URLs, podcast names, and frequencies
+    const userFeedUrls = new Set(userSubscriptions.map(s => s.feed_url));
+    const podcastNames = new Map<string, string>();
+    const podcastFrequencies = new Map<string, number>();
+    for (const sub of userSubscriptions) {
+      podcastNames.set(sub.feed_url, sub.podcast_title);
+      // Default to 1 (daily) if unknown, so we don't over-prioritize unknown podcasts
+      podcastFrequencies.set(sub.feed_url, sub.publication_frequency_days ?? 1);
+    }
+    
+    console.log(`[Digest] User has ${userSubscriptions.length} active subscriptions`);
+    
+    // 3. Fetch recent episodes ONLY from user's subscribed feeds
     const cutoffDate = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
     
+    // Build feed URL filter for the query
+    const feedUrlFilter = [...userFeedUrls].map(u => `"${u}"`).join(",");
+    
     const episodesResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/episodes?created_at=gte.${cutoffDate}&select=id,title,description,published_at,feed_url`,
+      `${env.SUPABASE_URL}/rest/v1/episodes?created_at=gte.${cutoffDate}&feed_url=in.(${feedUrlFilter})&select=id,title,description,published_at,feed_url`,
       { headers }
     );
     
@@ -2456,23 +3765,15 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
       feed_url: string;
     }>;
     
-    // Get podcast names from subscriptions for citation
-    const feedUrls = [...new Set(episodes.map(e => e.feed_url))];
-    const subscriptionsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/subscriptions?feed_url=in.(${feedUrls.map(u => `"${u}"`).join(",")})&select=feed_url,podcast_title`,
-      { headers }
-    );
-    const podcastNames = new Map<string, string>();
-    if (subscriptionsResponse.ok) {
-      const subs = await subscriptionsResponse.json() as Array<{ feed_url: string; podcast_title: string }>;
-      for (const sub of subs) {
-        podcastNames.set(sub.feed_url, sub.podcast_title);
-      }
-    }
+    console.log(`[Digest] Found ${episodes.length} episodes from user's subscriptions`);
     
-    // Filter out episodes already covered in recent digests
+    // Filter out episodes already covered in recent digests (unless force=true)
     const originalCount = episodes.length;
-    episodes = episodes.filter(ep => !alreadyCoveredEpisodes.has(ep.id));
+    if (!forceGenerate) {
+      episodes = episodes.filter(ep => !alreadyCoveredEpisodes.has(ep.id));
+    } else {
+      console.log(`[Digest] Force mode: skipping already-covered filter`);
+    }
     
     // Filter out excluded content creators (e.g., Peter Zeihan)
     const beforeExclusion = episodes.length;
@@ -2490,6 +3791,23 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
         hours_back: hoursBack,
         already_covered: originalCount
       }, 404);
+    }
+    
+    // Sort episodes by priority weight (less frequent podcasts get higher priority)
+    // Weight = publication_frequency_days (weekly=7 gets higher weight than daily=1)
+    episodes.sort((a, b) => {
+      const freqA = podcastFrequencies.get(a.feed_url) ?? 1;
+      const freqB = podcastFrequencies.get(b.feed_url) ?? 1;
+      // Higher frequency days = less frequent = higher priority
+      return freqB - freqA;
+    });
+    
+    // Log episode order for debugging
+    console.log(`[Digest] Episode order by priority:`);
+    for (const ep of episodes.slice(0, 5)) {
+      const freq = podcastFrequencies.get(ep.feed_url) ?? 1;
+      const name = podcastNames.get(ep.feed_url) || "Unknown";
+      console.log(`  - ${name}: ${ep.title.substring(0, 40)}... (freq: ${freq} days)`);
     }
     
     console.log(`[Digest] Found ${episodes.length} episodes`);
@@ -2605,7 +3923,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
             supabase_url: env.SUPABASE_URL,
             supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
             digest_id: digestId,
-            webhook_url: "https://podgest-api.pztest.workers.dev/api/webhooks/tts",
+            webhook_url: "https://api.podgest.app/api/webhooks/tts",
           }),
         }
       ).then(res => console.log(`[Digest] OpenAI TTS triggered: ${res.status}`))
@@ -2776,7 +4094,7 @@ Topics: ${ep.topics.join(", ")}`
 // RSS FEED FOR SPOTIFY
 // ============================================
 
-async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
+async function handleRSSFeed(userId: string, env: Env, baseUrl?: string): Promise<Response> {
   try {
     const headers = {
       "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2826,8 +4144,9 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
       completed_at: string;
     }>;
     
-    // Build RSS XML
-    const feedUrl = `https://podgest-api.pztest.workers.dev/feed/${userId}.xml`;
+    // Build RSS XML - use the actual request URL for self-references
+    const feedBaseUrl = baseUrl || "https://api.podgest.app";
+    const feedUrl = `${feedBaseUrl}/feed/${userId}.xml`;
     const now = new Date().toUTCString();
     const coverImage = "https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/cover.png";
     const welcomeAudio = "https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/welcome.mp3";
@@ -2843,6 +4162,8 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
         { headers }
       );
       
+      let hasWelcomeEpisode = false;
+      
       if (welcomeResponse.ok) {
         const welcomeDigests = await welcomeResponse.json() as Array<{
           id: string;
@@ -2854,6 +4175,7 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
         }>;
         
         if (welcomeDigests.length > 0) {
+          hasWelcomeEpisode = true;
           const welcome = welcomeDigests[0];
           const welcomeDate = new Date(welcome.completed_at).toUTCString();
           const description = welcome.script_text || "Welcome to Podgest! Your first real digest arrives tomorrow morning.";
@@ -2884,6 +4206,25 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
       <itunes:summary>Your first daily digest arrives tomorrow morning!</itunes:summary>
     </item>`);
         }
+      }
+      
+      // If no welcome episode exists, add a placeholder so the feed isn't empty
+      if (!hasWelcomeEpisode) {
+        const placeholderDate = new Date().toUTCString();
+        // Use a static placeholder GUID based on user ID so it's consistent
+        const placeholderGuid = `placeholder-${userId}`;
+        
+        items.push(`
+    <item>
+      <title><![CDATA[Welcome to Podgest, ${userName}!]]></title>
+      <description><![CDATA[Your personalized podcast digest is being set up. Add some podcasts and configure your API keys at dash.podgest.app, then your first digest will arrive tomorrow morning at 6 AM!]]></description>
+      <pubDate>${placeholderDate}</pubDate>
+      <guid isPermaLink="false">${placeholderGuid}</guid>
+      <itunes:duration>0:00</itunes:duration>
+      <itunes:explicit>no</itunes:explicit>
+      <itunes:episodeType>trailer</itunes:episodeType>
+      <itunes:summary>Your first daily digest arrives tomorrow morning! Set up your podcasts at dash.podgest.app</itunes:summary>
+    </item>`);
       }
     }
     
@@ -2919,9 +4260,8 @@ async function handleRSSFeed(userId: string, env: Env): Promise<Response> {
     </item>`);
     }
     
-    const feedTitle = digests.length === 0 
-      ? `Podgest - ${userName}'s Daily Digest`
-      : "Podgest Daily Digest";
+    // Always include user's name in title for uniqueness on Spotify/podcast platforms
+    const feedTitle = `Podgest - ${userName}'s Daily Digest`;
     
     const rss = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" 
@@ -2967,6 +4307,87 @@ ${items.join("\n")}
   } catch (error) {
     console.error("[RSS] Error:", error);
     return new Response("Internal error", { status: 500 });
+  }
+}
+
+// Handle OG preview for social media crawlers hitting RSS feed URLs
+async function handleFeedOGPreview(userId: string, env: Env, baseUrl: string): Promise<Response> {
+  try {
+    const headers = {
+      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+    };
+    
+    // Get user profile for personalization
+    const profileResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,email,display_name`,
+      { headers }
+    );
+    
+    let userName = "Your";
+    if (profileResponse.ok) {
+      const profiles = await profileResponse.json() as Array<{ id: string; email?: string; display_name?: string }>;
+      if (profiles.length > 0) {
+        if (profiles[0].display_name) {
+          userName = profiles[0].display_name.split(' ')[0] + "'s";
+        } else if (profiles[0].email) {
+          const emailPart = profiles[0].email.split('@')[0];
+          const firstName = emailPart.split(/[._0-9]/)[0];
+          if (firstName && firstName.length > 1) {
+            userName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase() + "'s";
+          }
+        }
+      }
+    }
+    
+    const feedUrl = `${baseUrl}/feed/${userId}.xml`;
+    const ogImage = "https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/og-image.png";
+    const title = `Podgest - ${userName} AI Podcast Digest`;
+    const description = "Personalized daily podcast digest, powered by AI. Never miss the highlights from your favorite shows.";
+    
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>${title}</title>
+  <meta name="description" content="${description}">
+  
+  <!-- Open Graph -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Podgest">
+  <meta property="og:title" content="${title}">
+  <meta property="og:description" content="${description}">
+  <meta property="og:image" content="${ogImage}">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:url" content="${feedUrl}">
+  
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="${title}">
+  <meta name="twitter:description" content="${description}">
+  <meta name="twitter:image" content="${ogImage}">
+  
+  <!-- Redirect non-crawlers to the actual feed -->
+  <meta http-equiv="refresh" content="0;url=${feedUrl}">
+</head>
+<body>
+  <p>Redirecting to podcast feed...</p>
+  <p><a href="${feedUrl}">${title}</a></p>
+</body>
+</html>`;
+    
+    return new Response(html, {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "public, max-age=300",
+      },
+    });
+  } catch (error) {
+    console.error("[FeedOG] Error:", error);
+    // Fall back to RSS feed on error
+    return handleRSSFeed(userId, env, baseUrl);
   }
 }
 
@@ -3063,36 +4484,33 @@ async function handleValidateKey(request: Request): Promise<Response> {
       return json({ valid: false, error: "key_type and key are required" }, 400);
     }
     
-    let valid = false;
-    let error: string | undefined;
+    let result: { valid: boolean; error?: string; errorCode?: string };
     
     switch (body.key_type) {
       case 'openai':
-        valid = await validateOpenAIKey(body.key);
-        if (!valid) error = "Invalid OpenAI API key";
+        result = await validateOpenAIKeyDetailed(body.key);
         break;
         
       case 'anthropic':
-        valid = await validateAnthropicKey(body.key);
-        if (!valid) error = "Invalid Anthropic API key";
+        result = await validateAnthropicKeyDetailed(body.key);
         break;
         
       case 'elevenlabs':
-        valid = await validateElevenLabsKey(body.key);
-        if (!valid) error = "Invalid ElevenLabs API key";
+        result = await validateElevenLabsKeyDetailed(body.key);
         break;
         
       default:
         return json({ valid: false, error: `Invalid key_type: ${body.key_type}` }, 400);
     }
     
-    return json({ valid, error });
+    return json(result);
     
   } catch (error) {
     console.error("[ValidateKey] Error:", error);
     return json({ 
       valid: false, 
-      error: error instanceof Error ? error.message : "Validation failed" 
+      error: error instanceof Error ? error.message : "Validation failed",
+      errorCode: 'unknown'
     }, 500);
   }
 }
@@ -3143,6 +4561,29 @@ async function handleSaveUserKey(request: Request, env: Env): Promise<Response> 
       return json({ error: "key is required" }, 400);
     }
     
+    // Validate the key before saving
+    let validationResult: { valid: boolean; error?: string; errorCode?: string };
+    switch (body.key_type) {
+      case 'openai':
+        validationResult = await validateOpenAIKeyDetailed(body.key);
+        break;
+      case 'anthropic':
+        validationResult = await validateAnthropicKeyDetailed(body.key);
+        break;
+      case 'elevenlabs':
+        validationResult = await validateElevenLabsKeyDetailed(body.key);
+        break;
+      default:
+        return json({ error: `Invalid key_type: ${body.key_type}` }, 400);
+    }
+    
+    if (!validationResult.valid) {
+      return json({ 
+        error: validationResult.error || "Invalid API key",
+        errorCode: validationResult.errorCode
+      }, 400);
+    }
+    
     // Encrypt the plaintext key
     const encryptedKey = await encryptApiKey(body.key, env.API_KEY_ENCRYPTION_KEY);
     
@@ -3185,7 +4626,7 @@ async function handleSaveUserKey(request: Request, env: Env): Promise<Response> 
     
     const updateData: Record<string, unknown> = {
       [column]: encryptedKey,
-      [validColumn]: true,  // Mark as valid since user just provided it
+      [validColumn]: true,  // Key was validated above
       [validatedAtColumn]: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
@@ -3235,6 +4676,113 @@ async function handleSaveUserKey(request: Request, env: Env): Promise<Response> 
     console.error("[SaveUserKey] Error:", error);
     return json({ 
       error: error instanceof Error ? error.message : "Failed to save key" 
+    }, 500);
+  }
+}
+
+// ============================================
+// FEED PARSING & LISTENNOTES DETECTION
+// ============================================
+
+interface ParsedPodcast {
+  title: string;
+  feed_url: string;
+  artwork_url?: string;
+  publication_frequency_days: number | null;
+}
+
+async function handleParseFeed(request: Request, env: Env): Promise<Response> {
+  try {
+    const body = await request.json() as { feed_url: string };
+    const { feed_url } = body;
+    
+    if (!feed_url) {
+      return json({ error: "feed_url is required" }, 400);
+    }
+    
+    console.log(`[ParseFeed] Parsing: ${feed_url}`);
+    
+    // Parse the RSS feed
+    const feed = await parseRSSFeed(feed_url);
+    
+    // Calculate publication frequency for this feed
+    const publicationFrequency = calculateFrequencyFromRSS(feed.episodes);
+    
+    // Check if this is a ListenNotes aggregator feed by looking for ListenNotes patterns in episodes
+    const detectedPodcasts = new Map<string, ParsedPodcast>();
+    let isAggregator = false;
+    
+    for (const episode of feed.episodes) {
+      const description = episode.description || "";
+      
+      // Check for ListenNotes pattern in description
+      const podcastUrlMatch = description.match(/<strong>Podcast<\/strong>:\s*<a\s+href="(https:\/\/www\.listennotes\.com\/podcasts\/[^"]+)"[^>]*>([^<]+)<\/a>/i);
+      
+      if (podcastUrlMatch) {
+        isAggregator = true;
+        const listenNotesUrl = podcastUrlMatch[1];
+        const podcastName = podcastUrlMatch[2].trim();
+        
+        // Skip if we already have this podcast
+        if (detectedPodcasts.has(listenNotesUrl)) continue;
+        
+        console.log(`[ParseFeed] Detected podcast: ${podcastName} (${listenNotesUrl})`);
+        
+        // Try to get the original RSS URL from the ListenNotes page
+        let originalRssUrl: string | null = null;
+        try {
+          originalRssUrl = await fetchOriginalRssUrl(listenNotesUrl);
+        } catch (e) {
+          console.warn(`[ParseFeed] Could not fetch RSS URL for ${podcastName}`);
+        }
+        
+        if (originalRssUrl) {
+          // Parse the original feed to get its frequency
+          let originalFrequency: number | null = null;
+          let artworkUrl: string | undefined;
+          try {
+            const originalFeed = await parseRSSFeed(originalRssUrl);
+            originalFrequency = calculateFrequencyFromRSS(originalFeed.episodes);
+            artworkUrl = originalFeed.artwork_url;
+          } catch (e) {
+            console.warn(`[ParseFeed] Could not parse original feed for ${podcastName}`);
+          }
+          
+          detectedPodcasts.set(listenNotesUrl, {
+            title: podcastName,
+            feed_url: originalRssUrl,
+            artwork_url: artworkUrl,
+            publication_frequency_days: originalFrequency,
+          });
+        } else {
+          // If we can't get the RSS URL, store what we have
+          detectedPodcasts.set(listenNotesUrl, {
+            title: podcastName,
+            feed_url: listenNotesUrl, // This won't work for RSS polling, but shows the podcast
+            publication_frequency_days: null,
+          });
+        }
+      }
+    }
+    
+    const result = {
+      feed_title: feed.title,
+      feed_url: feed_url,
+      artwork_url: feed.artwork_url,
+      episode_count: feed.episodes.length,
+      publication_frequency_days: publicationFrequency,
+      is_aggregator: isAggregator,
+      detected_podcasts: isAggregator ? Array.from(detectedPodcasts.values()) : [],
+    };
+    
+    console.log(`[ParseFeed] Result: ${result.feed_title}, ${result.episode_count} episodes, aggregator: ${isAggregator}, detected: ${result.detected_podcasts.length}`);
+    
+    return json(result);
+    
+  } catch (error) {
+    console.error("[ParseFeed] Error:", error);
+    return json({ 
+      error: error instanceof Error ? error.message : "Failed to parse feed" 
     }, 500);
   }
 }

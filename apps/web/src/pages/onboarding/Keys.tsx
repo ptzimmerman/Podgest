@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../../lib/supabase'
 
-const API_URL = import.meta.env.VITE_API_URL || 'https://podgest-api.pztest.workers.dev'
+const API_URL = import.meta.env.VITE_API_URL || 'https://api.podgest.app'
 
 export function OnboardingKeys() {
   const navigate = useNavigate()

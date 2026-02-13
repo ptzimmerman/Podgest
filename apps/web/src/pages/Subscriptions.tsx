@@ -7,6 +7,24 @@ type Subscription = {
   feed_url: string
   is_active: boolean
   priority: number
+  publication_frequency_days?: number | null
+}
+
+type ParsedPodcast = {
+  title: string
+  feed_url: string
+  artwork_url?: string
+  publication_frequency_days: number | null
+}
+
+type ParseFeedResponse = {
+  feed_title: string
+  feed_url: string
+  artwork_url?: string
+  episode_count: number
+  publication_frequency_days: number | null
+  is_aggregator: boolean
+  detected_podcasts: ParsedPodcast[]
 }
 
 export function Subscriptions() {
@@ -15,6 +33,17 @@ export function Subscriptions() {
   const [loading, setLoading] = useState(true)
   const [adding, setAdding] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [toastVisible, setToastVisible] = useState(false)
+  
+  // Show toast with auto-dismiss
+  const showToast = (type: 'success' | 'error', text: string) => {
+    setMessage({ type, text })
+    setToastVisible(true)
+    setTimeout(() => {
+      setToastVisible(false)
+      setTimeout(() => setMessage(null), 300)
+    }, type === 'error' ? 5000 : 3000) // Errors stay longer
+  }
 
   useEffect(() => {
     fetchSubscriptions()
@@ -27,7 +56,7 @@ export function Subscriptions() {
 
       const { data, error } = await supabase
         .from('subscriptions')
-        .select('id, podcast_title, feed_url, is_active, priority')
+        .select('id, podcast_title, feed_url, is_active, priority, publication_frequency_days')
         .eq('user_id', session.user.id)
         .order('priority', { ascending: false })
 
@@ -35,7 +64,7 @@ export function Subscriptions() {
       setSubscriptions(data || [])
     } catch (err) {
       console.error('Error fetching subscriptions:', err)
-      setMessage({ type: 'error', text: 'Failed to load subscriptions' })
+      showToast('error', 'Failed to load subscriptions')
     } finally {
       setLoading(false)
     }
@@ -45,48 +74,99 @@ export function Subscriptions() {
     if (!newFeedUrl) return
 
     setAdding(true)
-    setMessage(null)
 
     try {
       const { data: { session } } = await supabase.auth.getSession()
       if (!session) throw new Error('Not authenticated')
 
-      // Try to fetch the feed to get the title
-      let title = 'Unknown Podcast'
-      try {
-        const proxyUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(newFeedUrl)}`
-        const res = await fetch(proxyUrl)
-        if (res.ok) {
-          const data = await res.json()
-          title = data.feed?.title || 'Unknown Podcast'
-        }
-      } catch {
-        // Use URL as fallback title
-        title = new URL(newFeedUrl).hostname
+      // Use our parse-feed endpoint to analyze the feed
+      const apiUrl = import.meta.env.VITE_API_URL || 'https://api.podgest.app'
+      const parseRes = await fetch(`${apiUrl}/api/parse-feed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ feed_url: newFeedUrl }),
+      })
+      
+      if (!parseRes.ok) {
+        const err = await parseRes.json() as { error?: string }
+        throw new Error(err.error || 'Failed to parse feed')
       }
-
-      const { error } = await supabase
-        .from('subscriptions')
-        .insert({
-          user_id: session.user.id,
-          feed_url: newFeedUrl,
-          podcast_title: title,
-          is_active: true,
-          priority: 1,
-        })
-
-      if (error) {
-        if (error.code === '23505') {
-          throw new Error('You are already subscribed to this podcast')
+      
+      const feedData = await parseRes.json() as ParseFeedResponse
+      
+      // If it's an aggregator (like ListenNotes Listen Later), add all detected podcasts
+      if (feedData.is_aggregator && feedData.detected_podcasts.length > 0) {
+        let addedCount = 0
+        let skippedCount = 0
+        
+        for (const podcast of feedData.detected_podcasts) {
+          // Skip podcasts where we couldn't get the original RSS URL
+          if (podcast.feed_url.includes('listennotes.com')) {
+            skippedCount++
+            continue
+          }
+          
+          const { error } = await supabase
+            .from('subscriptions')
+            .insert({
+              user_id: session.user.id,
+              feed_url: podcast.feed_url,
+              podcast_title: podcast.title,
+              artwork_url: podcast.artwork_url,
+              publication_frequency_days: podcast.publication_frequency_days,
+              is_active: true,
+              priority: 1,
+            })
+          
+          if (error) {
+            if (error.code === '23505') {
+              // Already subscribed, skip
+              skippedCount++
+              continue
+            }
+            console.error(`Failed to add ${podcast.title}:`, error)
+          } else {
+            addedCount++
+          }
         }
-        throw error
-      }
+        
+        setNewFeedUrl('')
+        if (addedCount > 0) {
+          showToast('success', `Added ${addedCount} podcast${addedCount > 1 ? 's' : ''} from aggregator feed${skippedCount > 0 ? ` (${skippedCount} skipped)` : ''}`)
+        } else {
+          showToast('error', 'No new podcasts to add (already subscribed or could not resolve RSS URLs)')
+        }
+      } else {
+        // Regular feed - add single subscription
+        const { error } = await supabase
+          .from('subscriptions')
+          .insert({
+            user_id: session.user.id,
+            feed_url: feedData.feed_url,
+            podcast_title: feedData.feed_title,
+            artwork_url: feedData.artwork_url,
+            publication_frequency_days: feedData.publication_frequency_days,
+            is_active: true,
+            priority: 1,
+          })
 
-      setNewFeedUrl('')
-      setMessage({ type: 'success', text: `Added: ${title}` })
+        if (error) {
+          if (error.code === '23505') {
+            throw new Error('You are already subscribed to this podcast')
+          }
+          throw error
+        }
+
+        setNewFeedUrl('')
+        const freqText = feedData.publication_frequency_days 
+          ? ` (publishes every ${feedData.publication_frequency_days.toFixed(1)} days)`
+          : ''
+        showToast('success', `Added: ${feedData.feed_title}${freqText}`)
+      }
+      
       await fetchSubscriptions()
     } catch (err) {
-      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to add podcast' })
+      showToast('error', err instanceof Error ? err.message : 'Failed to add podcast')
     } finally {
       setAdding(false)
     }
@@ -102,7 +182,7 @@ export function Subscriptions() {
       if (error) throw error
       await fetchSubscriptions()
     } catch (err) {
-      setMessage({ type: 'error', text: 'Failed to update subscription' })
+      showToast('error', 'Failed to update subscription')
     }
   }
 
@@ -116,10 +196,10 @@ export function Subscriptions() {
         .eq('id', id)
 
       if (error) throw error
-      setMessage({ type: 'success', text: `Removed: ${title}` })
+      showToast('success', `Removed: ${title}`)
       await fetchSubscriptions()
     } catch (err) {
-      setMessage({ type: 'error', text: 'Failed to remove subscription' })
+      showToast('error', 'Failed to remove subscription')
     }
   }
 
@@ -140,9 +220,29 @@ export function Subscriptions() {
         </p>
       </div>
 
+      {/* Toast notification */}
       {message && (
-        <div className={`p-4 rounded-lg ${message.type === 'success' ? 'bg-green-50 dark:bg-green-900/30 text-green-800 dark:text-green-300 border border-green-200 dark:border-green-800' : 'bg-red-50 dark:bg-red-900/30 text-red-800 dark:text-red-300 border border-red-200 dark:border-red-800'}`}>
-          {message.text}
+        <div 
+          className={`fixed top-4 left-1/2 -translate-x-1/2 z-50 px-6 py-3 rounded-lg shadow-lg transition-all duration-300 ease-out ${
+            toastVisible ? 'translate-y-0 opacity-100' : '-translate-y-full opacity-0'
+          } ${
+            message.type === 'success' 
+              ? 'bg-green-600 text-white' 
+              : 'bg-red-600 text-white'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            {message.type === 'success' ? (
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              </svg>
+            ) : (
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            )}
+            {message.text}
+          </div>
         </div>
       )}
 
@@ -255,8 +355,58 @@ export function Subscriptions() {
           ].map((feed) => (
             <button
               key={feed.url}
-              onClick={() => setNewFeedUrl(feed.url)}
-              className="text-left px-3 py-2 rounded-lg hover:bg-gray-100 text-gray-600 hover:text-gray-900 transition-colors"
+              onClick={async () => {
+                setNewFeedUrl(feed.url)
+                // Auto-add after setting URL
+                setAdding(true)
+                try {
+                  const { data: { session } } = await supabase.auth.getSession()
+                  if (!session) throw new Error('Not authenticated')
+                  
+                  const apiUrl = import.meta.env.VITE_API_URL || 'https://api.podgest.app'
+                  const parseRes = await fetch(`${apiUrl}/api/parse-feed`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ feed_url: feed.url }),
+                  })
+                  
+                  if (!parseRes.ok) {
+                    const err = await parseRes.json() as { error?: string }
+                    throw new Error(err.error || 'Failed to parse feed')
+                  }
+                  
+                  const feedData = await parseRes.json() as ParseFeedResponse
+                  
+                  const { error } = await supabase
+                    .from('subscriptions')
+                    .insert({
+                      user_id: session.user.id,
+                      feed_url: feedData.feed_url,
+                      podcast_title: feed.name,
+                      artwork_url: feedData.artwork_url,
+                      publication_frequency_days: feedData.publication_frequency_days,
+                      is_active: true,
+                      priority: 1,
+                    })
+
+                  if (error) {
+                    if (error.code === '23505') {
+                      throw new Error('Already subscribed')
+                    }
+                    throw error
+                  }
+
+                  setNewFeedUrl('')
+                  showToast('success', `Added: ${feed.name}`)
+                  await fetchSubscriptions()
+                } catch (err) {
+                  showToast('error', err instanceof Error ? err.message : 'Failed to add')
+                } finally {
+                  setAdding(false)
+                }
+              }}
+              disabled={adding}
+              className="text-left px-3 py-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 dark:hover:text-indigo-300 transition-colors disabled:opacity-50"
             >
               + {feed.name}
             </button>
