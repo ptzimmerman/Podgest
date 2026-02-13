@@ -4783,8 +4783,8 @@ async function handleValidateKey(request: Request): Promise<Response> {
     if (body.key_type === 'openai' && !key.startsWith('sk-')) {
       return json({ valid: false, error: "OpenAI keys should start with 'sk-'", errorCode: 'invalid_key' }, 400);
     }
-    if (body.key_type === 'anthropic' && !key.startsWith('sk-ant-')) {
-      return json({ valid: false, error: "Anthropic keys should start with 'sk-ant-'", errorCode: 'invalid_key' }, 400);
+    if (body.key_type === 'anthropic' && !key.startsWith('sk-')) {
+      return json({ valid: false, error: "Anthropic keys should start with 'sk-'", errorCode: 'invalid_key' }, 400);
     }
     
     let result: { valid: boolean; error?: string; errorCode?: string };
