@@ -77,7 +77,8 @@ export async function getUserApiKeys(
 
     if (!response.ok) {
       const error = await response.text();
-      throw new Error(`Failed to fetch user API keys: ${error}`);
+      console.error(`[UserKeys] Supabase error fetching keys:`, error);
+      throw new Error('Failed to fetch user API keys');
     }
 
     const rows = await response.json() as UserApiKeysRow[];
