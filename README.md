@@ -74,6 +74,7 @@ flowchart TB
 | **🎯 Smart Prioritization** | Less frequent podcasts (weekly shows) get priority over daily ones |
 | **🔐 BYOK (Bring Your Own Keys)** | Use your own OpenAI, Anthropic, and ElevenLabs API keys |
 | **🔒 Encrypted Storage** | API keys encrypted at rest with AES-256-GCM |
+| **🧠 Semantic Memory** | All transcripts embedded via pgvector - search and query across your entire podcast history |
 | **👥 Multi-tenant** | Each user has isolated data and personalized digests |
 | **🎙️ MCP Server** | Query your podcast knowledge via Claude Desktop or Cursor |
 
