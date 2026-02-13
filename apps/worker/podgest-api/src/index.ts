@@ -1179,6 +1179,65 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+/**
+ * Verify a Supabase JWT token by calling the Supabase Auth API.
+ * This validates the token's signature, expiry, and returns the authenticated user ID.
+ * 
+ * SECURITY: Never trust client-provided JWTs by just decoding them (atob).
+ * The signature MUST be verified to prevent token forgery.
+ * 
+ * @returns The authenticated user ID, or null if the token is invalid.
+ */
+async function verifySupabaseToken(
+  token: string,
+  env: Env
+): Promise<{ userId: string; email?: string } | null> {
+  try {
+    const response = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+        'Authorization': `Bearer ${token}`,
+      },
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const user = await response.json() as { id?: string; email?: string };
+    if (!user.id) {
+      return null;
+    }
+
+    return { userId: user.id, email: user.email };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract and verify the Bearer token from an Authorization header.
+ * Returns the verified user ID or an error Response.
+ */
+async function requireAuth(
+  request: Request,
+  env: Env
+): Promise<{ userId: string; email?: string } | Response> {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return json({ error: "Authorization required" }, 401);
+  }
+
+  const token = authHeader.replace('Bearer ', '');
+  const verified = await verifySupabaseToken(token, env);
+
+  if (!verified) {
+    return json({ error: "Invalid or expired token" }, 401);
+  }
+
+  return verified;
+}
+
 async function handleModalWebhook(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
     const payload = await request.json() as {
@@ -1352,25 +1411,10 @@ async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
  */
 async function handleGenerateWelcome(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
-    // Extract user_id from JWT token
-    const authHeader = request.headers.get('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return json({ error: "Authorization required" }, 401);
-    }
-    
-    const token = authHeader.replace('Bearer ', '');
-    let userId: string;
-    
-    try {
-      const payloadBase64 = token.split('.')[1];
-      const payload = JSON.parse(atob(payloadBase64));
-      userId = payload.sub;
-      if (!userId) {
-        return json({ error: "Invalid token" }, 401);
-      }
-    } catch {
-      return json({ error: "Invalid token format" }, 401);
-    }
+    // Verify JWT token against Supabase Auth (not just decode it)
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const userId = authResult.userId;
     
     const headers = {
       "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4525,28 +4569,10 @@ async function handleValidateKey(request: Request): Promise<Response> {
  */
 async function handleSaveUserKey(request: Request, env: Env): Promise<Response> {
   try {
-    // Extract user_id from JWT token in Authorization header
-    const authHeader = request.headers.get('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return json({ error: "Authorization header required" }, 401);
-    }
-    
-    const token = authHeader.replace('Bearer ', '');
-    let userId: string;
-    
-    try {
-      // Decode JWT to get user ID (the 'sub' claim)
-      // JWT format: header.payload.signature
-      const payloadBase64 = token.split('.')[1];
-      const payload = JSON.parse(atob(payloadBase64));
-      userId = payload.sub;
-      
-      if (!userId) {
-        return json({ error: "Invalid token: missing user ID" }, 401);
-      }
-    } catch {
-      return json({ error: "Invalid token format" }, 401);
-    }
+    // Verify JWT token against Supabase Auth (not just decode it)
+    const authResult = await requireAuth(request, env);
+    if (authResult instanceof Response) return authResult;
+    const userId = authResult.userId;
     
     const body = await request.json() as {
       key_type: 'openai' | 'anthropic' | 'elevenlabs';
