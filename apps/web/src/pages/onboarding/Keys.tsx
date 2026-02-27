@@ -12,6 +12,8 @@ export function OnboardingKeys() {
   const [error, setError] = useState<string | null>(null)
   const [openaiSaved, setOpenaiSaved] = useState(false)
   const [anthropicSaved, setAnthropicSaved] = useState(false)
+  const [testing, setTesting] = useState<{ openai: boolean; anthropic: boolean }>({ openai: false, anthropic: false })
+  const [testResult, setTestResult] = useState<{ openai?: { valid: boolean; error?: string }; anthropic?: { valid: boolean; error?: string } }>({})
 
   useEffect(() => {
     // Check if user already has keys configured
@@ -33,6 +35,46 @@ export function OnboardingKeys() {
 
     if (data?.openai_key_encrypted) setOpenaiSaved(true)
     if (data?.anthropic_key_encrypted) setAnthropicSaved(true)
+  }
+
+  const testKey = async (keyType: 'openai' | 'anthropic', key: string) => {
+    if (!key) {
+      setTestResult(prev => ({ ...prev, [keyType]: { valid: false, error: 'Please enter a key first' } }))
+      return
+    }
+
+    setTesting(prev => ({ ...prev, [keyType]: true }))
+    setTestResult(prev => ({ ...prev, [keyType]: undefined }))
+
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) throw new Error('Not authenticated')
+
+      const res = await fetch(`${API_URL}/api/validate-key`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({ key_type: keyType, key }),
+      })
+
+      if (!res.ok) {
+        const data = await res.json()
+        setTestResult(prev => ({ ...prev, [keyType]: { valid: false, error: data.error || 'Validation failed' } }))
+        return
+      }
+
+      const { valid, error: validationError } = await res.json()
+      setTestResult(prev => ({
+        ...prev,
+        [keyType]: { valid, error: valid ? undefined : (validationError || 'Invalid key') },
+      }))
+    } catch {
+      setTestResult(prev => ({ ...prev, [keyType]: { valid: false, error: 'Failed to validate key' } }))
+    } finally {
+      setTesting(prev => ({ ...prev, [keyType]: false }))
+    }
   }
 
   const validateAndSaveKey = async (keyType: string, key: string) => {
@@ -174,14 +216,21 @@ export function OnboardingKeys() {
                     </svg>
                   </a>
                 </div>
-                <div className="flex gap-3">
+                <div className="flex gap-2">
                   <input
                     type="password"
                     value={openaiKey}
-                    onChange={(e) => setOpenaiKey(e.target.value)}
+                    onChange={(e) => { setOpenaiKey(e.target.value); setTestResult(prev => ({ ...prev, openai: undefined })) }}
                     placeholder="sk-proj-..."
                     className="flex-1 px-3 py-2 border border-gray-300 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm"
                   />
+                  <button
+                    onClick={() => testKey('openai', openaiKey)}
+                    disabled={!openaiKey || testing.openai}
+                    className="px-3 py-2 text-sm font-medium text-gray-700 bg-gray-100 border border-gray-300 rounded-lg hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {testing.openai ? 'Testing...' : 'Test'}
+                  </button>
                   <button
                     onClick={handleSaveOpenAI}
                     disabled={!openaiKey || saving}
@@ -190,6 +239,11 @@ export function OnboardingKeys() {
                     {saving ? 'Saving...' : 'Save'}
                   </button>
                 </div>
+                {testResult.openai && (
+                  <p className={`mt-2 text-sm ${testResult.openai.valid ? 'text-green-600' : 'text-red-600'}`}>
+                    {testResult.openai.valid ? '✓ Key is valid — go ahead and save!' : `✗ ${testResult.openai.error || 'Invalid key'}`}
+                  </p>
+                )}
               </div>
             )}
           </div>
@@ -228,14 +282,21 @@ export function OnboardingKeys() {
                     </svg>
                   </a>
                 </div>
-                <div className="flex gap-3">
+                <div className="flex gap-2">
                   <input
                     type="password"
                     value={anthropicKey}
-                    onChange={(e) => setAnthropicKey(e.target.value)}
+                    onChange={(e) => { setAnthropicKey(e.target.value); setTestResult(prev => ({ ...prev, anthropic: undefined })) }}
                     placeholder="sk-ant-..."
                     className="flex-1 px-3 py-2 border border-gray-300 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm"
                   />
+                  <button
+                    onClick={() => testKey('anthropic', anthropicKey)}
+                    disabled={!anthropicKey || testing.anthropic}
+                    className="px-3 py-2 text-sm font-medium text-gray-700 bg-gray-100 border border-gray-300 rounded-lg hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {testing.anthropic ? 'Testing...' : 'Test'}
+                  </button>
                   <button
                     onClick={handleSaveAnthropic}
                     disabled={!anthropicKey || saving}
@@ -244,6 +305,11 @@ export function OnboardingKeys() {
                     {saving ? 'Saving...' : 'Save'}
                   </button>
                 </div>
+                {testResult.anthropic && (
+                  <p className={`mt-2 text-sm ${testResult.anthropic.valid ? 'text-green-600' : 'text-red-600'}`}>
+                    {testResult.anthropic.valid ? '✓ Key is valid — go ahead and save!' : `✗ ${testResult.anthropic.error || 'Invalid key'}`}
+                  </p>
+                )}
               </div>
             )}
           </div>

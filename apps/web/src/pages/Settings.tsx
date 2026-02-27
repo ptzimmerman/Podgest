@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 
 const API_URL = import.meta.env.VITE_API_URL || 'https://api.podgest.app'
@@ -64,6 +65,10 @@ export function Settings() {
   const [digestStatus, setDigestStatus] = useState<string | null>(null)
   const [lastDigestError, setLastDigestError] = useState<string | null>(null)
   const [toastVisible, setToastVisible] = useState(false)
+  const [showDeleteModal, setShowDeleteModal] = useState(false)
+  const [deleteConfirmation, setDeleteConfirmation] = useState('')
+  const [deleting, setDeleting] = useState(false)
+  const navigate = useNavigate()
   
   // Show toast with auto-dismiss
   const showToast = (type: 'success' | 'error', text: string) => {
@@ -451,6 +456,35 @@ export function Settings() {
     } else {
       setCopiedMcp(true)
       setTimeout(() => setCopiedMcp(false), 2000)
+    }
+  }
+
+  const handleDeleteAccount = async () => {
+    setDeleting(true)
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) throw new Error('Not authenticated')
+
+      const res = await fetch(`${API_URL}/api/delete-account`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${session.access_token}`,
+        },
+      })
+
+      if (!res.ok) {
+        const data = await res.json()
+        throw new Error(data.error || 'Failed to delete account')
+      }
+
+      // Sign out and redirect to login
+      await supabase.auth.signOut()
+      navigate('/login')
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'Failed to delete account')
+      setDeleting(false)
+      setShowDeleteModal(false)
+      setDeleteConfirmation('')
     }
   }
 
@@ -1016,6 +1050,65 @@ export function Settings() {
           <li>• <strong>ElevenLabs</strong>: <a href="https://elevenlabs.io/app/settings/api-keys" target="_blank" rel="noopener noreferrer" className="underline">elevenlabs.io/app/settings/api-keys</a></li>
         </ul>
       </section>
+
+      {/* Danger Zone */}
+      <section className="bg-white dark:bg-gray-800 rounded-lg border-2 border-red-300 dark:border-red-700 p-6">
+        <h2 className="text-lg font-semibold text-red-600 dark:text-red-400 mb-2">Danger Zone</h2>
+        <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
+          Permanently delete your account and all associated data. This action cannot be undone.
+        </p>
+        <button
+          onClick={() => setShowDeleteModal(true)}
+          className="px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition-colors"
+        >
+          Delete Account
+        </button>
+      </section>
+
+      {/* Delete Account Confirmation Modal */}
+      {showDeleteModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="fixed inset-0 bg-black/50" onClick={() => { setShowDeleteModal(false); setDeleteConfirmation('') }} />
+          <div className="relative bg-white dark:bg-gray-800 rounded-xl shadow-xl max-w-md w-full mx-4 p-6">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Delete your account?</h3>
+            <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
+              This is <strong>permanent</strong> and cannot be undone. All of your data will be deleted, including:
+            </p>
+            <ul className="text-sm text-gray-600 dark:text-gray-400 mb-4 space-y-1 ml-4 list-disc">
+              <li>Your profile and settings</li>
+              <li>All podcast subscriptions</li>
+              <li>All generated digests and audio</li>
+              <li>Your API keys</li>
+            </ul>
+            <p className="text-sm text-gray-700 dark:text-gray-300 mb-3">
+              Type <strong className="font-mono text-red-600 dark:text-red-400">delete</strong> to confirm:
+            </p>
+            <input
+              type="text"
+              value={deleteConfirmation}
+              onChange={(e) => setDeleteConfirmation(e.target.value)}
+              placeholder="delete"
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-red-500 text-sm bg-white dark:bg-gray-900 dark:text-white mb-4"
+              autoFocus
+            />
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => { setShowDeleteModal(false); setDeleteConfirmation('') }}
+                className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeleteAccount}
+                disabled={deleteConfirmation !== 'delete' || deleting}
+                className="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-lg hover:bg-red-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {deleting ? 'Deleting...' : 'Delete my account'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

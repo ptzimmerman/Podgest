@@ -34,7 +34,6 @@ const POPULAR_PODCASTS = [
   { name: 'The Daily', url: 'https://feeds.simplecast.com/54nAGcIl', description: 'News from The New York Times' },
   { name: 'Pivot', url: 'https://feeds.megaphone.fm/pivot', description: 'Tech, business, and politics with Kara Swisher & Scott Galloway' },
   { name: 'Hard Fork', url: 'https://feeds.simplecast.com/l2i9YnTd', description: 'Tech news and culture from NYT' },
-  { name: 'Acquired', url: 'https://feeds.megaphone.fm/acquired', description: 'The playbook behind great companies' },
 ]
 
 export function OnboardingPodcasts() {

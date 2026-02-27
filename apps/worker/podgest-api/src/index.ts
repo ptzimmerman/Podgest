@@ -1024,6 +1024,13 @@ export default {
       return handleAdminDeleteUser(userId, env);
     }
     
+    // Self-service account deletion (user JWT auth)
+    if (url.pathname === "/api/delete-account" && request.method === "DELETE") {
+      const auth = await verifySupabaseJWT(request, env);
+      if (!auth) return json({ error: "Unauthorized" }, 401);
+      return withCors(await handleDeleteAccount(auth.userId, env), request);
+    }
+
     // ElevenReader transcript (admin only - exposes user data)
     // URL: /transcript/latest or /transcript/{userId}
     if (url.pathname.startsWith("/transcript/")) {
@@ -1696,7 +1703,7 @@ async function handleGenerateWelcome(request: Request, env: Env, ctx: ExecutionC
     // Create the welcome script
     const welcomeScript = `Hey ${userName}! Welcome to Podgest, your personal podcast digest.
 
-Here's how it works: Every morning at 6 AM, I check your subscribed podcasts for new episodes. When I find new content, I transcribe it using AI and identify the most interesting topics and insights.
+Here's how it works: Every morning, I check your subscribed podcasts for new episodes. When I find new content, I transcribe it using AI and identify the most interesting topics and insights.
 
 Then I create a personalized 5-minute audio digest just for you, summarizing the best moments from all your shows. Think of it like having a friend who listens to all your podcasts and gives you the highlights.
 
@@ -2594,6 +2601,91 @@ async function handleAdminDeleteUser(userId: string, env: Env): Promise<Response
   }
 }
 
+// Self-service account deletion - authenticated user deletes their own account
+async function handleDeleteAccount(userId: string, env: Env): Promise<Response> {
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+
+  try {
+    if (!isValidUUID(userId)) {
+      return json({ error: "Invalid user ID" }, 400);
+    }
+
+    // Verify the user exists
+    const profileResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=email`,
+      { headers }
+    );
+    const profiles = await profileResponse.json() as Array<{ email: string }>;
+    if (!profiles.length) {
+      return json({ error: "User not found" }, 404);
+    }
+
+    const email = profiles[0].email;
+    console.log(`[DeleteAccount] User ${email} (${userId}) requested account deletion`);
+
+    // 1. Delete subscriptions
+    await fetch(
+      `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}`,
+      { method: "DELETE", headers }
+    );
+
+    // 2. Delete digest audio from storage
+    const digestsResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&select=id`,
+      { headers }
+    );
+    const digests = await digestsResponse.json() as Array<{ id: string }>;
+    for (const digest of digests) {
+      await fetch(
+        `${env.SUPABASE_URL}/storage/v1/object/digests/${digest.id}/digest.mp3`,
+        { method: "DELETE", headers }
+      );
+    }
+
+    // 3. Delete API keys
+    await fetch(
+      `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${userId}`,
+      { method: "DELETE", headers }
+    );
+
+    // 4. Delete digests
+    await fetch(
+      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}`,
+      { method: "DELETE", headers }
+    );
+
+    // 5. Delete MCP tokens
+    await fetch(
+      `${env.SUPABASE_URL}/rest/v1/mcp_tokens?user_id=eq.${userId}`,
+      { method: "DELETE", headers }
+    );
+
+    // 6. Delete profile
+    await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}`,
+      { method: "DELETE", headers }
+    );
+
+    // 7. Delete the auth.users record via Supabase Admin API
+    await fetch(
+      `${env.SUPABASE_URL}/auth/v1/admin/users/${userId}`,
+      { method: "DELETE", headers }
+    );
+
+    console.log(`[DeleteAccount] Successfully deleted account for ${email} (${userId})`);
+
+    return json({ success: true, message: "Account deleted" });
+
+  } catch (error) {
+    console.error("[DeleteAccount] Error:", error);
+    return json({ error: "Failed to delete account. Please try again." }, 500);
+  }
+}
+
 // Serve the latest digest transcript for ElevenReader
 // URL: /transcript/latest or /transcript/{userId}
 async function handleLatestTranscript(pathname: string, env: Env): Promise<Response> {
@@ -3359,7 +3451,6 @@ async function handleTestDeleteDigest(env: Env, userId: string): Promise<Respons
   }
 }
 
-// Debug endpoint: Show user's subscriptions and available episodes
 async function handleDebugEpisodes(env: Env, userId: string): Promise<Response> {
   const headers = {
     "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4500,7 +4591,7 @@ async function handleRSSFeed(userId: string, env: Env, baseUrl?: string): Promis
         items.push(`
     <item>
       <title><![CDATA[Welcome to Podgest, ${userName}!]]></title>
-      <description><![CDATA[Your personalized podcast digest is being set up. Add some podcasts and configure your API keys at dash.podgest.app, then your first digest will arrive tomorrow morning at 6 AM!]]></description>
+      <description><![CDATA[Your personalized podcast digest is being set up. Add some podcasts and configure your API keys at dash.podgest.app, then your first digest will arrive tomorrow morning!]]></description>
       <pubDate>${placeholderDate}</pubDate>
       <guid isPermaLink="false">${placeholderGuid}</guid>
       <itunes:duration>0:00</itunes:duration>

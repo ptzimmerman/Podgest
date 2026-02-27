@@ -4,11 +4,9 @@
 -- to include it in HTTP headers when calling the API.
 
 -- Store admin key in vault
-SELECT vault.create_secret(
-  'REDACTED_ADMIN_KEY',
-  'admin_api_key',
-  'Admin API key for authenticating pg_cron calls to podgest-api'
-);
+-- Insert your admin API key into the vault. Generate one with: openssl rand -hex 32
+-- Then run: SELECT vault.create_secret('<YOUR_ADMIN_API_KEY>', 'admin_api_key', 'Admin API key for authenticating pg_cron calls to podgest-api');
+-- This must match the ADMIN_API_KEY secret set on the Cloudflare Worker.
 
 -- Update the daily digest trigger to include admin key
 CREATE OR REPLACE FUNCTION public.trigger_daily_digest()
