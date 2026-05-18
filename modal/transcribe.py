@@ -682,6 +682,270 @@ def openai_tts_web(request: dict) -> dict:
     )
 
 
+# TTS with audio clips spliced in
+@app.function(image=tts_image, timeout=600)
+@modal.fastapi_endpoint(method="POST")
+def tts_with_clips_web(request: dict) -> dict:
+    """
+    Generate TTS audio with original podcast clips spliced in.
+    
+    Expected JSON body:
+    {
+        "script": "... text with [CLIP:1] [CLIP:2] markers ...",
+        "openai_api_key": "...",
+        "clips": [
+            {"audio_url": "...", "start_seconds": 45.2, "end_seconds": 55.8},
+            ...
+        ],
+        "voice": "echo" (optional),
+        "model": "tts-1-hd" (optional),
+        "supabase_url": "..." (optional),
+        "supabase_key": "..." (optional),
+        "digest_id": "..." (optional),
+        "webhook_url": "..." (optional),
+        "admin_key": "..." (optional)
+    }
+    """
+    import requests
+    import tempfile
+    import subprocess
+    import os
+    import re
+    import json as json_mod
+    from openai import OpenAI
+    
+    script = request.get("script")
+    api_key = request.get("openai_api_key")
+    clips = request.get("clips", [])
+    voice = request.get("voice", "echo")
+    model = request.get("model", "tts-1-hd")
+    supabase_url = request.get("supabase_url")
+    supabase_key = request.get("supabase_key")
+    digest_id = request.get("digest_id")
+    webhook_url = request.get("webhook_url")
+    admin_key = request.get("admin_key")
+    
+    if not script:
+        return {"error": "script is required"}
+    if not api_key:
+        return {"error": "openai_api_key is required"}
+    
+    try:
+        print(f"🎙️ TTS+Clips: {len(script)} chars, {len(clips)} clips, voice={voice}")
+        
+        client = OpenAI(api_key=api_key)
+        
+        # Split script on [CLIP:N] markers into segments
+        # Pattern: [CLIP:1], [CLIP:2], etc.
+        parts = re.split(r'\[CLIP:\d+\]', script)
+        clip_positions = [m.start() for m in re.finditer(r'\[CLIP:\d+\]', script)]
+        
+        print(f"📦 Script split into {len(parts)} text segments with {len(clip_positions)} clip insertion points")
+        
+        # Generate TTS for each text segment
+        MAX_CHUNK_SIZE = 4000
+        audio_segments = []  # Ordered list of audio file paths
+        temp_files = []
+        
+        for seg_idx, text_part in enumerate(parts):
+            clean_text = text_part.replace("[PAUSE]", " ... ").strip()
+            if not clean_text:
+                # Empty segment between consecutive clips, skip TTS
+                pass
+            else:
+                # Split long text into TTS-sized chunks
+                sentences = re.split(r'(?<=[.!?])\s+', clean_text)
+                chunks = []
+                current = ""
+                for sentence in sentences:
+                    if len(current) + len(sentence) + 1 > MAX_CHUNK_SIZE:
+                        if current:
+                            chunks.append(current.strip())
+                        current = sentence
+                    else:
+                        current += (" " if current else "") + sentence
+                if current:
+                    chunks.append(current.strip())
+                
+                for chunk_idx, chunk in enumerate(chunks):
+                    print(f"🔊 TTS segment {seg_idx+1}, chunk {chunk_idx+1}/{len(chunks)} ({len(chunk)} chars)")
+                    response = client.audio.speech.create(
+                        model=model,
+                        voice=voice,
+                        input=chunk,
+                        response_format="mp3",
+                    )
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+                        for audio_chunk in response.iter_bytes():
+                            f.write(audio_chunk)
+                        audio_segments.append(f.name)
+                        temp_files.append(f.name)
+            
+            # After this text segment, insert the corresponding clip (if one exists)
+            if seg_idx < len(clips):
+                clip = clips[seg_idx]
+                clip_url = clip["audio_url"]
+                start_s = clip["start_seconds"]
+                end_s = clip["end_seconds"]
+                duration = end_s - start_s
+                
+                print(f"🎬 Extracting clip {seg_idx+1}: {start_s:.1f}s-{end_s:.1f}s ({duration:.1f}s) from {clip_url[:60]}...")
+                
+                # Download the source audio
+                dl_path = tempfile.mktemp(suffix=".mp3")
+                temp_files.append(dl_path)
+                
+                dl_headers = {
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                    "Accept": "audio/mpeg,audio/*;q=0.9,*/*;q=0.8",
+                }
+                dl_response = requests.get(clip_url, stream=True, timeout=120, headers=dl_headers)
+                dl_response.raise_for_status()
+                with open(dl_path, "wb") as f:
+                    for data_chunk in dl_response.iter_content(chunk_size=1024*1024):
+                        if data_chunk:
+                            f.write(data_chunk)
+                
+                # Extract the clip segment with ffmpeg, normalize volume
+                clip_path = tempfile.mktemp(suffix=".mp3")
+                temp_files.append(clip_path)
+                
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-ss", str(start_s),
+                    "-t", str(duration),
+                    "-i", dl_path,
+                    "-af", "loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:d=0.3,afade=t=out:st=" + str(max(0, duration-0.5)) + ":d=0.5",
+                    "-ar", "24000",
+                    "-ac", "1",
+                    "-b:a", "128k",
+                    clip_path
+                ], check=True, capture_output=True)
+                
+                audio_segments.append(clip_path)
+                print(f"✅ Clip {seg_idx+1} extracted successfully")
+        
+        # Concatenate all audio segments
+        print(f"🔗 Concatenating {len(audio_segments)} audio segments")
+        
+        # Re-encode everything to consistent format before concat
+        normalized_segments = []
+        for seg_path in audio_segments:
+            norm_path = tempfile.mktemp(suffix=".mp3")
+            temp_files.append(norm_path)
+            subprocess.run([
+                "ffmpeg", "-y", "-i", seg_path,
+                "-ar", "24000", "-ac", "1", "-b:a", "128k",
+                norm_path
+            ], check=True, capture_output=True)
+            normalized_segments.append(norm_path)
+        
+        # Create concat list
+        concat_list_path = tempfile.mktemp(suffix=".txt")
+        temp_files.append(concat_list_path)
+        with open(concat_list_path, "w") as f:
+            for path in normalized_segments:
+                f.write(f"file '{path}'\n")
+        
+        output_path = tempfile.mktemp(suffix=".mp3")
+        temp_files.append(output_path)
+        
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", concat_list_path, "-c", "copy", output_path
+        ], check=True, capture_output=True)
+        
+        # Get duration
+        probe_result = subprocess.run([
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", output_path
+        ], capture_output=True, text=True)
+        duration_seconds = 0
+        if probe_result.returncode == 0:
+            probe_data = json_mod.loads(probe_result.stdout)
+            duration_seconds = int(float(probe_data.get("format", {}).get("duration", 0)))
+        
+        print(f"⏱️ Final audio duration: {duration_seconds}s")
+        
+        # Read final audio
+        with open(output_path, "rb") as f:
+            final_audio = f.read()
+        
+        result = {
+            "status": "completed",
+            "digest_id": digest_id,
+            "duration_seconds": duration_seconds,
+            "clips_included": len(clips),
+            "provider": "openai+clips",
+            "voice": voice,
+            "model": model,
+        }
+        
+        # Upload to Supabase
+        if supabase_url and supabase_key and digest_id:
+            audio_path = f"{digest_id}/digest.mp3"
+            upload_url = f"{supabase_url}/storage/v1/object/digests/{audio_path}"
+            
+            print(f"📤 Uploading to Supabase: {audio_path} ({len(final_audio)} bytes)")
+            upload_response = requests.post(
+                upload_url,
+                headers={
+                    "Authorization": f"Bearer {supabase_key}",
+                    "Content-Type": "audio/mpeg",
+                    "x-upsert": "true",
+                },
+                data=final_audio,
+                timeout=120,
+            )
+            
+            if upload_response.ok:
+                result["audio_url"] = f"{supabase_url}/storage/v1/object/public/digests/{audio_path}"
+                print(f"✅ Uploaded: {result['audio_url']}")
+            else:
+                print(f"❌ Upload failed: {upload_response.status_code} - {upload_response.text}")
+                result["upload_error"] = upload_response.text
+        
+        # Cleanup
+        for f_path in temp_files:
+            if os.path.exists(f_path):
+                os.unlink(f_path)
+        
+        # Send webhook
+        if webhook_url:
+            print(f"📤 Sending to webhook: {webhook_url}")
+            wh_headers = {"Content-Type": "application/json"}
+            if admin_key:
+                wh_headers["X-Admin-Key"] = admin_key
+            requests.post(webhook_url, json=result, headers=wh_headers, timeout=30)
+        
+        return result
+        
+    except Exception as e:
+        import traceback
+        print(f"❌ TTS+Clips Error: {e}")
+        print(traceback.format_exc())
+        
+        error_result = {
+            "status": "failed",
+            "digest_id": digest_id,
+            "error": str(e),
+            "provider": "openai+clips",
+        }
+        
+        if webhook_url:
+            wh_headers = {"Content-Type": "application/json"}
+            if admin_key:
+                wh_headers["X-Admin-Key"] = admin_key
+            requests.post(webhook_url, json=error_result, headers=wh_headers, timeout=30)
+        
+        # Cleanup on error
+        for f_path in temp_files:
+            if os.path.exists(f_path):
+                os.unlink(f_path)
+        
+        return error_result
+
+
 # ElevenLabs TTS Web endpoint (legacy)
 @app.function(image=tts_image)
 @modal.fastapi_endpoint(method="POST")

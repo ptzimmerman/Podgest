@@ -3545,9 +3545,73 @@ async function handleDebugEpisodes(env: Env, userId: string): Promise<Response> 
   }
 }
 
+async function cleanupOldDigestAudio(env: Env): Promise<{ deleted: number; errors: number }> {
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+
+  const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+  const response = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/digests?select=id&audio_url=not.is.null&created_at=lt.${cutoff}`,
+    { headers }
+  );
+
+  if (!response.ok) {
+    console.error(`[Retention] Failed to query old digests: ${response.status}`);
+    return { deleted: 0, errors: 1 };
+  }
+
+  const oldDigests = await response.json() as Array<{ id: string }>;
+  if (oldDigests.length === 0) {
+    console.log("[Retention] No expired digest audio to clean up");
+    return { deleted: 0, errors: 0 };
+  }
+
+  console.log(`[Retention] Found ${oldDigests.length} digests with expired audio`);
+  let deleted = 0;
+  let errors = 0;
+
+  for (const digest of oldDigests) {
+    try {
+      await fetch(
+        `${env.SUPABASE_URL}/storage/v1/object/digests/${digest.id}/digest.mp3`,
+        { method: "DELETE", headers }
+      );
+      deleted++;
+    } catch {
+      errors++;
+    }
+  }
+
+  const patchResponse = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/digests?audio_url=not.is.null&created_at=lt.${cutoff}`,
+    {
+      method: "PATCH",
+      headers: { ...headers, "Prefer": "return=minimal" },
+      body: JSON.stringify({ audio_url: null }),
+    }
+  );
+
+  if (!patchResponse.ok) {
+    console.error(`[Retention] Failed to null out audio_url: ${patchResponse.status}`);
+    errors++;
+  }
+
+  console.log(`[Retention] Cleanup complete: ${deleted} files deleted, ${errors} errors`);
+  return { deleted, errors };
+}
+
 // Daily cron trigger - now routes to dispatcher (async) or legacy (sync)
 // The dispatcher is preferred as it avoids timeout issues
 async function handleDailyCron(env: Env, ctx: ExecutionContext): Promise<Response> {
+  // Run retention cleanup before dispatching new digests
+  console.log("[DailyCron] Running storage retention cleanup...");
+  const cleanup = await cleanupOldDigestAudio(env);
+  console.log(`[DailyCron] Retention: deleted=${cleanup.deleted}, errors=${cleanup.errors}`);
+
   // If queue is configured, use async dispatcher
   if (env.DIGEST_QUEUE) {
     console.log("[DailyCron] Using async queue dispatcher");
@@ -3853,6 +3917,79 @@ interface DigestScript {
   word_count: number;
 }
 
+interface ClipMarker {
+  episode_id: string;
+  quote: string;  // The text to find in transcript for timestamp lookup
+  context: string;  // Brief description of why this clip is interesting
+}
+
+interface DigestScriptWithClips extends DigestScript {
+  clips: ClipMarker[];
+}
+
+interface ResolvedClip {
+  episode_id: string;
+  audio_url: string;
+  start_seconds: number;
+  end_seconds: number;
+  quote: string;
+}
+
+interface TranscriptSegment {
+  start: number;
+  end: number;
+  text: string;
+}
+
+function findClipTimestamps(
+  quote: string,
+  segments: TranscriptSegment[]
+): { start: number; end: number } | null {
+  const normalizedQuote = quote.toLowerCase().replace(/[^\w\s]/g, "").trim();
+  const quoteWords = normalizedQuote.split(/\s+/);
+  if (quoteWords.length < 3) return null;
+
+  // Build a sliding window over segments to find the best match
+  let bestMatch = { score: 0, startIdx: 0, endIdx: 0 };
+
+  for (let i = 0; i < segments.length; i++) {
+    let windowText = "";
+    for (let j = i; j < Math.min(i + 10, segments.length); j++) {
+      windowText += " " + segments[j].text;
+      const normalizedWindow = windowText.toLowerCase().replace(/[^\w\s]/g, "").trim();
+
+      // Count matching words in sequence
+      const windowWords = normalizedWindow.split(/\s+/);
+      let matchCount = 0;
+      let searchStart = 0;
+      for (const word of quoteWords) {
+        const idx = windowWords.indexOf(word, searchStart);
+        if (idx >= 0) {
+          matchCount++;
+          searchStart = idx + 1;
+        }
+      }
+
+      const score = matchCount / quoteWords.length;
+      if (score > bestMatch.score) {
+        bestMatch = { score, startIdx: i, endIdx: j };
+      }
+    }
+  }
+
+  // Require at least 60% word match
+  if (bestMatch.score < 0.6) return null;
+
+  const startSeg = segments[bestMatch.startIdx];
+  const endSeg = segments[bestMatch.endIdx];
+
+  // Add a small buffer and cap clip length at 20 seconds
+  const start = Math.max(0, startSeg.start - 0.5);
+  const end = Math.min(endSeg.end + 0.5, startSeg.start + 20);
+
+  return { start, end };
+}
+
 // Check which users need digests generated based on their timezone and digest_time
 async function handleScheduledDigest(env: Env): Promise<Response> {
   try {
@@ -4117,7 +4254,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     const feedUrlFilter = [...userFeedUrls].map(u => `"${u}"`).join(",");
     
     const episodesResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/episodes?created_at=gte.${cutoffDate}&feed_url=in.(${feedUrlFilter})&select=id,title,description,published_at,feed_url`,
+      `${env.SUPABASE_URL}/rest/v1/episodes?created_at=gte.${cutoffDate}&feed_url=in.(${feedUrlFilter})&select=id,title,description,published_at,feed_url,audio_url`,
       { headers }
     );
     
@@ -4131,6 +4268,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
       description: string;
       published_at: string;
       feed_url: string;
+      audio_url: string;
     }>;
     
     console.log(`[Digest] Found ${episodes.length} episodes from user's subscriptions`);
@@ -4208,30 +4346,69 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
       }
     }
     
-    // 3. Build context for Claude (including podcast name for citations)
+    // 3. Fetch transcript text for clip extraction
+    const episodeTranscripts = new Map<string, { text: string; segments: TranscriptSegment[] }>();
+    for (const ep of episodes) {
+      try {
+        const transcriptResponse = await fetch(
+          `${env.SUPABASE_URL}/storage/v1/object/transcripts/${ep.id}/transcript.json`,
+          { headers }
+        );
+        if (transcriptResponse.ok) {
+          const transcript = await transcriptResponse.json() as { text: string; segments: TranscriptSegment[] };
+          episodeTranscripts.set(ep.id, transcript);
+        }
+      } catch {
+        // Non-fatal: episode just won't have clips
+      }
+    }
+    console.log(`[Digest] Fetched transcripts for ${episodeTranscripts.size}/${episodes.length} episodes`);
+
+    // 4. Build context for Claude (including podcast name for citations)
     // For ListenNotes feeds, extract the original podcast name from description
     const episodeSummaries = episodes.map(ep => {
       const topics = episodeTopics.get(ep.id);
-      // Try to extract original podcast name from ListenNotes description
       const originalPodcastName = extractOriginalPodcastName(ep.description || "");
-      // Fall back to subscription's podcast_title only if no original found
       const podcastName = originalPodcastName || podcastNames.get(ep.feed_url) || "Unknown Podcast";
+      const transcript = episodeTranscripts.get(ep.id);
       return {
+        id: ep.id,
         title: ep.title,
         podcast_name: podcastName,
         summary: topics?.summary || ep.description?.substring(0, 200) || "No summary available",
         topics: topics?.topics || [],
         themes: topics?.themes || [],
         key_points: topics?.key_points || [],
+        transcript_excerpt: transcript?.text?.substring(0, 2000) || "",
       };
     });
     
-    console.log(`[Digest] Generating script with Claude...`);
+    console.log(`[Digest] Generating script with Claude (with clip markers)...`);
     
-    // 4. Generate news broadcaster script with Claude (using user's key if available)
-    const script = await generateDigestScript(episodeSummaries, maxLengthMinutes, userAnthropicKey);
+    // 5. Generate news broadcaster script with clip markers
+    const script = await generateDigestScriptWithClips(episodeSummaries, maxLengthMinutes, userAnthropicKey);
     
-    console.log(`[Digest] Script generated: ${script.word_count} words`);
+    console.log(`[Digest] Script generated: ${script.word_count} words, ${script.clips.length} clips requested`);
+
+    // 6. Resolve clip markers to actual timestamps using transcript segments
+    const resolvedClips: ResolvedClip[] = [];
+    for (const clip of script.clips) {
+      const transcript = episodeTranscripts.get(clip.episode_id);
+      const episode = episodes.find(ep => ep.id === clip.episode_id);
+      if (!transcript?.segments || !episode?.audio_url) continue;
+
+      const resolved = findClipTimestamps(clip.quote, transcript.segments);
+      if (resolved) {
+        resolvedClips.push({
+          episode_id: clip.episode_id,
+          audio_url: episode.audio_url,
+          start_seconds: resolved.start,
+          end_seconds: resolved.end,
+          quote: clip.quote,
+        });
+      }
+    }
+    console.log(`[Digest] Resolved ${resolvedClips.length}/${script.clips.length} clips to timestamps`);
     
     // 5. Save pending digest record first (so we can update it when TTS completes)
     const digestId = crypto.randomUUID();
@@ -4272,41 +4449,53 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     
     console.log(`[Digest] Saved pending digest ${digestId}`);
     
-    // 6. Trigger Modal TTS asynchronously with webhook callback (using OpenAI - 10x cheaper)
-    // Uses user's OpenAI key if available, falls back to env key
-    console.log(`[Digest] Triggering OpenAI TTS for ${script.script.length} chars...`);
+    // 7. Trigger Modal TTS asynchronously with webhook callback
+    const hasClips = resolvedClips.length > 0;
+    const ttsEndpoint = hasClips
+      ? "https://ptzimmerman--podgest-transcribe-tts-with-clips-web.modal.run"
+      : "https://ptzimmerman--podgest-transcribe-openai-tts-web.modal.run";
     
-    // Use waitUntil to ensure the request is sent even after response is returned
+    console.log(`[Digest] Triggering ${hasClips ? 'TTS+Clips' : 'OpenAI TTS'} for ${script.script.length} chars, ${resolvedClips.length} clips...`);
+    
+    const ttsPayload: Record<string, unknown> = {
+      script: script.script,
+      openai_api_key: userOpenAIKey,
+      voice: "echo",
+      model: "tts-1-hd",
+      supabase_url: env.SUPABASE_URL,
+      supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
+      digest_id: digestId,
+      webhook_url: "https://api.podgest.app/api/webhooks/tts",
+      admin_key: env.ADMIN_API_KEY,
+    };
+
+    if (hasClips) {
+      ttsPayload.clips = resolvedClips.map(c => ({
+        audio_url: c.audio_url,
+        start_seconds: c.start_seconds,
+        end_seconds: c.end_seconds,
+      }));
+    }
+    
     ctx.waitUntil(
-      fetch(
-        "https://ptzimmerman--podgest-transcribe-openai-tts-web.modal.run",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            script: script.script,
-            openai_api_key: userOpenAIKey,  // BYOK: Use user's key if available
-            voice: "echo",  // Warm, conversational voice
-            model: "tts-1-hd",  // High quality
-            supabase_url: env.SUPABASE_URL,
-            supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
-            digest_id: digestId,
-            webhook_url: "https://api.podgest.app/api/webhooks/tts",
-            admin_key: env.ADMIN_API_KEY,
-          }),
-        }
-      ).then(res => console.log(`[Digest] OpenAI TTS triggered: ${res.status}`))
-       .catch(err => console.error(`[Digest] Modal trigger error: ${err}`))
+      fetch(ttsEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(ttsPayload),
+      }).then(res => console.log(`[Digest] TTS triggered: ${res.status}`))
+        .catch(err => console.error(`[Digest] Modal trigger error: ${err}`))
     );
     
-    // Return immediately - audio will be ready in ~1 minute
+    // Return immediately - audio will be ready in ~1-2 minutes
     return json({
       success: true,
       status: "generating",
-      message: "Digest script generated, audio processing in background. Check back in ~1 minute.",
+      message: `Digest script generated with ${resolvedClips.length} audio clips, processing in background.`,
       digest_id: digestId,
       episodes_count: episodes.length,
       estimated_duration_seconds: estimatedDuration,
+      clips_resolved: resolvedClips.length,
+      clips_requested: script.clips.length,
       script: {
         title: script.title,
         word_count: script.word_count,
@@ -4464,6 +4653,175 @@ Topics: ${ep.topics.join(", ")}`
   return result;
 }
 
+async function generateDigestScriptWithClips(
+  episodes: Array<{
+    id: string;
+    title: string;
+    podcast_name: string;
+    summary: string;
+    topics: string[];
+    themes: string[];
+    key_points: string[];
+    transcript_excerpt: string;
+  }>,
+  maxMinutes: number,
+  apiKey: string
+): Promise<DigestScriptWithClips> {
+
+  const targetWordCount = maxMinutes * 150;
+
+  const today = new Date();
+  const dayOfWeek = today.toLocaleDateString('en-US', { weekday: 'long' });
+  const dateStr = today.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+
+  const systemPrompt = `You are Alex Chen, an upbeat and energetic podcast host for "Podgest" - a daily news digest show.
+Your style is enthusiastic, warm, and engaging - but STRICTLY NEUTRAL. You deliver facts, not opinions.
+
+CRITICAL RULE: You are a NEWS READER, not a commentator. 
+- DO NOT add your own opinions, reactions, or editorial commentary
+- DO NOT use phrases like "What's fascinating is...", "Here's where it gets interesting...", "What really caught my attention..."
+- DO NOT editorialize with "This is huge", "shocking", "remarkable", etc.
+- JUST report what was said on the source podcasts, attributed to them
+- Let the facts speak for themselves
+
+CRITICAL: The script MUST be approximately ${targetWordCount} words long (${maxMinutes} minutes at 150 words/minute). 
+This is a hard requirement - expand on stories with detail and analysis to hit this target.
+
+AUDIO CLIPS: You have access to the original podcast audio. When you reference a particularly compelling quote or moment, 
+you can insert a clip marker: [CLIP:episode_index] where episode_index is the Story number (1-based).
+The clip will be automatically extracted and spliced into the audio at that point.
+
+CLIP GUIDELINES:
+- Include 2-4 clips total across the digest (don't overdo it)
+- Place the [CLIP:N] marker AFTER your lead-in to the quote (e.g., "Here's how they put it: [CLIP:2]")
+- Only clip moments that are genuinely compelling: a strong quote, a surprising stat, an emotional moment
+- Each clip will be 5-15 seconds of the original audio
+- In the "clips" array of your response, provide the exact quote text that should be clipped
+
+STRUCTURE YOUR SCRIPT EXACTLY LIKE THIS:
+
+1. OPENING (warm, energetic):
+   "Hey there! It's ${dayOfWeek}, ${dateStr}, and this is the Podgest Podcast. I'm Alex Chen, and I've got a great lineup for you today. [PAUSE] Here's what's on deck: [brief 2-3 sentence preview of main themes]. Let's get into it! [PAUSE]"
+
+2. MAIN CONTENT - Group stories into 3-5 SECTIONS by theme:
+   - Start each section with a transition: "Alright, let's talk about [SECTION NAME]. [PAUSE]"
+   - Cover each story with: context, key details, why it matters
+   - CITE YOUR SOURCES naturally like a broadcaster:
+     * "Over on [Podcast Name], they reported..."
+     * "According to [Podcast Name]..."
+   - When appropriate, lead into a clip: "Here's how [Host/Guest] described it: [CLIP:N]"
+   - After a clip, briefly react/transition: "So that gives you a sense of..."
+   
+   CRITICAL - ACCURATE CITATIONS:
+   - ONLY cite a podcast for information that actually came from that podcast
+   - Each story below has a "Source Podcast" field - use ONLY that podcast name when citing that story's content
+   
+   - Be warm and engaging but NEUTRAL
+   - End each section with: "And that wraps up [SECTION NAME]. [PAUSE]"
+
+3. CLOSING (tie it together):
+   - "Alright, let's zoom out for a second. [PAUSE]"
+   - Draw connections between stories
+   - End with: "That's your Podgest for ${dayOfWeek}. Thanks for hanging out with me today - I'll catch you tomorrow. Until then, stay curious! [PAUSE]"
+
+IMPORTANT FORMATTING:
+- Include [PAUSE] markers where natural breaks should occur
+- Write in a conversational, slightly upbeat tone
+- Use contractions naturally
+- Vary sentence length for natural rhythm
+
+Return a JSON object with this structure:
+{
+  "title": "Podgest - ${dateStr}",
+  "script": "Hey there! It's ${dayOfWeek}... [full script with [PAUSE] and [CLIP:N] markers]",
+  "topics_covered": ["topic1", "topic2", ...],
+  "word_count": 450,
+  "clips": [
+    {"episode_index": 1, "quote": "exact quote text from the transcript to clip"},
+    {"episode_index": 2, "quote": "another exact quote to clip"}
+  ]
+}
+
+IMPORTANT: Return ONLY the JSON object, no markdown formatting.
+The "quote" field in clips should be a verbatim excerpt from the transcript (15-40 words) that you want to play as audio.`;
+
+  const episodeContext = episodes.map((ep, i) => 
+    `Story ${i + 1} (id: ${ep.id}): "${ep.title}"
+Source Podcast: ${ep.podcast_name}
+Summary: ${ep.summary}
+Key Points: ${ep.key_points.join("; ")}
+Topics: ${ep.topics.join(", ")}
+Transcript Excerpt: ${ep.transcript_excerpt.substring(0, 1500)}`
+  ).join("\n\n");
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages: [
+        {
+          role: "user",
+          content: `Create a ${maxMinutes}-minute news-style podcast script covering these ${episodes.length} stories. Include 2-4 audio clips from the original episodes where compelling:\n\n${episodeContext}`,
+        },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Claude API error: ${response.status} - ${err}`);
+  }
+
+  const data = await response.json() as {
+    content: Array<{ type: string; text: string }>;
+  };
+  
+  const textContent = data.content.find(c => c.type === "text");
+  if (!textContent) {
+    throw new Error("No text content in Claude response");
+  }
+  
+  let jsonText = textContent.text.trim();
+  if (jsonText.startsWith("```json")) jsonText = jsonText.slice(7);
+  else if (jsonText.startsWith("```")) jsonText = jsonText.slice(3);
+  if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3);
+  jsonText = jsonText.trim();
+  
+  const result = JSON.parse(jsonText) as {
+    title: string;
+    script: string;
+    topics_covered: string[];
+    word_count: number;
+    clips: Array<{ episode_index: number; quote: string }>;
+  };
+  
+  if (!result.word_count) {
+    result.word_count = result.script.split(/\s+/).length;
+  }
+
+  // Map episode_index to episode_id
+  const clips: ClipMarker[] = (result.clips || []).map(c => ({
+    episode_id: episodes[c.episode_index - 1]?.id || "",
+    quote: c.quote,
+    context: `Clip from story ${c.episode_index}`,
+  })).filter(c => c.episode_id);
+
+  return {
+    title: result.title,
+    script: result.script,
+    topics_covered: result.topics_covered,
+    word_count: result.word_count,
+    clips,
+  };
+}
+
 // ============================================
 // RSS FEED FOR SPOTIFY
 // ============================================
@@ -4513,7 +4871,7 @@ async function handleRSSFeed(userId: string, env: Env, baseUrl?: string): Promis
       id: string;
       digest_date: string;
       topic_clusters: { topics: string[]; title: string };
-      audio_url: string;
+      audio_url: string | null;
       duration_seconds: number;
       completed_at: string;
     }>;
@@ -4528,8 +4886,9 @@ async function handleRSSFeed(userId: string, env: Env, baseUrl?: string): Promis
     // Build items with actual file sizes
     const items: string[] = [];
     
-    // Check for welcome episode (if no regular digests)
-    if (digests.length === 0) {
+    // Check for welcome episode (if no playable digests with audio)
+    const hasPlayableDigests = digests.some(d => d.audio_url);
+    if (!hasPlayableDigests) {
       // Fetch welcome episode if it exists (marked with date 1970-01-01)
       const welcomeResponse = await fetch(
         `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=eq.1970-01-01&status=eq.completed&select=*`,
@@ -4542,13 +4901,13 @@ async function handleRSSFeed(userId: string, env: Env, baseUrl?: string): Promis
         const welcomeDigests = await welcomeResponse.json() as Array<{
           id: string;
           topic_clusters: { title: string; topics: string[] };
-          audio_url: string;
+          audio_url: string | null;
           duration_seconds: number;
           completed_at: string;
           script_text: string;
         }>;
         
-        if (welcomeDigests.length > 0) {
+        if (welcomeDigests.length > 0 && welcomeDigests[0].audio_url) {
           hasWelcomeEpisode = true;
           const welcome = welcomeDigests[0];
           const welcomeDate = new Date(welcome.completed_at).toUTCString();
@@ -4556,9 +4915,10 @@ async function handleRSSFeed(userId: string, env: Env, baseUrl?: string): Promis
           const duration = formatDuration(welcome.duration_seconds || 60);
           
           // Get file size
+          const audioUrl = welcome.audio_url!;
           let fileSize = 0;
           try {
-            const headResponse = await fetch(welcome.audio_url, { method: "HEAD" });
+            const headResponse = await fetch(audioUrl, { method: "HEAD" });
             const contentLength = headResponse.headers.get("content-length");
             if (contentLength) {
               fileSize = parseInt(contentLength, 10);
@@ -4573,7 +4933,7 @@ async function handleRSSFeed(userId: string, env: Env, baseUrl?: string): Promis
       <description><![CDATA[${description}]]></description>
       <pubDate>${welcomeDate}</pubDate>
       <guid isPermaLink="false">${welcome.id}</guid>
-      <enclosure url="${welcome.audio_url}" length="${fileSize}" type="audio/mpeg"/>
+      <enclosure url="${audioUrl}" length="${fileSize}" type="audio/mpeg"/>
       <itunes:duration>${duration}</itunes:duration>
       <itunes:explicit>no</itunes:explicit>
       <itunes:episodeType>trailer</itunes:episodeType>
@@ -4602,8 +4962,10 @@ async function handleRSSFeed(userId: string, env: Env, baseUrl?: string): Promis
       }
     }
     
-    // Add actual digest episodes
+    // Add actual digest episodes (skip those with expired/deleted audio)
     for (const d of digests) {
+      if (!d.audio_url) continue;
+
       const pubDate = new Date(d.completed_at).toUTCString();
       const title = d.topic_clusters?.title || `Daily Digest - ${d.digest_date}`;
       const description = d.topic_clusters?.topics?.join(", ") || "Your daily podcast digest";
