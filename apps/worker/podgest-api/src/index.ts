@@ -1092,6 +1092,14 @@ export default {
       return json({ debug, server_time: now.toISOString() });
     }
     
+    // Poll-only cron trigger (admin only) — polls RSS feeds and triggers transcription
+    // Run this 30-60 min BEFORE daily-cron so transcripts are ready for clip extraction
+    if (url.pathname === "/api/poll-cron" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
+      return handlePollCron(env);
+    }
+
     // Daily cron trigger (admin only - called by Supabase pg_cron or external scheduler)
     // This runs the full daily workflow: poll + digest
     if (url.pathname === "/api/daily-cron" && request.method === "POST") {
@@ -3020,7 +3028,51 @@ async function pollSubscriptionsForUser(
           
           if (insertResponse.ok) {
             newEpisodesTotal++;
+            const inserted = await insertResponse.json() as Array<{ id: string }>;
+            const episodeId = inserted?.[0]?.id;
             console.log(`[Poll-${userId.slice(0,8)}] New episode: ${item.title}`);
+
+            // Trigger transcription for clip extraction
+            if (episodeId && item.enclosure) {
+              try {
+                await fetch(
+                  `${env.SUPABASE_URL}/rest/v1/transcriptions`,
+                  {
+                    method: "POST",
+                    headers,
+                    body: JSON.stringify({
+                      episode_id: episodeId,
+                      status: "processing",
+                    }),
+                  }
+                );
+
+                const modalResponse = await fetch(
+                  "https://ptzimmerman--podgest-transcribe-transcribe-web.modal.run",
+                  {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      audio_url: item.enclosure,
+                      webhook_url: "https://api.podgest.app/api/webhooks/modal",
+                      admin_key: env.ADMIN_API_KEY,
+                      job_id: JSON.stringify({
+                        episode_id: episodeId,
+                        transcription_id: episodeId,
+                      }),
+                    }),
+                  }
+                );
+
+                if (modalResponse.ok) {
+                  console.log(`[Poll-${userId.slice(0,8)}] Triggered transcription for: ${item.title}`);
+                } else {
+                  console.error(`[Poll-${userId.slice(0,8)}] Modal trigger failed: ${modalResponse.status}`);
+                }
+              } catch (modalErr) {
+                console.error(`[Poll-${userId.slice(0,8)}] Transcription trigger error: ${modalErr}`);
+              }
+            }
           }
         }
       }
@@ -3602,6 +3654,56 @@ async function cleanupOldDigestAudio(env: Env): Promise<{ deleted: number; error
 
   console.log(`[Retention] Cleanup complete: ${deleted} files deleted, ${errors} errors`);
   return { deleted, errors };
+}
+
+// Poll-only cron — polls all users' RSS feeds and triggers transcriptions
+// Run 30-60 min before daily-cron so transcripts are ready for clip extraction
+async function handlePollCron(env: Env): Promise<Response> {
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+
+  try {
+    const profilesResponse = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?select=id,email`,
+      { headers }
+    );
+
+    if (!profilesResponse.ok) {
+      return json({ error: "Failed to fetch profiles" }, 500);
+    }
+
+    const profiles = await profilesResponse.json() as Array<{ id: string; email: string }>;
+    console.log(`[PollCron] Polling feeds for ${profiles.length} users`);
+
+    const results: Array<{ user_id: string; new_episodes: number }> = [];
+
+    for (const profile of profiles) {
+      try {
+        const pollResult = await pollSubscriptionsForUser(env, profile.id, crypto.randomUUID());
+        results.push({ user_id: profile.id, new_episodes: pollResult.new_episodes });
+        console.log(`[PollCron] ${profile.email}: ${pollResult.new_episodes} new episodes`);
+      } catch (err) {
+        console.error(`[PollCron] Error polling for ${profile.email}: ${err}`);
+        results.push({ user_id: profile.id, new_episodes: 0 });
+      }
+    }
+
+    const totalNew = results.reduce((sum, r) => sum + r.new_episodes, 0);
+    console.log(`[PollCron] Complete: ${totalNew} new episodes across ${profiles.length} users`);
+
+    return json({
+      success: true,
+      users_polled: profiles.length,
+      total_new_episodes: totalNew,
+      results,
+    });
+  } catch (error) {
+    console.error(`[PollCron] Error: ${error}`);
+    return json({ error: String(error) }, 500);
+  }
 }
 
 // Daily cron trigger - now routes to dispatcher (async) or legacy (sync)
