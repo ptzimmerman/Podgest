@@ -13,7 +13,7 @@
  * - save_memory / recall / list_memories / forget: Personal memory layer
  *
  * Data layer: Cloudflare D1 (relational), Vectorize (embeddings), R2 (transcripts).
- * Auth still delegates to Supabase — TODO(Phase 5): Better Auth.
+ * Auth: Better Auth session shared across *.podgest.app (see /authorize).
  */
 
 import { OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";

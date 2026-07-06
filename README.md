@@ -22,17 +22,15 @@ flowchart TB
         MCP["podgest-mcp Worker"]
         Pages["Cloudflare Pages"]
         Queue["Cloudflare Queue"]
-    end
-
-    subgraph Supabase["🗄️ Supabase"]
-        DB[(PostgreSQL)]
-        Storage["Storage<br/>(audio files)"]
-        Cron["pg_cron<br/>(daily triggers)"]
+        Cron["Cron Triggers<br/>(daily schedule)"]
+        DB[(D1 SQLite)]
+        Vectorize["Vectorize<br/>(embeddings)"]
+        R2["R2 Storage<br/>(audio + transcripts)"]
     end
 
     subgraph Modal["⚡ Modal (GPU)"]
         Whisper["faster-whisper<br/>Transcription"]
-        TTS["OpenAI/ElevenLabs<br/>Text-to-Speech"]
+        TTS["OpenAI<br/>Text-to-Speech"]
     end
 
     subgraph AI["🤖 AI Services"]
@@ -48,15 +46,17 @@ flowchart TB
     Queue --> API
     
     API --> DB
-    API --> Storage
+    API --> R2
+    API --> Vectorize
     API --> Whisper
     API --> Claude
     API --> TTS
     
-    Whisper --> Storage
-    TTS --> Storage
+    Whisper --> API
+    TTS --> API
     
     MCP --> DB
+    MCP --> Vectorize
     MCP --> OpenAI
 ```
 
@@ -72,9 +72,9 @@ flowchart TB
 | **📡 Any Podcast RSS** | Add any podcast via RSS URL or browse popular feeds |
 | **🔗 ListenNotes Integration** | Import your Listen Later playlist - auto-detects individual podcasts |
 | **🎯 Smart Prioritization** | Less frequent podcasts (weekly shows) get priority over daily ones |
-| **🔐 BYOK (Bring Your Own Keys)** | Use your own OpenAI, Anthropic, and ElevenLabs API keys |
+| **🔐 BYOK (Bring Your Own Keys)** | Use your own OpenAI and Anthropic API keys |
 | **🔒 Encrypted Storage** | API keys encrypted at rest with AES-256-GCM |
-| **🧠 Semantic Memory** | All transcripts embedded via pgvector - search and query across your entire podcast history |
+| **🧠 Semantic Memory** | All transcripts embedded in Cloudflare Vectorize - search and query across your entire podcast history |
 | **👥 Multi-tenant** | Each user has isolated data and personalized digests |
 | **🎙️ MCP Server** | Query your podcast knowledge via Claude Desktop or Cursor |
 
@@ -117,13 +117,14 @@ flowchart TB
 |-----------|------------|
 | **Frontend** | React + TypeScript + Tailwind (Cloudflare Pages) |
 | **API** | Cloudflare Workers (TypeScript) |
-| **Database** | Supabase PostgreSQL |
-| **Storage** | Supabase Storage (audio files) |
-| **Scheduling** | pg_cron + Cloudflare Queues |
+| **Database** | Cloudflare D1 (SQLite) |
+| **Storage** | Cloudflare R2 (audio via cdn.podgest.app, private transcripts) |
+| **Vector Search** | Cloudflare Vectorize |
+| **Scheduling** | Cloudflare Cron Triggers + Queues |
 | **Transcription** | Modal (faster-whisper on GPU) |
 | **Script Generation** | Claude (Anthropic) |
-| **Text-to-Speech** | OpenAI TTS (ElevenLabs optional) |
-| **Auth** | Supabase Auth (Magic Link) |
+| **Text-to-Speech** | OpenAI TTS |
+| **Auth** | Better Auth (Google sign-in, D1-backed sessions) |
 
 ---
 
@@ -139,12 +140,13 @@ podgest/
 │   │       │   ├── Subscriptions.tsx # Podcast management
 │   │       │   └── onboarding/      # First-time user setup
 │   │       └── lib/
-│   │           └── supabase.ts      # Supabase client
+│   │           └── auth.ts          # Better Auth client
 │   │
 │   ├── worker/
 │   │   └── podgest-api/             # Main API (Cloudflare Worker)
 │   │       └── src/
-│   │           ├── index.ts         # API endpoints, digest pipeline, RSS feed
+│   │           ├── index.ts         # API endpoints, digest pipeline, RSS feed, cron
+│   │           ├── auth.ts          # Better Auth config (Google, D1, shared cookies)
 │   │           └── user-keys.ts     # API key encryption/validation
 │   │
 │   └── mcp-server/                  # MCP Server (Cloudflare Worker)
@@ -155,8 +157,9 @@ podgest/
 │   ├── transcribe.py                # GPU transcription (faster-whisper)
 │   └── tts.py                       # Text-to-speech generation
 │
-├── supabase/
-│   └── migrations/                  # Database schema + RLS policies
+├── migration/
+│   ├── d1_schema.sql                # D1 (SQLite) schema
+│   └── better_auth_schema.sql       # Better Auth tables
 │
 ├── docs/
 │   └── IMPLEMENTATION.md            # Detailed design docs & implementation plan
@@ -174,19 +177,11 @@ podgest/
 
 - Node.js 18+
 - pnpm
-- Cloudflare account (Workers + Pages)
-- Supabase project
+- Cloudflare account (Workers + Pages + D1 + R2 + Vectorize)
 - Modal account (for GPU transcription)
+- Google OAuth client (for Better Auth sign-in)
 
 ### Environment Variables
-
-Copy `.env.example` to `.env` and configure:
-
-| Variable | Description |
-|----------|-------------|
-| `SUPABASE_URL` | Supabase project URL |
-| `SUPABASE_ANON_KEY` | Supabase anonymous key |
-| `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key (server-side only) |
 
 Worker secrets (set via `wrangler secret put`):
 
@@ -194,6 +189,8 @@ Worker secrets (set via `wrangler secret put`):
 |--------|-------------|
 | `API_KEY_ENCRYPTION_KEY` | AES-256 key for encrypting user API keys |
 | `ADMIN_API_KEY` | Admin endpoint authentication |
+| `BETTER_AUTH_SECRET` | Better Auth session signing secret |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth client for sign-in |
 
 ### Development
 
