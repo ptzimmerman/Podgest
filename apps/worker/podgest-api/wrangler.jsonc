@@ -28,6 +28,45 @@
         "dead_letter_queue": "podgest-digest-dlq"
       }
     ]
+  },
+  // Cloudflare-native data layer (Supabase migration, Jul 2026)
+  "r2_buckets": [
+    {
+      "binding": "MEDIA",
+      "bucket_name": "podgest-media"
+    },
+    {
+      "binding": "TRANSCRIPTS",
+      "bucket_name": "podgest-transcripts"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "podgest-db",
+      "database_id": "f4f2c887-b593-42b8-9c27-2c485485e66e"
+    }
+  ],
+  "vectorize": [
+    {
+      "binding": "VECTORIZE",
+      "index_name": "podgest-vectors"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "SESSIONS_KV",
+      "id": "16f342f38b6846409506e965e0c18ef1"
+    }
+  ],
+  // Cron Triggers (replaced Supabase pg_cron, Jul 2026). All UTC.
+  // poll feeds -> daily digest -> watchdog retries
+  "triggers": {
+    "crons": [
+      "30 11 * * *",
+      "0 12 * * *",
+      "15,30 12 * * *",
+      "45 12-16 * * *"
+    ]
   }
-  // Note: Cron triggers removed - now using Supabase pg_cron for scheduling
 }

@@ -222,6 +222,7 @@ class TextToSpeech:
         digest_id: str | None = None,
         webhook_url: str | None = None,
         admin_key: str | None = None,
+        upload_url: str | None = None,  # worker endpoint that stores audio in R2
     ) -> dict:
         """
         Generate audio from script text.
@@ -283,14 +284,29 @@ class TextToSpeech:
                 "characters": total_chars,
             }
             
-            # Upload to Supabase if credentials provided
-            if supabase_url and supabase_key and digest_id:
+            # Preferred: upload via worker endpoint -> R2 (Modal holds no storage creds)
+            if upload_url:
+                print(f"📤 Uploading to worker/R2: {upload_url}")
+                upload_response = requests.post(
+                    upload_url,
+                    headers={"X-Admin-Key": admin_key or "", "Content-Type": "audio/mpeg"},
+                    data=final_audio,
+                    timeout=120,
+                )
+                if upload_response.ok:
+                    result["audio_url"] = upload_response.json().get("audio_url")
+                    print(f"✅ Uploaded: {result['audio_url']}")
+                else:
+                    print(f"❌ Upload failed: {upload_response.status_code} - {upload_response.text}")
+                    result["upload_error"] = upload_response.text
+            # Legacy: direct Supabase upload
+            elif supabase_url and supabase_key and digest_id:
                 audio_path = f"{digest_id}/digest.mp3"
-                upload_url = f"{supabase_url}/storage/v1/object/digests/{audio_path}"
+                sb_upload_url = f"{supabase_url}/storage/v1/object/digests/{audio_path}"
                 
                 print(f"📤 Uploading to Supabase: {audio_path}")
                 upload_response = requests.post(
-                    upload_url,
+                    sb_upload_url,
                     headers={
                         "Authorization": f"Bearer {supabase_key}",
                         "Content-Type": "audio/mpeg",
@@ -457,6 +473,7 @@ class OpenAITTS:
         digest_id: str | None = None,
         webhook_url: str | None = None,
         admin_key: str | None = None,
+        upload_url: str | None = None,  # worker endpoint that stores audio in R2
     ) -> dict:
         """
         Generate audio from script text using OpenAI TTS.
@@ -525,14 +542,29 @@ class OpenAITTS:
                 "model": model,
             }
             
-            # Upload to Supabase if credentials provided
-            if supabase_url and supabase_key and digest_id:
+            # Preferred: upload via worker endpoint -> R2 (Modal holds no storage creds)
+            if upload_url:
+                print(f"📤 Uploading to worker/R2: {upload_url}")
+                upload_response = requests.post(
+                    upload_url,
+                    headers={"X-Admin-Key": admin_key or "", "Content-Type": "audio/mpeg"},
+                    data=final_audio,
+                    timeout=120,
+                )
+                if upload_response.ok:
+                    result["audio_url"] = upload_response.json().get("audio_url")
+                    print(f"✅ Uploaded: {result['audio_url']}")
+                else:
+                    print(f"❌ Upload failed: {upload_response.status_code} - {upload_response.text}")
+                    result["upload_error"] = upload_response.text
+            # Legacy: direct Supabase upload
+            elif supabase_url and supabase_key and digest_id:
                 audio_path = f"{digest_id}/digest.mp3"
-                upload_url = f"{supabase_url}/storage/v1/object/digests/{audio_path}"
+                sb_upload_url = f"{supabase_url}/storage/v1/object/digests/{audio_path}"
                 
                 print(f"📤 Uploading to Supabase: {audio_path}")
                 upload_response = requests.post(
-                    upload_url,
+                    sb_upload_url,
                     headers={
                         "Authorization": f"Bearer {supabase_key}",
                         "Content-Type": "audio/mpeg",
@@ -679,6 +711,7 @@ def openai_tts_web(request: dict) -> dict:
         digest_id=request.get("digest_id"),
         webhook_url=request.get("webhook_url"),
         admin_key=request.get("admin_key"),
+        upload_url=request.get("upload_url"),
     )
 
 
@@ -724,6 +757,7 @@ def tts_with_clips_web(request: dict) -> dict:
     digest_id = request.get("digest_id")
     webhook_url = request.get("webhook_url")
     admin_key = request.get("admin_key")
+    upload_url = request.get("upload_url")
     
     if not script:
         return {"error": "script is required"}
@@ -881,14 +915,29 @@ def tts_with_clips_web(request: dict) -> dict:
             "model": model,
         }
         
-        # Upload to Supabase
-        if supabase_url and supabase_key and digest_id:
+        # Preferred: upload via worker endpoint -> R2 (Modal holds no storage creds)
+        if upload_url:
+            print(f"📤 Uploading to worker/R2: {upload_url} ({len(final_audio)} bytes)")
+            upload_response = requests.post(
+                upload_url,
+                headers={"X-Admin-Key": admin_key or "", "Content-Type": "audio/mpeg"},
+                data=final_audio,
+                timeout=120,
+            )
+            if upload_response.ok:
+                result["audio_url"] = upload_response.json().get("audio_url")
+                print(f"✅ Uploaded: {result['audio_url']}")
+            else:
+                print(f"❌ Upload failed: {upload_response.status_code} - {upload_response.text}")
+                result["upload_error"] = upload_response.text
+        # Legacy: direct Supabase upload
+        elif supabase_url and supabase_key and digest_id:
             audio_path = f"{digest_id}/digest.mp3"
-            upload_url = f"{supabase_url}/storage/v1/object/digests/{audio_path}"
+            sb_upload_url = f"{supabase_url}/storage/v1/object/digests/{audio_path}"
             
             print(f"📤 Uploading to Supabase: {audio_path} ({len(final_audio)} bytes)")
             upload_response = requests.post(
-                upload_url,
+                sb_upload_url,
                 headers={
                     "Authorization": f"Bearer {supabase_key}",
                     "Content-Type": "audio/mpeg",

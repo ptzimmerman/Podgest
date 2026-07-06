@@ -41,3 +41,7 @@ supabase/.temp/
 .vercel
 .env*.local
 .wrangler/
+migration/dumps/
+migration/.better_auth_secret
+migration/d1_import/
+migration/vectorize_import/

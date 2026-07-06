@@ -1,11 +1,12 @@
 /**
  * User API Keys Management
  * 
- * Fetches and decrypts user API keys from Supabase.
+ * Fetches and decrypts user API keys from D1.
  * Keys are stored encrypted with AES-256-GCM in the user_api_keys table.
  */
 
 import { decryptApiKey } from './encryption';
+import { one } from './db';
 
 /**
  * Decrypted user API keys
@@ -13,7 +14,6 @@ import { decryptApiKey } from './encryption';
 export interface UserApiKeys {
   openaiKey?: string;
   anthropicKey?: string;
-  elevenlabsKey?: string;
 }
 
 /**
@@ -24,36 +24,28 @@ interface UserApiKeysRow {
   user_id: string;
   openai_key_encrypted: string | null;
   anthropic_key_encrypted: string | null;
-  elevenlabs_key_encrypted: string | null;
-  openai_valid: boolean;
-  anthropic_valid: boolean;
-  elevenlabs_valid: boolean;
+  // SQLite booleans: INTEGER 0/1 (nullable)
+  openai_valid: number | null;
+  anthropic_valid: number | null;
   openai_validated_at: string | null;
   anthropic_validated_at: string | null;
-  elevenlabs_validated_at: string | null;
   created_at: string;
-  updated_at: string;
+  updated_at: string | null;
 }
 
 /**
- * Fetch and decrypt a user's API keys from Supabase.
+ * Fetch and decrypt a user's API keys from D1.
  * 
- * @param supabaseUrl - Supabase project URL
- * @param serviceRoleKey - Supabase service role key
+ * @param db - D1 database binding
  * @param userId - User ID to fetch keys for
  * @param encryptionKey - 32-byte hex encryption key for decryption
  * @returns Decrypted API keys (undefined for keys not set)
  */
 export async function getUserApiKeys(
-  supabaseUrl: string,
-  serviceRoleKey: string,
+  db: D1Database,
   userId: string,
   encryptionKey: string
 ): Promise<UserApiKeys> {
-  if (!supabaseUrl || !serviceRoleKey) {
-    throw new Error('Supabase configuration is required');
-  }
-
   if (!userId) {
     throw new Error('User ID is required');
   }
@@ -64,31 +56,17 @@ export async function getUserApiKeys(
 
   try {
     // Fetch user's API keys from database
-    const response = await fetch(
-      `${supabaseUrl}/rest/v1/user_api_keys?user_id=eq.${userId}&select=*`,
-      {
-        headers: {
-          'apikey': serviceRoleKey,
-          'Authorization': `Bearer ${serviceRoleKey}`,
-          'Content-Type': 'application/json',
-        },
-      }
+    const row = await one<UserApiKeysRow>(
+      db,
+      `SELECT * FROM user_api_keys WHERE user_id = ?`,
+      userId
     );
 
-    if (!response.ok) {
-      const error = await response.text();
-      console.error(`[UserKeys] Supabase error fetching keys:`, error);
-      throw new Error('Failed to fetch user API keys');
-    }
-
-    const rows = await response.json() as UserApiKeysRow[];
-
     // No keys configured for this user
-    if (!rows || rows.length === 0) {
+    if (!row) {
       return {};
     }
 
-    const row = rows[0];
     const keys: UserApiKeys = {};
 
     // Decrypt each key if present
@@ -109,14 +87,6 @@ export async function getUserApiKeys(
       }
     }
 
-    if (row.elevenlabs_key_encrypted) {
-      try {
-        keys.elevenlabsKey = await decryptApiKey(row.elevenlabs_key_encrypted, encryptionKey);
-      } catch (error) {
-        console.error(`[UserKeys] Failed to decrypt ElevenLabs key for user ${userId}:`, error);
-      }
-    }
-
     return keys;
   } catch (error) {
     if (error instanceof Error) {
@@ -129,43 +99,31 @@ export async function getUserApiKeys(
 /**
  * Check if a user has a specific API key configured.
  * 
- * @param supabaseUrl - Supabase project URL
- * @param serviceRoleKey - Supabase service role key
+ * @param db - D1 database binding
  * @param userId - User ID to check
  * @param keyType - Which key to check for
  * @returns True if the key exists (may not be valid)
  */
 export async function hasApiKey(
-  supabaseUrl: string,
-  serviceRoleKey: string,
+  db: D1Database,
   userId: string,
-  keyType: 'openai' | 'anthropic' | 'elevenlabs'
+  keyType: 'openai' | 'anthropic'
 ): Promise<boolean> {
   try {
+    // keyType is constrained by the type system, so the column name is safe to interpolate
     const column = `${keyType}_key_encrypted`;
-    
-    const response = await fetch(
-      `${supabaseUrl}/rest/v1/user_api_keys?user_id=eq.${userId}&select=${column}`,
-      {
-        headers: {
-          'apikey': serviceRoleKey,
-          'Authorization': `Bearer ${serviceRoleKey}`,
-          'Content-Type': 'application/json',
-        },
-      }
+
+    const row = await one<Record<string, string | null>>(
+      db,
+      `SELECT ${column} FROM user_api_keys WHERE user_id = ?`,
+      userId
     );
 
-    if (!response.ok) {
+    if (!row) {
       return false;
     }
 
-    const rows = await response.json() as Array<Record<string, string | null>>;
-    
-    if (!rows || rows.length === 0) {
-      return false;
-    }
-
-    return rows[0][column] !== null;
+    return row[column] !== null;
   } catch {
     return false;
   }
@@ -174,79 +132,52 @@ export async function hasApiKey(
 /**
  * Get user API key status (which keys are set and valid).
  * 
- * @param supabaseUrl - Supabase project URL
- * @param serviceRoleKey - Supabase service role key
+ * @param db - D1 database binding
  * @param userId - User ID to check
  * @returns Status of each API key
  */
 export async function getApiKeyStatus(
-  supabaseUrl: string,
-  serviceRoleKey: string,
+  db: D1Database,
   userId: string
 ): Promise<{
   openai: { set: boolean; valid: boolean; validatedAt: string | null };
   anthropic: { set: boolean; valid: boolean; validatedAt: string | null };
-  elevenlabs: { set: boolean; valid: boolean; validatedAt: string | null };
 }> {
   const defaultStatus = { set: false, valid: false, validatedAt: null };
 
   try {
-    const response = await fetch(
-      `${supabaseUrl}/rest/v1/user_api_keys?user_id=eq.${userId}&select=` +
-      `openai_key_encrypted,anthropic_key_encrypted,elevenlabs_key_encrypted,` +
-      `openai_valid,anthropic_valid,elevenlabs_valid,` +
-      `openai_validated_at,anthropic_validated_at,elevenlabs_validated_at`,
-      {
-        headers: {
-          'apikey': serviceRoleKey,
-          'Authorization': `Bearer ${serviceRoleKey}`,
-          'Content-Type': 'application/json',
-        },
-      }
+    const row = await one<UserApiKeysRow>(
+      db,
+      `SELECT openai_key_encrypted, anthropic_key_encrypted,
+              openai_valid, anthropic_valid,
+              openai_validated_at, anthropic_validated_at
+       FROM user_api_keys WHERE user_id = ?`,
+      userId
     );
 
-    if (!response.ok) {
+    if (!row) {
       return {
         openai: defaultStatus,
         anthropic: defaultStatus,
-        elevenlabs: defaultStatus,
       };
     }
-
-    const rows = await response.json() as UserApiKeysRow[];
-
-    if (!rows || rows.length === 0) {
-      return {
-        openai: defaultStatus,
-        anthropic: defaultStatus,
-        elevenlabs: defaultStatus,
-      };
-    }
-
-    const row = rows[0];
 
     return {
       openai: {
         set: row.openai_key_encrypted !== null,
-        valid: row.openai_valid,
+        valid: !!row.openai_valid,
         validatedAt: row.openai_validated_at,
       },
       anthropic: {
         set: row.anthropic_key_encrypted !== null,
-        valid: row.anthropic_valid,
+        valid: !!row.anthropic_valid,
         validatedAt: row.anthropic_validated_at,
-      },
-      elevenlabs: {
-        set: row.elevenlabs_key_encrypted !== null,
-        valid: row.elevenlabs_valid,
-        validatedAt: row.elevenlabs_validated_at,
       },
     };
   } catch {
     return {
       openai: defaultStatus,
       anthropic: defaultStatus,
-      elevenlabs: defaultStatus,
     };
   }
 }
@@ -321,7 +252,7 @@ export async function validateAnthropicKeyDetailed(apiKey: string): Promise<KeyV
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'claude-3-haiku-20240307',
+        model: 'claude-haiku-4-5',
         max_tokens: 1,
         messages: [{ role: 'user', content: 'Hi' }],
       }),
@@ -367,56 +298,6 @@ export async function validateAnthropicKeyDetailed(apiKey: string): Promise<KeyV
 }
 
 /**
- * Validate an ElevenLabs API key with detailed error reporting.
- */
-export async function validateElevenLabsKeyDetailed(apiKey: string): Promise<KeyValidationResult> {
-  if (!apiKey) {
-    return { valid: false, error: "API key is required", errorCode: 'invalid_key' };
-  }
-
-  try {
-    const response = await fetch('https://api.elevenlabs.io/v1/user/subscription', {
-      method: 'GET',
-      headers: {
-        'xi-api-key': apiKey,
-      },
-    });
-
-    if (response.ok) {
-      // Check subscription status
-      try {
-        const data = await response.json() as { 
-          character_count?: number; 
-          character_limit?: number;
-          status?: string;
-        };
-        
-        // Check if they have characters remaining
-        if (data.character_limit !== undefined && data.character_count !== undefined) {
-          const remaining = data.character_limit - data.character_count;
-          if (remaining <= 0) {
-            return { valid: false, error: "ElevenLabs character quota exhausted. Please upgrade your plan.", errorCode: 'quota_exceeded' };
-          }
-        }
-        return { valid: true };
-      } catch {
-        return { valid: true }; // Key works, couldn't parse subscription details
-      }
-    }
-
-    if (response.status === 401) {
-      return { valid: false, error: "Invalid API key", errorCode: 'invalid_key' };
-    }
-    if (response.status === 429) {
-      return { valid: false, error: "Rate limited. Please try again later.", errorCode: 'rate_limited' };
-    }
-    return { valid: false, error: `HTTP ${response.status}`, errorCode: 'unknown' };
-  } catch (e) {
-    return { valid: false, error: "Network error - could not reach ElevenLabs", errorCode: 'network_error' };
-  }
-}
-
-/**
  * Validate an OpenAI API key by making a test API call.
  * @deprecated Use validateOpenAIKeyDetailed for better error messages
  */
@@ -434,11 +315,3 @@ export async function validateAnthropicKey(apiKey: string): Promise<boolean> {
   return result.valid;
 }
 
-/**
- * Validate an ElevenLabs API key by making a test API call.
- * @deprecated Use validateElevenLabsKeyDetailed for better error messages
- */
-export async function validateElevenLabsKey(apiKey: string): Promise<boolean> {
-  const result = await validateElevenLabsKeyDetailed(apiKey);
-  return result.valid;
-}

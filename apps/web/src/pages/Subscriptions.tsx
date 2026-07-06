@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
-import { supabase } from '../lib/supabase'
+
+const API_URL = import.meta.env.VITE_API_URL || 'https://api.podgest.app'
 
 type Subscription = {
   id: string
@@ -51,17 +52,13 @@ export function Subscriptions() {
 
   const fetchSubscriptions = async () => {
     try {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) return
+      const res = await fetch(`${API_URL}/api/subscriptions`, {
+        credentials: 'include',
+      })
+      if (!res.ok) throw new Error('Failed to load subscriptions')
 
-      const { data, error } = await supabase
-        .from('subscriptions')
-        .select('id, podcast_title, feed_url, is_active, priority, publication_frequency_days')
-        .eq('user_id', session.user.id)
-        .order('priority', { ascending: false })
-
-      if (error) throw error
-      setSubscriptions(data || [])
+      const data = await res.json() as { subscriptions: Subscription[] }
+      setSubscriptions(data.subscriptions || [])
     } catch (err) {
       console.error('Error fetching subscriptions:', err)
       showToast('error', 'Failed to load subscriptions')
@@ -70,18 +67,32 @@ export function Subscriptions() {
     }
   }
 
+  // Add a subscription via the API. Returns 'added' | 'duplicate' | 'error'.
+  const createSubscription = async (sub: {
+    feed_url: string
+    podcast_title: string
+    artwork_url?: string
+    publication_frequency_days: number | null
+  }): Promise<'added' | 'duplicate' | 'error'> => {
+    const res = await fetch(`${API_URL}/api/subscriptions`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sub),
+    })
+    if (res.ok) return 'added'
+    if (res.status === 409) return 'duplicate'
+    return 'error'
+  }
+
   const handleAddFeed = async () => {
     if (!newFeedUrl) return
 
     setAdding(true)
 
     try {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) throw new Error('Not authenticated')
-
       // Use our parse-feed endpoint to analyze the feed
-      const apiUrl = import.meta.env.VITE_API_URL || 'https://api.podgest.app'
-      const parseRes = await fetch(`${apiUrl}/api/parse-feed`, {
+      const parseRes = await fetch(`${API_URL}/api/parse-feed`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ feed_url: newFeedUrl }),
@@ -106,27 +117,20 @@ export function Subscriptions() {
             continue
           }
           
-          const { error } = await supabase
-            .from('subscriptions')
-            .insert({
-              user_id: session.user.id,
-              feed_url: podcast.feed_url,
-              podcast_title: podcast.title,
-              artwork_url: podcast.artwork_url,
-              publication_frequency_days: podcast.publication_frequency_days,
-              is_active: true,
-              priority: 1,
-            })
+          const result = await createSubscription({
+            feed_url: podcast.feed_url,
+            podcast_title: podcast.title,
+            artwork_url: podcast.artwork_url,
+            publication_frequency_days: podcast.publication_frequency_days,
+          })
           
-          if (error) {
-            if (error.code === '23505') {
-              // Already subscribed, skip
-              skippedCount++
-              continue
-            }
-            console.error(`Failed to add ${podcast.title}:`, error)
-          } else {
+          if (result === 'added') {
             addedCount++
+          } else if (result === 'duplicate') {
+            // Already subscribed, skip
+            skippedCount++
+          } else {
+            console.error(`Failed to add ${podcast.title}`)
           }
         }
         
@@ -138,23 +142,18 @@ export function Subscriptions() {
         }
       } else {
         // Regular feed - add single subscription
-        const { error } = await supabase
-          .from('subscriptions')
-          .insert({
-            user_id: session.user.id,
-            feed_url: feedData.feed_url,
-            podcast_title: feedData.feed_title,
-            artwork_url: feedData.artwork_url,
-            publication_frequency_days: feedData.publication_frequency_days,
-            is_active: true,
-            priority: 1,
-          })
+        const result = await createSubscription({
+          feed_url: feedData.feed_url,
+          podcast_title: feedData.feed_title,
+          artwork_url: feedData.artwork_url,
+          publication_frequency_days: feedData.publication_frequency_days,
+        })
 
-        if (error) {
-          if (error.code === '23505') {
-            throw new Error('You are already subscribed to this podcast')
-          }
-          throw error
+        if (result === 'duplicate') {
+          throw new Error('You are already subscribed to this podcast')
+        }
+        if (result === 'error') {
+          throw new Error('Failed to add podcast')
         }
 
         setNewFeedUrl('')
@@ -174,12 +173,14 @@ export function Subscriptions() {
 
   const handleToggleActive = async (id: string, currentActive: boolean) => {
     try {
-      const { error } = await supabase
-        .from('subscriptions')
-        .update({ is_active: !currentActive })
-        .eq('id', id)
+      const res = await fetch(`${API_URL}/api/subscriptions/${id}`, {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_active: !currentActive }),
+      })
 
-      if (error) throw error
+      if (!res.ok) throw new Error('Failed to update subscription')
       await fetchSubscriptions()
     } catch (err) {
       showToast('error', 'Failed to update subscription')
@@ -190,12 +191,12 @@ export function Subscriptions() {
     if (!confirm(`Remove "${title}" from your subscriptions?`)) return
 
     try {
-      const { error } = await supabase
-        .from('subscriptions')
-        .delete()
-        .eq('id', id)
+      const res = await fetch(`${API_URL}/api/subscriptions/${id}`, {
+        method: 'DELETE',
+        credentials: 'include',
+      })
 
-      if (error) throw error
+      if (!res.ok) throw new Error('Failed to remove subscription')
       showToast('success', `Removed: ${title}`)
       await fetchSubscriptions()
     } catch (err) {
@@ -360,11 +361,7 @@ export function Subscriptions() {
                 // Auto-add after setting URL
                 setAdding(true)
                 try {
-                  const { data: { session } } = await supabase.auth.getSession()
-                  if (!session) throw new Error('Not authenticated')
-                  
-                  const apiUrl = import.meta.env.VITE_API_URL || 'https://api.podgest.app'
-                  const parseRes = await fetch(`${apiUrl}/api/parse-feed`, {
+                  const parseRes = await fetch(`${API_URL}/api/parse-feed`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ feed_url: feed.url }),
@@ -377,23 +374,18 @@ export function Subscriptions() {
                   
                   const feedData = await parseRes.json() as ParseFeedResponse
                   
-                  const { error } = await supabase
-                    .from('subscriptions')
-                    .insert({
-                      user_id: session.user.id,
-                      feed_url: feedData.feed_url,
-                      podcast_title: feed.name,
-                      artwork_url: feedData.artwork_url,
-                      publication_frequency_days: feedData.publication_frequency_days,
-                      is_active: true,
-                      priority: 1,
-                    })
+                  const result = await createSubscription({
+                    feed_url: feedData.feed_url,
+                    podcast_title: feed.name,
+                    artwork_url: feedData.artwork_url,
+                    publication_frequency_days: feedData.publication_frequency_days,
+                  })
 
-                  if (error) {
-                    if (error.code === '23505') {
-                      throw new Error('Already subscribed')
-                    }
-                    throw error
+                  if (result === 'duplicate') {
+                    throw new Error('Already subscribed')
+                  }
+                  if (result === 'error') {
+                    throw new Error('Failed to add')
                   }
 
                   setNewFeedUrl('')

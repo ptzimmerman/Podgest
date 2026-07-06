@@ -1,51 +1,61 @@
 import { useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { supabase } from '../lib/supabase'
+import { authClient } from '../lib/auth'
+
+const API_URL = 'https://api.podgest.app'
 
 export function Callback() {
   const navigate = useNavigate()
 
   useEffect(() => {
-    const checkOnboardingStatus = async (userId: string) => {
+    const checkOnboardingStatus = async () => {
       // Check if user has API keys configured
-      const { data: keysData } = await supabase
-        .from('user_api_keys')
-        .select('openai_key_encrypted, anthropic_key_encrypted')
-        .eq('user_id', userId)
-        .single()
+      try {
+        const keysRes = await fetch(`${API_URL}/api/user-keys/status`, {
+          credentials: 'include',
+        })
+        const keysData = keysRes.ok
+          ? await keysRes.json() as { openai: { configured: boolean }; anthropic: { configured: boolean } }
+          : null
 
-      const hasKeys = keysData?.openai_key_encrypted && keysData?.anthropic_key_encrypted
+        const hasKeys = keysData?.openai.configured && keysData?.anthropic.configured
 
-      if (!hasKeys) {
-        // Needs to add API keys
-        navigate('/onboarding/keys')
-        return
+        if (!hasKeys) {
+          // Needs to add API keys
+          navigate('/onboarding/keys')
+          return
+        }
+
+        // Check if user has any subscriptions
+        const subsRes = await fetch(`${API_URL}/api/subscriptions`, {
+          credentials: 'include',
+        })
+        const subsData = subsRes.ok
+          ? await subsRes.json() as { subscriptions: { id: string }[] }
+          : null
+
+        const hasSubscriptions = subsData && subsData.subscriptions.length > 0
+
+        if (!hasSubscriptions) {
+          // Has keys but no subscriptions
+          navigate('/onboarding/podcasts')
+          return
+        }
+
+        // Fully onboarded - go to settings/dashboard
+        navigate('/settings')
+      } catch {
+        // If the checks fail, fall back to settings rather than trapping the user here
+        navigate('/settings')
       }
-
-      // Check if user has any subscriptions
-      const { data: subsData } = await supabase
-        .from('subscriptions')
-        .select('id')
-        .eq('user_id', userId)
-        .limit(1)
-
-      const hasSubscriptions = subsData && subsData.length > 0
-
-      if (!hasSubscriptions) {
-        // Has keys but no subscriptions
-        navigate('/onboarding/podcasts')
-        return
-      }
-
-      // Fully onboarded - go to settings/dashboard
-      navigate('/settings')
     }
 
-    // Handle the OAuth callback
-    supabase.auth.onAuthStateChange((event, session) => {
-      if (event === 'SIGNED_IN' && session) {
-        checkOnboardingStatus(session.user.id)
-      } else if (event === 'SIGNED_OUT') {
+    // After the Better Auth redirect, the session cookie is already set —
+    // just verify it and route based on onboarding state.
+    authClient.getSession().then(({ data }) => {
+      if (data?.session) {
+        checkOnboardingStatus()
+      } else {
         navigate('/login')
       }
     })

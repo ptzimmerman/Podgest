@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { supabase } from '../../lib/supabase'
+import { authClient } from '../../lib/auth'
 
 const API_URL = import.meta.env.VITE_API_URL || 'https://api.podgest.app'
 
@@ -21,20 +21,27 @@ export function OnboardingKeys() {
   }, [])
 
   const checkExistingKeys = async () => {
-    const { data: { session } } = await supabase.auth.getSession()
-    if (!session) {
+    const { data } = await authClient.getSession()
+    if (!data?.session) {
       navigate('/login')
       return
     }
 
-    const { data } = await supabase
-      .from('user_api_keys')
-      .select('openai_key_encrypted, anthropic_key_encrypted')
-      .eq('user_id', session.user.id)
-      .single()
+    try {
+      const res = await fetch(`${API_URL}/api/user-keys/status`, {
+        credentials: 'include',
+      })
+      if (!res.ok) return
 
-    if (data?.openai_key_encrypted) setOpenaiSaved(true)
-    if (data?.anthropic_key_encrypted) setAnthropicSaved(true)
+      const status = await res.json() as {
+        openai: { configured: boolean }
+        anthropic: { configured: boolean }
+      }
+      if (status.openai.configured) setOpenaiSaved(true)
+      if (status.anthropic.configured) setAnthropicSaved(true)
+    } catch (err) {
+      console.error('Failed to check existing keys:', err)
+    }
   }
 
   const testKey = async (keyType: 'openai' | 'anthropic', key: string) => {
@@ -47,14 +54,11 @@ export function OnboardingKeys() {
     setTestResult(prev => ({ ...prev, [keyType]: undefined }))
 
     try {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) throw new Error('Not authenticated')
-
       const res = await fetch(`${API_URL}/api/validate-key`, {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${session.access_token}`,
         },
         body: JSON.stringify({ key_type: keyType, key }),
       })
@@ -78,15 +82,12 @@ export function OnboardingKeys() {
   }
 
   const validateAndSaveKey = async (keyType: string, key: string) => {
-    const { data: { session } } = await supabase.auth.getSession()
-    if (!session) throw new Error('Not authenticated')
-
     // Validate
     const validateRes = await fetch(`${API_URL}/api/validate-key`, {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${session.access_token}`,
       },
       body: JSON.stringify({ key_type: keyType, key }),
     })
@@ -104,9 +105,9 @@ export function OnboardingKeys() {
     // Save
     const saveRes = await fetch(`${API_URL}/api/user-keys`, {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${session.access_token}`,
       },
       body: JSON.stringify({ key_type: keyType, key }),
     })

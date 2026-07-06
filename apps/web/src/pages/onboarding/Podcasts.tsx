@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { supabase } from '../../lib/supabase'
+import { authClient } from '../../lib/auth'
 
 const API_URL = import.meta.env.VITE_API_URL || 'https://api.podgest.app'
 
@@ -50,19 +50,17 @@ export function OnboardingPodcasts() {
 
   const fetchSubscriptions = async () => {
     try {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) {
+      const res = await fetch(`${API_URL}/api/subscriptions`, {
+        credentials: 'include',
+      })
+      if (res.status === 401) {
         navigate('/login')
         return
       }
+      if (!res.ok) throw new Error('Failed to load subscriptions')
 
-      const { data, error } = await supabase
-        .from('subscriptions')
-        .select('id, podcast_title, feed_url')
-        .eq('user_id', session.user.id)
-
-      if (error) throw error
-      setSubscriptions(data || [])
+      const data = await res.json() as { subscriptions: Subscription[] }
+      setSubscriptions(data.subscriptions || [])
     } catch (err) {
       console.error('Error fetching subscriptions:', err)
     } finally {
@@ -70,14 +68,29 @@ export function OnboardingPodcasts() {
     }
   }
 
+  // Add a subscription via the API. Returns 'added' | 'duplicate' | 'error'.
+  const createSubscription = async (sub: {
+    feed_url: string
+    podcast_title: string
+    artwork_url?: string
+    publication_frequency_days: number | null
+  }): Promise<'added' | 'duplicate' | 'error'> => {
+    const res = await fetch(`${API_URL}/api/subscriptions`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sub),
+    })
+    if (res.ok) return 'added'
+    if (res.status === 409) return 'duplicate'
+    return 'error'
+  }
+
   const addPodcast = async (feedUrl: string, title?: string) => {
     setAdding(true)
     setError(null)
 
     try {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) throw new Error('Not authenticated')
-
       // Use our parse-feed endpoint to analyze the feed
       const parseRes = await fetch(`${API_URL}/api/parse-feed`, {
         method: 'POST',
@@ -100,19 +113,14 @@ export function OnboardingPodcasts() {
           // Skip podcasts where we couldn't get the original RSS URL
           if (podcast.feed_url.includes('listennotes.com')) continue
           
-          const { error } = await supabase
-            .from('subscriptions')
-            .insert({
-              user_id: session.user.id,
-              feed_url: podcast.feed_url,
-              podcast_title: podcast.title,
-              artwork_url: podcast.artwork_url,
-              publication_frequency_days: podcast.publication_frequency_days,
-              is_active: true,
-              priority: 1,
-            })
+          const result = await createSubscription({
+            feed_url: podcast.feed_url,
+            podcast_title: podcast.title,
+            artwork_url: podcast.artwork_url,
+            publication_frequency_days: podcast.publication_frequency_days,
+          })
           
-          if (!error) addedCount++
+          if (result === 'added') addedCount++
         }
         
         if (addedCount === 0) {
@@ -122,23 +130,18 @@ export function OnboardingPodcasts() {
         // Regular feed - add single subscription
         const podcastTitle = title || feedData.feed_title || 'Unknown Podcast'
         
-        const { error } = await supabase
-          .from('subscriptions')
-          .insert({
-            user_id: session.user.id,
-            feed_url: feedData.feed_url,
-            podcast_title: podcastTitle,
-            artwork_url: feedData.artwork_url,
-            publication_frequency_days: feedData.publication_frequency_days,
-            is_active: true,
-            priority: 1,
-          })
+        const result = await createSubscription({
+          feed_url: feedData.feed_url,
+          podcast_title: podcastTitle,
+          artwork_url: feedData.artwork_url,
+          publication_frequency_days: feedData.publication_frequency_days,
+        })
 
-        if (error) {
-          if (error.code === '23505') {
-            throw new Error('Already subscribed to this podcast')
-          }
-          throw error
+        if (result === 'duplicate') {
+          throw new Error('Already subscribed to this podcast')
+        }
+        if (result === 'error') {
+          throw new Error('Failed to add podcast')
         }
       }
 
@@ -153,7 +156,10 @@ export function OnboardingPodcasts() {
 
   const removePodcast = async (id: string) => {
     try {
-      await supabase.from('subscriptions').delete().eq('id', id)
+      await fetch(`${API_URL}/api/subscriptions/${id}`, {
+        method: 'DELETE',
+        credentials: 'include',
+      })
       await fetchSubscriptions()
     } catch (err) {
       console.error('Error removing subscription:', err)
@@ -172,8 +178,8 @@ export function OnboardingPodcasts() {
     setFinishing(true)
     
     try {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) {
+      const { data } = await authClient.getSession()
+      if (!data?.session) {
         navigate('/login')
         return
       }
@@ -181,9 +187,9 @@ export function OnboardingPodcasts() {
       // Generate welcome episode in the background
       fetch(`${API_URL}/api/generate-welcome`, {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${session.access_token}`,
         },
       }).then(res => {
         if (res.ok) {

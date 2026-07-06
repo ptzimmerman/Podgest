@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { supabase } from '../lib/supabase'
+import { authClient } from '../lib/auth'
 
 const API_URL = import.meta.env.VITE_API_URL || 'https://api.podgest.app'
 
@@ -34,31 +34,29 @@ const DIGEST_TIMES = Array.from({ length: 48 }, (_, i) => {
 type KeyStatus = {
   openai: { configured: boolean; valid: boolean | null }
   anthropic: { configured: boolean; valid: boolean | null }
-  elevenlabs: { configured: boolean; valid: boolean | null }
 }
 
 export function Settings() {
+  const { data: session } = authClient.useSession()
+  const userId = session?.user.id ?? null
   const [openaiKey, setOpenaiKey] = useState('')
   const [anthropicKey, setAnthropicKey] = useState('')
-  const [elevenLabsKey, setElevenLabsKey] = useState('')
   const [keyStatus, setKeyStatus] = useState<KeyStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
-  const [userId, setUserId] = useState<string | null>(null)
   const [copiedFeed, setCopiedFeed] = useState(false)
   const [copiedMcp, setCopiedMcp] = useState(false)
   const [digestLength, setDigestLength] = useState(5)
   const [digestTime, setDigestTime] = useState('06:00')
   const [timezone, setTimezone] = useState('America/Chicago')
   const [savingDigestPrefs, setSavingDigestPrefs] = useState(false)
-  const [validating, setValidating] = useState<{ openai: boolean; anthropic: boolean; elevenlabs: boolean }>({
-    openai: false, anthropic: false, elevenlabs: false
+  const [validating, setValidating] = useState<{ openai: boolean; anthropic: boolean }>({
+    openai: false, anthropic: false
   })
   const [validationResult, setValidationResult] = useState<{ 
     openai?: { valid: boolean; error?: string };
     anthropic?: { valid: boolean; error?: string };
-    elevenlabs?: { valid: boolean; error?: string };
   }>({})
   const [generatingDigest, setGeneratingDigest] = useState(false)
   const [currentDigestId, setCurrentDigestId] = useState<string | null>(null)
@@ -91,28 +89,30 @@ export function Settings() {
     if (!currentDigestId || !generatingDigest) return
     
     const pollInterval = setInterval(async () => {
-      const { data, error } = await supabase
-        .from('digests')
-        .select('status, error_message')
-        .eq('id', currentDigestId)
-        .single()
-      
-      if (error) {
-        console.error('Error polling digest status:', error)
-        return
-      }
-      
-      setDigestStatus(data.status)
-      
-      if (data.status === 'completed') {
-        setGeneratingDigest(false)
-        showToast('success', 'Digest generated successfully!')
-        clearInterval(pollInterval)
-      } else if (data.status === 'failed') {
-        setGeneratingDigest(false)
-        setLastDigestError(data.error_message || 'Generation failed')
-        showToast('error', data.error_message || 'Digest generation failed')
-        clearInterval(pollInterval)
+      try {
+        const res = await fetch(`${API_URL}/api/digests/${currentDigestId}`, {
+          credentials: 'include',
+        })
+        if (!res.ok) {
+          console.error('Error polling digest status:', res.status)
+          return
+        }
+        const { digest } = await res.json() as { digest: { status: string; error_message: string | null } }
+
+        setDigestStatus(digest.status)
+
+        if (digest.status === 'completed') {
+          setGeneratingDigest(false)
+          showToast('success', 'Digest generated successfully!')
+          clearInterval(pollInterval)
+        } else if (digest.status === 'failed') {
+          setGeneratingDigest(false)
+          setLastDigestError(digest.error_message || 'Generation failed')
+          showToast('error', digest.error_message || 'Digest generation failed')
+          clearInterval(pollInterval)
+        }
+      } catch (err) {
+        console.error('Error polling digest status:', err)
       }
     }, 3000) // Poll every 3 seconds
     
@@ -121,23 +121,17 @@ export function Settings() {
   
   const checkInProgressDigest = async () => {
     try {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) return
-      
       // Check for any pending or processing digests for this user
-      const { data, error } = await supabase
-        .from('digests')
-        .select('id, status, error_message')
-        .eq('user_id', session.user.id)
-        .in('status', ['pending', 'processing', 'transcribing', 'generating_script', 'generating_audio'])
-        .order('created_at', { ascending: false })
-        .limit(1)
-      
-      if (error) throw error
-      
-      if (data && data.length > 0) {
-        setCurrentDigestId(data[0].id)
-        setDigestStatus(data[0].status)
+      const res = await fetch(`${API_URL}/api/digests/in-progress`, {
+        credentials: 'include',
+      })
+      if (!res.ok) return
+
+      const { digest } = await res.json() as { digest: { id: string; status: string; error_message: string | null } | null }
+
+      if (digest) {
+        setCurrentDigestId(digest.id)
+        setDigestStatus(digest.status)
         setGeneratingDigest(true)
       }
     } catch (err) {
@@ -153,17 +147,17 @@ export function Settings() {
     setMessage(null)
     
     try {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) throw new Error('Not authenticated')
+      const { data: sessionData } = await authClient.getSession()
+      if (!sessionData?.session) throw new Error('Not authenticated')
       
       const res = await fetch(`${API_URL}/api/generate-digest`, {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${session.access_token}`,
         },
         body: JSON.stringify({ 
-          user_id: session.user.id,
+          user_id: sessionData.user.id,
           hours_back: 48, // Look back 48 hours for content
           force: true // Generate even if recent digest exists
         }),
@@ -188,34 +182,12 @@ export function Settings() {
 
   const fetchKeyStatus = async () => {
     try {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) return
+      const res = await fetch(`${API_URL}/api/user-keys/status`, {
+        credentials: 'include',
+      })
+      if (!res.ok) throw new Error('Failed to fetch key status')
 
-      setUserId(session.user.id)
-
-      const { data, error } = await supabase
-        .from('user_api_keys')
-        .select('openai_key_encrypted, anthropic_key_encrypted, elevenlabs_key_encrypted, openai_valid, anthropic_valid, elevenlabs_valid')
-        .eq('user_id', session.user.id)
-        .single()
-
-      if (error && error.code !== 'PGRST116') throw error // PGRST116 = no rows
-
-      const status: KeyStatus = {
-        openai: { 
-          configured: !!data?.openai_key_encrypted, 
-          valid: data?.openai_valid ?? null 
-        },
-        anthropic: { 
-          configured: !!data?.anthropic_key_encrypted, 
-          valid: data?.anthropic_valid ?? null 
-        },
-        elevenlabs: { 
-          configured: !!data?.elevenlabs_key_encrypted, 
-          valid: data?.elevenlabs_valid ?? null 
-        },
-      }
-
+      const status = await res.json() as KeyStatus
       setKeyStatus(status)
     } catch (err) {
       console.error('Error fetching key status:', err)
@@ -226,25 +198,23 @@ export function Settings() {
 
   const fetchDigestPreferences = async () => {
     try {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) return
+      const res = await fetch(`${API_URL}/api/profile`, {
+        credentials: 'include',
+      })
+      if (!res.ok) throw new Error('Failed to fetch profile')
 
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('digest_length_minutes, timezone, digest_time')
-        .eq('id', session.user.id)
-        .single()
-
-      if (error) throw error
-      if (data?.digest_length_minutes) {
-        setDigestLength(data.digest_length_minutes)
+      const { profile } = await res.json() as {
+        profile: { digest_length_minutes: number | null; timezone: string | null; digest_time: string | null }
       }
-      if (data?.timezone) {
-        setTimezone(data.timezone)
+      if (profile?.digest_length_minutes) {
+        setDigestLength(profile.digest_length_minutes)
       }
-      if (data?.digest_time) {
+      if (profile?.timezone) {
+        setTimezone(profile.timezone)
+      }
+      if (profile?.digest_time) {
         // digest_time is stored as HH:MM:SS, convert to HH:MM
-        setDigestTime(data.digest_time.substring(0, 5))
+        setDigestTime(profile.digest_time.substring(0, 5))
       }
     } catch (err) {
       console.error('Error fetching digest preferences:', err)
@@ -258,28 +228,14 @@ export function Settings() {
   }) => {
     setSavingDigestPrefs(true)
     try {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) throw new Error('Not authenticated')
-
-      // Convert time to HH:MM:SS format if provided
-      const updateData = {
-        ...updates,
-        digest_time: updates.digest_time ? `${updates.digest_time}:00` : undefined
-      }
-      
-      // Remove undefined values
-      Object.keys(updateData).forEach(key => {
-        if (updateData[key as keyof typeof updateData] === undefined) {
-          delete updateData[key as keyof typeof updateData]
-        }
+      const res = await fetch(`${API_URL}/api/profile`, {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
       })
 
-      const { error } = await supabase
-        .from('profiles')
-        .update(updateData)
-        .eq('id', session.user.id)
-
-      if (error) throw error
+      if (!res.ok) throw new Error('Failed to save preferences')
       showToast('success', 'Preferences saved')
     } catch (err) {
       console.error('Error saving preferences:', err)
@@ -310,7 +266,7 @@ export function Settings() {
     saveDigestPreferences({ digest_time: value })
   }
 
-  const validateKey = async (keyType: 'openai' | 'anthropic' | 'elevenlabs', key: string) => {
+  const validateKey = async (keyType: 'openai' | 'anthropic', key: string) => {
     if (!key) {
       setValidationResult(prev => ({ ...prev, [keyType]: { valid: false, error: 'Please enter a key first' } }))
       return
@@ -339,15 +295,12 @@ export function Settings() {
   }
 
   const validateAndSaveKey = async (keyType: string, key: string) => {
-    const { data: { session } } = await supabase.auth.getSession()
-    if (!session) throw new Error('Not authenticated')
-
     // Validate key first
     const validateRes = await fetch(`${API_URL}/api/validate-key`, {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${session.access_token}`,
       },
       body: JSON.stringify({ key_type: keyType, key }),
     })
@@ -365,9 +318,9 @@ export function Settings() {
     // Save key
     const saveRes = await fetch(`${API_URL}/api/user-keys`, {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${session.access_token}`,
       },
       body: JSON.stringify({ key_type: keyType, key }),
     })
@@ -407,16 +360,6 @@ export function Settings() {
         }
       }
 
-      if (elevenLabsKey) {
-        try {
-          await validateAndSaveKey('elevenlabs', elevenLabsKey)
-          results.push('ElevenLabs')
-          setElevenLabsKey('')
-        } catch (err) {
-          errors.push(`ElevenLabs: ${err instanceof Error ? err.message : 'Failed'}`)
-        }
-      }
-
       if (errors.length > 0) {
         showToast('error', errors.join('; '))
       } else if (results.length > 0) {
@@ -429,19 +372,16 @@ export function Settings() {
       // If we just saved an OpenAI key (required for TTS), try to generate welcome episode
       // This handles users who skipped onboarding and added keys later
       if (results.includes('OpenAI')) {
-        const { data: { session } } = await supabase.auth.getSession()
-        if (session) {
-          // Fire and forget - don't block on this
-          fetch(`${API_URL}/api/generate-welcome`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${session.access_token}`,
-            },
-          }).catch(() => {
-            // Silently ignore errors - welcome episode is optional
-          })
-        }
+        // Fire and forget - don't block on this
+        fetch(`${API_URL}/api/generate-welcome`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        }).catch(() => {
+          // Silently ignore errors - welcome episode is optional
+        })
       }
     } finally {
       setSaving(false)
@@ -462,14 +402,9 @@ export function Settings() {
   const handleDeleteAccount = async () => {
     setDeleting(true)
     try {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (!session) throw new Error('Not authenticated')
-
       const res = await fetch(`${API_URL}/api/delete-account`, {
         method: 'DELETE',
-        headers: {
-          'Authorization': `Bearer ${session.access_token}`,
-        },
+        credentials: 'include',
       })
 
       if (!res.ok) {
@@ -478,7 +413,7 @@ export function Settings() {
       }
 
       // Sign out and redirect to login
-      await supabase.auth.signOut()
+      await authClient.signOut()
       navigate('/login')
     } catch (err) {
       showToast('error', err instanceof Error ? err.message : 'Failed to delete account')
@@ -992,48 +927,12 @@ export function Settings() {
             )}
           </div>
 
-          {/* ElevenLabs Key */}
-          <div>
-            <div className="flex items-center justify-between">
-              <label htmlFor="elevenlabs-key" className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                ElevenLabs API Key
-                <span className="ml-2 text-xs text-gray-400 font-normal">(Optional)</span>
-              </label>
-              {keyStatus && <StatusBadge status={keyStatus.elevenlabs} />}
-            </div>
-            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-              Premium TTS provider for high-quality voices
-            </p>
-            <div className="mt-2 flex gap-2">
-              <input
-                type="password"
-                id="elevenlabs-key"
-                value={elevenLabsKey}
-                onChange={(e) => { setElevenLabsKey(e.target.value); setValidationResult(prev => ({ ...prev, elevenlabs: undefined })) }}
-                placeholder={keyStatus?.elevenlabs.configured ? 'Enter new key to replace' : 'xi-...'}
-                className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm bg-white dark:bg-gray-900 dark:text-white"
-              />
-              <button
-                type="button"
-                onClick={() => validateKey('elevenlabs', elevenLabsKey)}
-                disabled={!elevenLabsKey || validating.elevenlabs}
-                className="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-              >
-                {validating.elevenlabs ? 'Testing...' : 'Test'}
-              </button>
-            </div>
-            {validationResult.elevenlabs && (
-              <p className={`mt-2 text-sm ${validationResult.elevenlabs.valid ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
-                {validationResult.elevenlabs.valid ? '✓ Key is valid' : `✗ ${validationResult.elevenlabs.error || 'Invalid key'}`}
-              </p>
-            )}
-          </div>
         </div>
 
         <div className="mt-6 pt-6 border-t border-gray-200 dark:border-gray-700">
           <button
             onClick={handleSave}
-            disabled={saving || (!openaiKey && !anthropicKey && !elevenLabsKey)}
+            disabled={saving || (!openaiKey && !anthropicKey)}
             className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {saving ? 'Saving...' : 'Save API Keys'}
@@ -1047,7 +946,6 @@ export function Settings() {
         <ul className="mt-2 text-sm text-blue-700 dark:text-blue-400 space-y-1">
           <li>• <strong>OpenAI</strong>: <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer" className="underline">platform.openai.com/api-keys</a></li>
           <li>• <strong>Anthropic</strong>: <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener noreferrer" className="underline">console.anthropic.com/settings/keys</a></li>
-          <li>• <strong>ElevenLabs</strong>: <a href="https://elevenlabs.io/app/settings/api-keys" target="_blank" rel="noopener noreferrer" className="underline">elevenlabs.io/app/settings/api-keys</a></li>
         </ul>
       </section>
 

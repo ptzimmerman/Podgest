@@ -1,25 +1,23 @@
 import { useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { supabase } from '../lib/supabase'
+import { authClient } from '../lib/auth'
 
 export function Login() {
   const navigate = useNavigate()
 
   useEffect(() => {
     // Check if already logged in
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session) {
+    authClient.getSession().then(({ data }) => {
+      if (data?.session) {
         navigate('/settings')
       }
     })
   }, [navigate])
 
   const handleGoogleLogin = async () => {
-    const { error } = await supabase.auth.signInWithOAuth({
+    const { error } = await authClient.signIn.social({
       provider: 'google',
-      options: {
-        redirectTo: `${window.location.origin}/callback`,
-      },
+      callbackURL: `${window.location.origin}/callback`,
     })
 
     if (error) {

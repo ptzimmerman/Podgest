@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
 import { Link, Outlet, useNavigate } from 'react-router-dom'
-import { supabase } from '../lib/supabase'
+import { authClient } from '../lib/auth'
+
+const API_URL = 'https://api.podgest.app'
 
 type UserInfo = {
   email: string
@@ -10,6 +12,7 @@ type UserInfo = {
 
 export function Layout() {
   const navigate = useNavigate()
+  const { data: session } = authClient.useSession()
   const [user, setUser] = useState<UserInfo | null>(null)
   const [userId, setUserId] = useState<string | null>(null)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -39,10 +42,12 @@ export function Layout() {
     
     const saveDarkMode = async () => {
       try {
-        await supabase
-          .from('profiles')
-          .update({ dark_mode: darkMode })
-          .eq('id', userId)
+        await fetch(`${API_URL}/api/profile`, {
+          method: 'PATCH',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dark_mode: darkMode }),
+        })
       } catch (err) {
         console.error('Failed to save dark mode preference:', err)
       }
@@ -52,36 +57,30 @@ export function Layout() {
   }, [darkMode, userId])
 
   useEffect(() => {
-    const fetchUser = async () => {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (session?.user) {
-        const email = session.user.email || ''
-        const metadata = session.user.user_metadata || {}
-        setUserId(session.user.id)
-        setUser({
-          email,
-          displayName: metadata.full_name || metadata.name || null,
-          avatarUrl: metadata.avatar_url || metadata.picture || null,
-        })
-        
-        // Fetch dark mode preference from database
-        try {
-          const { data } = await supabase
-            .from('profiles')
-            .select('dark_mode')
-            .eq('id', session.user.id)
-            .single()
-          
-          if (data?.dark_mode !== null && data?.dark_mode !== undefined) {
-            setDarkMode(data.dark_mode)
-          }
-        } catch (err) {
-          console.error('Failed to fetch dark mode preference:', err)
+    if (!session?.user) return
+
+    setUserId(session.user.id)
+    setUser({
+      email: session.user.email || '',
+      displayName: session.user.name || null,
+      avatarUrl: session.user.image || null,
+    })
+
+    // Fetch dark mode preference from database
+    const fetchDarkMode = async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/profile`, { credentials: 'include' })
+        if (!res.ok) return
+        const { profile } = await res.json() as { profile: { dark_mode: boolean } }
+        if (profile?.dark_mode !== null && profile?.dark_mode !== undefined) {
+          setDarkMode(profile.dark_mode)
         }
+      } catch (err) {
+        console.error('Failed to fetch dark mode preference:', err)
       }
     }
-    fetchUser()
-  }, [])
+    fetchDarkMode()
+  }, [session?.user])
 
   // Close menu when clicking outside
   useEffect(() => {
@@ -95,7 +94,7 @@ export function Layout() {
   }, [])
 
   const handleSignOut = async () => {
-    await supabase.auth.signOut()
+    await authClient.signOut()
     navigate('/login')
   }
 

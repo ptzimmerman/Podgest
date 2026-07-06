@@ -10,12 +10,34 @@
   // Note: Custom domain (mcp.podgest.app) is configured via Cloudflare dashboard
   
   // Environment variables (set via wrangler secret)
-  // SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY, USER_ENCRYPTION_KEY
+  // USER_ENCRYPTION_KEY (secret; decrypts user BYOK API keys)
   
   "kv_namespaces": [
     {
       "binding": "OAUTH_KV",
       "id": "8dba0fed9c8544f8b6cbc93846695d8c"
+    }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "podgest-db",
+      "database_id": "f4f2c887-b593-42b8-9c27-2c485485e66e"
+    }
+  ],
+
+  "vectorize": [
+    {
+      "binding": "VECTORIZE",
+      "index_name": "podgest-vectors"
+    }
+  ],
+
+  "r2_buckets": [
+    {
+      "binding": "TRANSCRIPTS",
+      "bucket_name": "podgest-transcripts"
     }
   ],
   

@@ -1,13 +1,12 @@
-import { getUserApiKeys, validateOpenAIKey, validateAnthropicKey, validateElevenLabsKey, validateOpenAIKeyDetailed, validateAnthropicKeyDetailed, validateElevenLabsKeyDetailed } from './user-keys';
+import { getUserApiKeys, validateOpenAIKey, validateAnthropicKey, validateOpenAIKeyDetailed, validateAnthropicKeyDetailed } from './user-keys';
 import { generateChunkedEmbeddings } from './embeddings';
 import { encryptApiKey, decryptApiKey } from './encryption';
+import { one, all, run, parseJson } from './db';
+import { createAuth } from './auth';
 
 export interface Env {
-  SUPABASE_URL: string;
-  SUPABASE_SERVICE_ROLE_KEY: string;
   ANTHROPIC_API_KEY: string;
   SUPERMEMORY_API_KEY: string;
-  ELEVENLABS_API_KEY: string;
   OPENAI_API_KEY: string;
   // Phase 8: BYOK encryption key for user API keys
   // Generate with: openssl rand -hex 32
@@ -18,7 +17,20 @@ export interface Env {
   // Generate with: openssl rand -hex 32
   // Set with: wrangler secret put ADMIN_API_KEY
   ADMIN_API_KEY: string;
+  // Better Auth (replaced Supabase Auth, Jul 2026)
+  BETTER_AUTH_SECRET: string;
+  GOOGLE_CLIENT_ID: string;
+  GOOGLE_CLIENT_SECRET: string;
+  // Cloudflare-native data layer (Supabase migration, Jul 2026)
+  MEDIA: R2Bucket;        // public bucket (digest audio + static assets), served via cdn.podgest.app
+  TRANSCRIPTS: R2Bucket;  // private bucket for transcript JSON
+  DB: D1Database;
+  VECTORIZE: VectorizeIndex;
+  SESSIONS_KV: KVNamespace;
 }
+
+// Public base URL for the MEDIA bucket (R2 custom domain)
+const MEDIA_BASE_URL = "https://cdn.podgest.app";
 
 // Queue message type for async digest processing
 interface DigestQueueMessage {
@@ -474,26 +486,19 @@ async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<
   let newEpisodesTotal = 0;
   let transcriptionsTriggered = 0;
 
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-
   // 1. Fetch all active subscriptions
   console.log("[Poll] Fetching subscriptions...");
-  const subsResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/subscriptions?is_active=eq.true&select=id,user_id,feed_url,podcast_title`,
-    { headers }
-  );
-  
-  if (!subsResponse.ok) {
-    const errorMsg = `Failed to fetch subscriptions: ${subsResponse.status}`;
+  let subscriptions: Subscription[];
+  try {
+    subscriptions = await all<Subscription>(
+      env.DB,
+      `SELECT id, user_id, feed_url, podcast_title FROM subscriptions WHERE is_active = 1`
+    );
+  } catch (e) {
+    const errorMsg = `Failed to fetch subscriptions: ${e instanceof Error ? e.message : String(e)}`;
     await logger?.log('poll_fetch_subscriptions', 'failed', {}, errorMsg);
     throw new Error(errorMsg);
   }
-  
-  const subscriptions: Subscription[] = await subsResponse.json();
   console.log(`[Poll] Found ${subscriptions.length} active subscriptions`);
   await logger?.log('poll_fetch_subscriptions', 'completed', { count: subscriptions.length });
 
@@ -509,25 +514,21 @@ async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<
       const publicationFrequency = calculateFrequencyFromRSS(feed.episodes);
       
       // Update subscription metadata including frequency
-      await fetch(
-        `${env.SUPABASE_URL}/rest/v1/subscriptions?id=eq.${sub.id}`,
-        {
-          method: "PATCH",
-          headers,
-          body: JSON.stringify({
-            artwork_url: feed.artwork_url,
-            last_polled_at: new Date().toISOString(),
-            publication_frequency_days: publicationFrequency,
-          }),
-        }
+      await run(
+        env.DB,
+        `UPDATE subscriptions SET artwork_url = ?, last_polled_at = ?, publication_frequency_days = ? WHERE id = ?`,
+        feed.artwork_url,
+        new Date().toISOString(),
+        publicationFrequency,
+        sub.id
       );
 
       // Get existing episode GUIDs for this feed
-      const existingResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/episodes?feed_url=eq.${encodeURIComponent(sub.feed_url)}&select=guid`,
-        { headers }
+      const existingEpisodes = await all<{ guid: string }>(
+        env.DB,
+        `SELECT guid FROM episodes WHERE feed_url = ?`,
+        sub.feed_url
       );
-      const existingEpisodes: { guid: string }[] = await existingResponse.json();
       const existingGuids = new Set(existingEpisodes.map(e => e.guid));
       
       // Find new episodes
@@ -539,31 +540,41 @@ async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<
 
       // Insert new episodes and trigger transcription
       for (const episode of episodesToProcess) {
-        // Insert episode
-        const insertResponse = await fetch(
-          `${env.SUPABASE_URL}/rest/v1/episodes`,
-          {
-            method: "POST",
-            headers: { ...headers, "Prefer": "return=representation" },
-            body: JSON.stringify({
-              feed_url: sub.feed_url,
-              guid: episode.guid,
-              title: episode.title,
-              description: episode.description,
-              audio_url: episode.audio_url,
-              duration_seconds: episode.duration_seconds,
-              published_at: episode.published_at,
-            }),
-          }
-        );
-
-        if (!insertResponse.ok) {
-          const err = await insertResponse.text();
-          console.error(`[Poll] Failed to insert episode: ${err}`);
+        // Insert episode (upsert on (feed_url, guid) to be safe against races)
+        const insertedEpisode = { id: crypto.randomUUID() };
+        try {
+          await run(
+            env.DB,
+            `INSERT INTO episodes (id, feed_url, guid, title, description, audio_url, duration_seconds, published_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(feed_url, guid) DO UPDATE SET
+               title = excluded.title,
+               description = excluded.description,
+               audio_url = excluded.audio_url,
+               duration_seconds = excluded.duration_seconds,
+               published_at = excluded.published_at`,
+            insertedEpisode.id,
+            sub.feed_url,
+            episode.guid,
+            episode.title,
+            episode.description,
+            episode.audio_url,
+            episode.duration_seconds,
+            episode.published_at
+          );
+          // If the row already existed, reuse its id
+          const existingRow = await one<{ id: string }>(
+            env.DB,
+            `SELECT id FROM episodes WHERE feed_url = ? AND guid = ?`,
+            sub.feed_url,
+            episode.guid
+          );
+          if (existingRow) insertedEpisode.id = existingRow.id;
+        } catch (insertErr) {
+          console.error(`[Poll] Failed to insert episode: ${insertErr}`);
           continue;
         }
 
-        const [insertedEpisode] = await insertResponse.json();
         newEpisodesTotal++;
         console.log(`[Poll] Inserted episode: ${episode.title}`);
 
@@ -597,36 +608,25 @@ async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<
                 if (transcriptText && transcriptText.length > 100) {
                   console.log(`[Poll] Found existing transcript for: ${episode.title} (${transcriptText.length} chars)`);
                   
-                  // Save transcript to storage
+                  // Save transcript to R2
                   const transcriptPath = `${insertedEpisode.id}/transcript.json`;
                   const transcriptData = JSON.stringify({ text: transcriptText });
                   
-                  await fetch(
-                    `${env.SUPABASE_URL}/storage/v1/object/transcripts/${transcriptPath}`,
-                    {
-                      method: "POST",
-                      headers: {
-                        ...headers,
-                        "Content-Type": "application/json",
-                      },
-                      body: transcriptData,
-                    }
-                  );
+                  await env.TRANSCRIPTS.put(transcriptPath, transcriptData, {
+                    httpMetadata: { contentType: "application/json" },
+                  });
                   
                   // Create completed transcription record
-                  await fetch(
-                    `${env.SUPABASE_URL}/rest/v1/transcriptions`,
-                    {
-                      method: "POST",
-                      headers,
-                      body: JSON.stringify({
-                        episode_id: insertedEpisode.id,
-                        status: "completed",
-                        transcript_storage_path: transcriptPath,
-                        word_count: transcriptText.split(/\s+/).length,
-                        completed_at: new Date().toISOString(),
-                      }),
-                    }
+                  await run(
+                    env.DB,
+                    `INSERT INTO transcriptions (id, episode_id, status, transcript_storage_path, word_count, completed_at)
+                     VALUES (?, ?, ?, ?, ?, ?)`,
+                    crypto.randomUUID(),
+                    insertedEpisode.id,
+                    "completed",
+                    transcriptPath,
+                    transcriptText.split(/\s+/).length,
+                    new Date().toISOString()
                   );
                   
                   transcriptFound = true;
@@ -653,16 +653,12 @@ async function pollAllSubscriptions(env: Env, logger?: PipelineLogger): Promise<
         // Fall back to Modal if no existing transcript found
         if (!transcriptFound) {
           // Create transcription record
-          await fetch(
-            `${env.SUPABASE_URL}/rest/v1/transcriptions`,
-            {
-              method: "POST",
-              headers,
-              body: JSON.stringify({
-                episode_id: insertedEpisode.id,
-                status: "processing",
-              }),
-            }
+          await run(
+            env.DB,
+            `INSERT INTO transcriptions (id, episode_id, status) VALUES (?, ?, ?)`,
+            crypto.randomUUID(),
+            insertedEpisode.id,
+            "processing"
           );
 
           // Trigger Modal transcription
@@ -745,32 +741,15 @@ function requireAdminAuth(request: Request, env: Env): Response | null {
 }
 
 /**
- * Verify a Supabase JWT token by calling the Supabase Auth API.
+ * Verify a Better Auth session (cookie or Bearer session token).
  * Returns the user's ID if valid, or null if invalid/expired.
  */
-async function verifySupabaseJWT(request: Request, env: Env): Promise<{ userId: string } | null> {
-  const authHeader = request.headers.get('Authorization');
-  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
-  
-  const token = authHeader.replace('Bearer ', '');
-  
-  // Don't try to verify the admin key as a JWT
-  if (token === env.ADMIN_API_KEY) return null;
-  
+async function verifySession(request: Request, env: Env): Promise<{ userId: string } | null> {
   try {
-    const response = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
-      },
-    });
-    
-    if (!response.ok) return null;
-    
-    const user = await response.json() as { id: string };
-    if (!user?.id) return null;
-    
-    return { userId: user.id };
+    const auth = createAuth(env);
+    const session = await auth.api.getSession({ headers: request.headers });
+    if (!session?.user?.id) return null;
+    return { userId: session.user.id };
   } catch {
     return null;
   }
@@ -797,9 +776,9 @@ async function requireAuth(request: Request, env: Env): Promise<{ userId: string
     return { userId: 'admin' };
   }
   
-  // Try JWT verification
-  const jwtAuth = await verifySupabaseJWT(request, env);
-  if (jwtAuth) return jwtAuth;
+  // Try Better Auth session verification
+  const sessionAuth = await verifySession(request, env);
+  if (sessionAuth) return sessionAuth;
   
   return json({ error: "Unauthorized: valid credentials required" }, 401);
 }
@@ -813,14 +792,13 @@ function isValidUUID(value: string): boolean {
 }
 
 /**
- * Validate that a URL belongs to our Supabase Storage domain.
+ * Validate that a URL belongs to our media CDN (R2 custom domain).
  * Prevents content injection via webhook audio_url spoofing.
  */
-function isAllowedAudioUrl(audioUrl: string, env: Env): boolean {
+function isAllowedAudioUrl(audioUrl: string, _env: Env): boolean {
   try {
     const url = new URL(audioUrl);
-    const supabaseUrl = new URL(env.SUPABASE_URL);
-    return url.hostname === supabaseUrl.hostname;
+    return url.hostname === new URL(MEDIA_BASE_URL).hostname;
   } catch {
     return false;
   }
@@ -843,6 +821,8 @@ function getCorsHeaders(request: Request): Record<string, string> {
     "Access-Control-Allow-Origin": allowedOrigin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
     "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Key",
+    // Cookie-based Better Auth sessions require credentialed CORS
+    "Access-Control-Allow-Credentials": "true",
     "Vary": "Origin",
   };
 }
@@ -880,6 +860,13 @@ export default {
       return json({ status: "ok", timestamp: new Date().toISOString() });
     }
 
+    // Better Auth routes (sign-in, callback, session, sign-out, ...)
+    if (url.pathname.startsWith("/api/auth/")) {
+      const auth = createAuth(env);
+      const response = await auth.handler(request);
+      return withCors(response, request);
+    }
+
     // Manual poll trigger (admin only)
     if (url.pathname === "/api/poll" && request.method === "POST") {
       const authError = requireAdminAuth(request, env);
@@ -905,6 +892,14 @@ export default {
       const authError = requireAdminAuth(request, env);
       if (authError) return authError;
       return handleTTSWebhook(request, env);
+    }
+
+    // Modal TTS audio upload -> R2 (admin key required)
+    // Modal POSTs the finished MP3 here; the worker owns all storage credentials.
+    if (url.pathname === "/api/webhooks/tts-audio" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
+      return handleTTSAudioUpload(request, env, url);
     }
     
     // Manual topic extraction trigger (admin only)
@@ -1026,7 +1021,7 @@ export default {
     
     // Self-service account deletion (user JWT auth)
     if (url.pathname === "/api/delete-account" && request.method === "DELETE") {
-      const auth = await verifySupabaseJWT(request, env);
+      const auth = await verifySession(request, env);
       if (!auth) return json({ error: "Unauthorized" }, 401);
       return withCors(await handleDeleteAccount(auth.userId, env), request);
     }
@@ -1043,20 +1038,11 @@ export default {
     if (url.pathname === "/api/debug-cron" && request.method === "GET") {
       const authError = requireAdminAuth(request, env);
       if (authError) return authError;
-      const headers = {
-        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        "Content-Type": "application/json",
-      };
-      const profilesResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/profiles?select=id,timezone,digest_time`,
-        { headers }
-      );
-      const profiles = await profilesResponse.json() as Array<{
+      const profiles = await all<{
         id: string;
         timezone: string;
         digest_time: string;
-      }>;
+      }>(env.DB, `SELECT id, timezone, digest_time FROM profiles`);
       
       const now = new Date();
       const debug = profiles.map(profile => {
@@ -1203,6 +1189,72 @@ export default {
       return withCors(await handleParseFeed(request, env), request);
     }
 
+    // ============================================
+    // USER-FACING DATA ENDPOINTS (Better Auth session)
+    // Replaced direct Supabase client access from the dashboard, Jul 2026.
+    // ============================================
+
+    // List the authenticated user's subscriptions
+    if (url.pathname === "/api/subscriptions" && request.method === "GET") {
+      const auth = await verifySession(request, env);
+      if (!auth) return withCors(json({ error: "Unauthorized" }, 401), request);
+      return withCors(await handleListSubscriptions(auth.userId, env), request);
+    }
+
+    // Add a subscription for the authenticated user
+    if (url.pathname === "/api/subscriptions" && request.method === "POST") {
+      const auth = await verifySession(request, env);
+      if (!auth) return withCors(json({ error: "Unauthorized" }, 401), request);
+      return withCors(await handleAddSubscription(auth.userId, request, env), request);
+    }
+
+    // Update (toggle active) or delete a subscription owned by the authenticated user
+    if (url.pathname.startsWith("/api/subscriptions/") && (request.method === "PATCH" || request.method === "DELETE")) {
+      const auth = await verifySession(request, env);
+      if (!auth) return withCors(json({ error: "Unauthorized" }, 401), request);
+      const subscriptionId = url.pathname.replace("/api/subscriptions/", "");
+      if (request.method === "DELETE") {
+        return withCors(await handleDeleteSubscription(auth.userId, subscriptionId, env), request);
+      }
+      return withCors(await handleUpdateSubscription(auth.userId, subscriptionId, request, env), request);
+    }
+
+    // Read the authenticated user's profile (digest prefs, dark mode)
+    if (url.pathname === "/api/profile" && request.method === "GET") {
+      const auth = await verifySession(request, env);
+      if (!auth) return withCors(json({ error: "Unauthorized" }, 401), request);
+      return withCors(await handleGetProfile(auth.userId, env), request);
+    }
+
+    // Update the authenticated user's profile preferences
+    if (url.pathname === "/api/profile" && request.method === "PATCH") {
+      const auth = await verifySession(request, env);
+      if (!auth) return withCors(json({ error: "Unauthorized" }, 401), request);
+      return withCors(await handleUpdateOwnProfile(auth.userId, request, env), request);
+    }
+
+    // API key configuration status for the authenticated user (no key material returned)
+    if (url.pathname === "/api/user-keys/status" && request.method === "GET") {
+      const auth = await verifySession(request, env);
+      if (!auth) return withCors(json({ error: "Unauthorized" }, 401), request);
+      return withCors(await handleUserKeyStatus(auth.userId, env), request);
+    }
+
+    // Latest in-progress digest for the authenticated user (for resuming the progress UI)
+    if (url.pathname === "/api/digests/in-progress" && request.method === "GET") {
+      const auth = await verifySession(request, env);
+      if (!auth) return withCors(json({ error: "Unauthorized" }, 401), request);
+      return withCors(await handleInProgressDigest(auth.userId, env), request);
+    }
+
+    // Status of a specific digest owned by the authenticated user (for polling)
+    if (url.pathname.startsWith("/api/digests/") && request.method === "GET") {
+      const auth = await verifySession(request, env);
+      if (!auth) return withCors(json({ error: "Unauthorized" }, 401), request);
+      const digestId = url.pathname.replace("/api/digests/", "");
+      return withCors(await handleDigestStatus(auth.userId, digestId, env), request);
+    }
+
     return json({ error: "Not found" }, 404);
   },
   
@@ -1211,9 +1263,54 @@ export default {
   async queue(batch: MessageBatch<DigestQueueMessage>, env: Env, ctx: ExecutionContext): Promise<void> {
     await handleQueueBatch(batch, env, ctx);
   },
-  
-  // Note: Cron triggers removed - now using Supabase pg_cron via /api/daily-cron endpoint
+
+  // Cloudflare Cron Triggers (replaced Supabase pg_cron, Jul 2026).
+  // Schedules mirror the old pg_cron jobs (all UTC):
+  //   30 11 * * *   poll feeds + trigger transcriptions
+  //   0 12 * * *    daily digest dispatch
+  //   15,30 12 * * * + 45 12-16 * * *  watchdog: requeue users missing today's digest
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    switch (event.cron) {
+      case "30 11 * * *":
+        await handlePollCron(env);
+        break;
+      case "0 12 * * *":
+        await handleDailyCron(env, ctx);
+        break;
+      default:
+        await runDigestWatchdog(env);
+        break;
+    }
+  },
 };
+
+// Watchdog (was pg_cron watchdog_check_digests_per_user): requeue any user
+// who has no digest row for today's UTC date.
+async function runDigestWatchdog(env: Env): Promise<void> {
+  const today = new Date().toISOString().slice(0, 10);
+  const missing = await env.DB.prepare(
+    `SELECT p.id, p.email FROM profiles p
+     LEFT JOIN digests d ON d.user_id = p.id AND d.digest_date = ?
+     WHERE d.id IS NULL`
+  ).bind(today).all<{ id: string; email: string }>();
+
+  const users = missing.results ?? [];
+  if (users.length === 0) {
+    console.log(`[Watchdog] All users have digests for ${today}`);
+    return;
+  }
+
+  const runId = crypto.randomUUID();
+  console.log(`[Watchdog] ${users.length} user(s) missing digest for ${today}, requeuing (run ${runId})`);
+  for (const user of users) {
+    await env.DIGEST_QUEUE.send({
+      user_id: user.id,
+      triggered_at: new Date().toISOString(),
+      run_id: runId,
+    });
+    await logPipelineEvent(env, user.id, "watchdog_requeued", { run_id: runId, email: user.email });
+  }
+}
 
 // Internal function to generate digest for a user (used by scheduled cron)
 // Returns { success: boolean, error?: string, digest_id?: string }
@@ -1257,28 +1354,18 @@ async function runScheduledDigest(env: Env, ctx: ExecutionContext, logger?: Pipe
     action: string
   }>
 }> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-  
-  const profilesResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/profiles?select=id,timezone,digest_time`,
-    { headers }
-  );
-  
-  if (!profilesResponse.ok) {
-    const errorMsg = "Failed to fetch profiles";
-    await logger?.log('digest_fetch_profiles', 'failed', {}, errorMsg);
-    throw new Error(errorMsg);
-  }
-  
-  const profiles = await profilesResponse.json() as Array<{
+  let profiles: Array<{
     id: string;
     timezone: string;
     digest_time: string;
   }>;
+  try {
+    profiles = await all(env.DB, `SELECT id, timezone, digest_time FROM profiles`);
+  } catch (e) {
+    const errorMsg = "Failed to fetch profiles";
+    await logger?.log('digest_fetch_profiles', 'failed', {}, errorMsg);
+    throw new Error(errorMsg);
+  }
   
   await logger?.log('digest_fetch_profiles', 'completed', { user_count: profiles.length });
   
@@ -1306,12 +1393,12 @@ async function runScheduledDigest(env: Env, ctx: ExecutionContext, logger?: Pipe
     };
     
     // Check if digest already exists for today
-    const existingResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${profile.id}&digest_date=eq.${today}&select=id`,
-      { headers }
+    const existing = await all<{ id: string }>(
+      env.DB,
+      `SELECT id FROM digests WHERE user_id = ? AND digest_date = ?`,
+      profile.id,
+      today
     );
-    
-    const existing = await existingResponse.json() as Array<{ id: string }>;
     userDebug.digest_exists = existing.length > 0;
     
     if (existing.length === 0) {
@@ -1377,24 +1464,15 @@ function createPipelineLogger(env: Env): PipelineLogger {
     runId,
     log: async (step: string, status: 'started' | 'completed' | 'failed', details?: Record<string, unknown>, error?: string) => {
       try {
-        await fetch(
-          `${env.SUPABASE_URL}/rest/v1/pipeline_logs`,
-          {
-            method: "POST",
-            headers: {
-              "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-              "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-              "Content-Type": "application/json",
-              "Prefer": "return=minimal",
-            },
-            body: JSON.stringify({
-              run_id: runId,
-              step,
-              status,
-              details: details || null,
-              error: error || null,
-            }),
-          }
+        // pipeline_logs.id is AUTOINCREMENT - no id generated here
+        await run(
+          env.DB,
+          `INSERT INTO pipeline_logs (run_id, step, status, details, error) VALUES (?, ?, ?, ?, ?)`,
+          runId,
+          step,
+          status,
+          details ? JSON.stringify(details) : null,
+          error || null
         );
       } catch (e) {
         // Don't let logging failures break the pipeline
@@ -1451,88 +1529,73 @@ async function handleModalWebhook(request: Request, env: Env, ctx: ExecutionCont
       return json({ error: "Invalid episode_id format" }, 400);
     }
 
-    const headers = {
-      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      "Prefer": "return=minimal",
-    };
-
     // State check: verify the transcription exists and is in "processing" state
-    const checkResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${jobData.episode_id}&select=episode_id,status`,
-      { headers }
+    const existing = await all<{ episode_id: string; status: string }>(
+      env.DB,
+      `SELECT episode_id, status FROM transcriptions WHERE episode_id = ?`,
+      jobData.episode_id
     );
-    if (checkResponse.ok) {
-      const existing = await checkResponse.json() as Array<{ episode_id: string; status: string }>;
-      if (!existing.length) {
-        console.warn(`[Webhook] No transcription found for episode: ${jobData.episode_id}`);
-        return json({ error: "Transcription record not found" }, 404);
-      }
-      if (existing[0].status === "completed") {
-        console.warn(`[Webhook] Transcription for ${jobData.episode_id} already completed - ignoring duplicate`);
-        return json({ error: "Already completed" }, 409);
-      }
+    if (!existing.length) {
+      console.warn(`[Webhook] No transcription found for episode: ${jobData.episode_id}`);
+      return json({ error: "Transcription record not found" }, 404);
+    }
+    if (existing[0].status === "completed") {
+      console.warn(`[Webhook] Transcription for ${jobData.episode_id} already completed - ignoring duplicate`);
+      return json({ error: "Already completed" }, 409);
     }
 
     if (payload.status === "completed" && payload.text) {
-      // Upload transcript to storage
+      // Upload transcript to R2
       const transcriptPath = `${jobData.episode_id}/transcript.json`;
-      const storageResult = await fetch(
-        `${env.SUPABASE_URL}/storage/v1/object/transcripts/${transcriptPath}`,
-        {
-          method: "POST",
-          headers: { ...headers, "x-upsert": "true" },
-          body: JSON.stringify({
-            text: payload.text,
-            segments: payload.segments,
-            language: payload.language,
-            duration: payload.duration,
-          }),
-        }
+      await env.TRANSCRIPTS.put(
+        transcriptPath,
+        JSON.stringify({
+          text: payload.text,
+          segments: payload.segments,
+          language: payload.language,
+          duration: payload.duration,
+        }),
+        { httpMetadata: { contentType: "application/json" } }
       );
-      console.log(`[Webhook] Storage upload: ${storageResult.status}`);
+      console.log(`[Webhook] R2 transcript upload complete`);
 
       // Update transcription record
-      await fetch(
-        `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${jobData.episode_id}`,
-        {
-          method: "PATCH",
-          headers,
-          body: JSON.stringify({
-            status: "completed",
-            transcript_storage_path: transcriptPath,
-            word_count: payload.text.split(/\s+/).length,
-            language: payload.language || "en",
-            completed_at: new Date().toISOString(),
-          }),
-        }
+      await run(
+        env.DB,
+        `UPDATE transcriptions SET status = ?, transcript_storage_path = ?, word_count = ?, language = ?, completed_at = ? WHERE episode_id = ?`,
+        "completed",
+        transcriptPath,
+        payload.text.split(/\s+/).length,
+        payload.language || "en",
+        new Date().toISOString(),
+        jobData.episode_id
       );
 
       console.log(`[Webhook] Transcription completed for episode: ${jobData.episode_id}`);
       
-      // Trigger topic extraction, SuperMemory embedding, and pgvector embeddings asynchronously
+      // Trigger topic extraction, SuperMemory embedding, and vector embeddings asynchronously
+      // (payload.text is guaranteed by the enclosing if, but TS loses the narrowing in the closure)
+      const transcriptText = payload.text;
       ctx.waitUntil(
         (async () => {
           // First, do topic extraction and SuperMemory embedding (existing)
-          await extractTopicsForEpisode(jobData.episode_id, payload.text, env);
-          await embedInSuperMemory(jobData.episode_id, payload.text, env);
+          await extractTopicsForEpisode(jobData.episode_id, transcriptText, env);
+          await embedInSuperMemory(jobData.episode_id, transcriptText, env);
           
-          // Generate pgvector embeddings using user's OpenAI key (BYOK)
-          await generateEmbeddingsForTranscript(jobData.episode_id, payload.text, env);
+          // Generate vector embeddings using user's OpenAI key (BYOK)
+          await generateEmbeddingsForTranscript(jobData.episode_id, transcriptText, env);
         })()
       );
       
       return json({ success: true, status: "completed" });
     } else {
       // Update as failed
-      await fetch(
-        `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${jobData.episode_id}`,
-        {
-          method: "PATCH",
-          headers,
-          body: JSON.stringify({ status: "failed", error_message: payload.error }),
-        }
+      await run(
+        env.DB,
+        `UPDATE transcriptions SET status = ?, error_message = ? WHERE episode_id = ?`,
+        "failed",
+        payload.error ?? null,
+        jobData.episode_id
       );
 
       console.log(`[Webhook] Transcription failed for episode: ${jobData.episode_id}`);
@@ -1545,6 +1608,26 @@ async function handleModalWebhook(request: Request, env: Env, ctx: ExecutionCont
 }
 
 // Handle TTS completion webhook from Modal
+// Receives the finished MP3 bytes from Modal and stores them in R2.
+// Modal no longer holds storage credentials; it just POSTs audio here.
+async function handleTTSAudioUpload(request: Request, env: Env, url: URL): Promise<Response> {
+  const digestId = url.searchParams.get("digest_id");
+  if (!digestId || !isValidUUID(digestId)) {
+    return json({ error: "Valid digest_id query param required" }, 400);
+  }
+  const body = await request.arrayBuffer();
+  if (!body || body.byteLength < 1000) {
+    return json({ error: "Audio body missing or too small" }, 400);
+  }
+  const key = `digests/${digestId}/digest.mp3`;
+  await env.MEDIA.put(key, body, {
+    httpMetadata: { contentType: "audio/mpeg" },
+  });
+  const audioUrl = `${MEDIA_BASE_URL}/${key}`;
+  console.log(`[TTS Audio] Stored ${body.byteLength} bytes at ${key}`);
+  return json({ success: true, audio_url: audioUrl });
+}
+
 async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
   try {
     const payload = await request.json() as {
@@ -1567,28 +1650,19 @@ async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
       return json({ error: "Invalid digest_id format" }, 400);
     }
 
-    const headers = {
-      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      "Prefer": "return=minimal",
-    };
-
     // State check: only accept webhooks for digests currently in "generating" state
-    const checkResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?id=eq.${payload.digest_id}&select=id,status`,
-      { headers }
+    const existing = await one<{ id: string; status: string }>(
+      env.DB,
+      `SELECT id, status FROM digests WHERE id = ?`,
+      payload.digest_id
     );
-    if (checkResponse.ok) {
-      const existing = await checkResponse.json() as Array<{ id: string; status: string }>;
-      if (!existing.length) {
-        console.warn(`[TTS Webhook] No digest found for id: ${payload.digest_id}`);
-        return json({ error: "Digest not found" }, 404);
-      }
-      if (existing[0].status !== "generating") {
-        console.warn(`[TTS Webhook] Digest ${payload.digest_id} is in state '${existing[0].status}', not 'generating' - ignoring`);
-        return json({ error: "Digest not in generating state" }, 409);
-      }
+    if (!existing) {
+      console.warn(`[TTS Webhook] No digest found for id: ${payload.digest_id}`);
+      return json({ error: "Digest not found" }, 404);
+    }
+    if (existing.status !== "generating") {
+      console.warn(`[TTS Webhook] Digest ${payload.digest_id} is in state '${existing.status}', not 'generating' - ignoring`);
+      return json({ error: "Digest not in generating state" }, 409);
     }
 
     if (payload.status === "completed" && payload.audio_url) {
@@ -1599,34 +1673,26 @@ async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
       }
 
       // Update digest record with audio URL
-      await fetch(
-        `${env.SUPABASE_URL}/rest/v1/digests?id=eq.${payload.digest_id}`,
-        {
-          method: "PATCH",
-          headers,
-          body: JSON.stringify({
-            status: "completed",
-            audio_url: payload.audio_url,
-            duration_seconds: payload.duration_seconds,
-            completed_at: new Date().toISOString(),
-          }),
-        }
+      await run(
+        env.DB,
+        `UPDATE digests SET status = ?, audio_url = ?, duration_seconds = ?, completed_at = ? WHERE id = ?`,
+        "completed",
+        payload.audio_url,
+        payload.duration_seconds ?? null,
+        new Date().toISOString(),
+        payload.digest_id
       );
 
       console.log(`[TTS Webhook] Digest ${payload.digest_id} completed: ${payload.audio_url}`);
       return json({ success: true, status: "completed" });
     } else {
       // Update as failed
-      await fetch(
-        `${env.SUPABASE_URL}/rest/v1/digests?id=eq.${payload.digest_id}`,
-        {
-          method: "PATCH",
-          headers,
-          body: JSON.stringify({ 
-            status: "failed", 
-            error_message: payload.error || "TTS generation failed",
-          }),
-        }
+      await run(
+        env.DB,
+        `UPDATE digests SET status = ?, error_message = ? WHERE id = ?`,
+        "failed",
+        payload.error || "TTS generation failed",
+        payload.digest_id
       );
 
       console.log(`[TTS Webhook] Digest ${payload.digest_id} failed: ${payload.error}`);
@@ -1648,25 +1714,19 @@ async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
  */
 async function handleGenerateWelcome(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
-    // Verify JWT token via Supabase Auth
-    const auth = await verifySupabaseJWT(request, env);
+    // Verify Better Auth session
+    const auth = await verifySession(request, env);
     if (!auth) {
       return json({ error: "Unauthorized: invalid or expired token" }, 401);
     }
     const userId = auth.userId;
     
-    const headers = {
-      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-    };
-    
     // Check if user already has a welcome episode (marked with date 1970-01-01)
-    const existingResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=eq.1970-01-01&select=id,status`,
-      { headers }
+    const existing = await all<{ id: string; status: string }>(
+      env.DB,
+      `SELECT id, status FROM digests WHERE user_id = ? AND digest_date = '1970-01-01'`,
+      userId
     );
-    const existing = await existingResponse.json() as Array<{ id: string; status: string }>;
     
     if (existing.length > 0) {
       console.log(`[Welcome] User ${userId} already has welcome episode (status: ${existing[0].status})`);
@@ -1674,32 +1734,29 @@ async function handleGenerateWelcome(request: Request, env: Env, ctx: ExecutionC
     }
     
     // Get user info for personalization
-    const profileResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,email,display_name`,
-      { headers }
+    const profile = await one<{ id: string; email: string | null; display_name: string | null }>(
+      env.DB,
+      `SELECT id, email, display_name FROM profiles WHERE id = ?`,
+      userId
     );
     
     let userName = "there";
-    if (profileResponse.ok) {
-      const profiles = await profileResponse.json() as Array<{ id: string; email?: string; display_name?: string }>;
-      if (profiles.length > 0) {
-        // Prefer display_name, fall back to first name from email
-        if (profiles[0].display_name) {
-          userName = profiles[0].display_name.split(' ')[0]; // First name from display name
-        } else if (profiles[0].email) {
-          const emailPart = profiles[0].email.split('@')[0];
-          const firstName = emailPart.split(/[._0-9]/)[0];
-          if (firstName && firstName.length > 1) {
-            userName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
-          }
+    if (profile) {
+      // Prefer display_name, fall back to first name from email
+      if (profile.display_name) {
+        userName = profile.display_name.split(' ')[0]; // First name from display name
+      } else if (profile.email) {
+        const emailPart = profile.email.split('@')[0];
+        const firstName = emailPart.split(/[._0-9]/)[0];
+        if (firstName && firstName.length > 1) {
+          userName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
         }
       }
     }
     
     // Get user's OpenAI key for TTS
     const userKeys = await getUserApiKeys(
-      env.SUPABASE_URL,
-      env.SUPABASE_SERVICE_ROLE_KEY,
+      env.DB,
       userId,
       env.API_KEY_ENCRYPTION_KEY
     );
@@ -1723,32 +1780,25 @@ Alright, that's the quick tour. I'll catch you tomorrow with your first digest. 
 
     // Create digest record
     const digestId = crypto.randomUUID();
-    const digestRecord = {
-      id: digestId,
-      user_id: userId,
-      digest_date: "1970-01-01",  // Special date marker for welcome episode
-      status: "generating",
-      topic_clusters: {
-        title: `Welcome to Podgest, ${userName}!`,
-        topics: ["Introduction", "How it works", "Getting started"],
-      },
-      script_text: welcomeScript,
-      episodes_included: [],
-      created_at: new Date().toISOString(),
-    };
-    
-    const insertResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests`,
-      {
-        method: "POST",
-        headers: { ...headers, "Prefer": "return=minimal" },
-        body: JSON.stringify(digestRecord),
-      }
-    );
-    
-    if (!insertResponse.ok) {
-      const err = await insertResponse.text();
-      console.error(`[Welcome] Failed to create digest record: ${err}`);
+    try {
+      await run(
+        env.DB,
+        `INSERT INTO digests (id, user_id, digest_date, status, topic_clusters, script_text, episodes_included, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        digestId,
+        userId,
+        "1970-01-01",  // Special date marker for welcome episode
+        "generating",
+        JSON.stringify({
+          title: `Welcome to Podgest, ${userName}!`,
+          topics: ["Introduction", "How it works", "Getting started"],
+        }),
+        welcomeScript,
+        JSON.stringify([]),
+        new Date().toISOString()
+      );
+    } catch (insertErr) {
+      console.error(`[Welcome] Failed to create digest record: ${insertErr}`);
       return json({ error: "Failed to create welcome episode" }, 500);
     }
     
@@ -1766,8 +1816,7 @@ Alright, that's the quick tour. I'll catch you tomorrow with your first digest. 
             openai_api_key: userKeys.openaiKey,
             voice: "echo",
             model: "tts-1-hd",
-            supabase_url: env.SUPABASE_URL,
-            supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
+            upload_url: `https://api.podgest.app/api/webhooks/tts-audio?digest_id=${digestId}`,
             digest_id: digestId,
             webhook_url: "https://api.podgest.app/api/webhooks/tts",
             admin_key: env.ADMIN_API_KEY,
@@ -1805,32 +1854,26 @@ interface TopicExtractionResult {
 async function extractTopicsForEpisode(episodeId: string, transcriptText: string, env: Env): Promise<void> {
   console.log(`[Topics] Starting extraction for episode: ${episodeId}`);
   
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-  
   try {
     // Get episode to find user via subscription
-    const episodeResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episodeId}&select=id,feed_url`,
-      { headers }
+    const episode = await one<{ id: string; feed_url: string }>(
+      env.DB,
+      `SELECT id, feed_url FROM episodes WHERE id = ?`,
+      episodeId
     );
-    const episodes = await episodeResponse.json() as Array<{ id: string; feed_url: string }>;
     
-    if (!episodes.length) {
+    if (!episode) {
       console.error(`[Topics] Episode not found: ${episodeId}`);
       return;
     }
     
     // Find user via subscription
-    const subResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/subscriptions?feed_url=eq.${encodeURIComponent(episodes[0].feed_url)}&select=user_id&limit=1`,
-      { headers }
+    const sub = await one<{ user_id: string }>(
+      env.DB,
+      `SELECT user_id FROM subscriptions WHERE feed_url = ? LIMIT 1`,
+      episode.feed_url
     );
-    const subs = await subResponse.json() as Array<{ user_id: string }>;
-    const userId = subs[0]?.user_id;
+    const userId = sub?.user_id;
     
     if (!userId) {
       console.log(`[Topics] No user found for episode, skipping topic extraction`);
@@ -1839,8 +1882,7 @@ async function extractTopicsForEpisode(episodeId: string, transcriptText: string
     
     // Get user's Anthropic key (required - no fallback)
     const userKeys = await getUserApiKeys(
-      env.SUPABASE_URL,
-      env.SUPABASE_SERVICE_ROLE_KEY,
+      env.DB,
       userId,
       env.API_KEY_ENCRYPTION_KEY
     );
@@ -1853,35 +1895,28 @@ async function extractTopicsForEpisode(episodeId: string, transcriptText: string
     const result = await callClaudeForTopics(transcriptText, userKeys.anthropicKey);
     
     // Get transcription ID
-    const transcriptionResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episodeId}&select=id`,
-      { headers }
+    const transcription = await one<{ id: string }>(
+      env.DB,
+      `SELECT id FROM transcriptions WHERE episode_id = ?`,
+      episodeId
     );
-    const transcriptions = await transcriptionResponse.json() as { id: string }[];
     
-    if (!transcriptions.length) {
+    if (!transcription) {
       console.error(`[Topics] No transcription found for episode: ${episodeId}`);
       return;
     }
     
-    const transcriptionId = transcriptions[0].id;
-    
     // Insert topic extraction
-    const insertResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/topic_extractions`,
-      {
-        method: "POST",
-        headers: { ...headers, "Prefer": "return=minimal" },
-        body: JSON.stringify({
-          transcription_id: transcriptionId,
-          topics: result,
-        }),
-      }
-    );
-    
-    if (!insertResponse.ok) {
-      const err = await insertResponse.text();
-      console.error(`[Topics] Failed to insert: ${err}`);
+    try {
+      await run(
+        env.DB,
+        `INSERT INTO topic_extractions (id, transcription_id, topics) VALUES (?, ?, ?)`,
+        crypto.randomUUID(),
+        transcription.id,
+        JSON.stringify(result)
+      );
+    } catch (insertErr) {
+      console.error(`[Topics] Failed to insert: ${insertErr}`);
       return;
     }
     
@@ -1923,7 +1958,7 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code fenc
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
+      model: "claude-sonnet-5",
       max_tokens: 1024,
       messages: [
         {
@@ -1988,69 +2023,57 @@ async function embedInSuperMemory(episodeId: string, transcriptText: string, env
   console.log(`[SuperMemory] Starting embedding for episode: ${episodeId}`);
   
   try {
-    const headers = {
-      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-    };
-    
     // Get episode metadata (including description for original podcast name extraction)
-    const episodeResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episodeId}&select=id,title,published_at,feed_url,description`,
-      { headers }
-    );
-    
-    if (!episodeResponse.ok) {
-      console.error(`[SuperMemory] Failed to fetch episode: ${episodeResponse.status}`);
-      return;
-    }
-    
-    const episodes = await episodeResponse.json() as Array<{
+    const episode = await one<{
       id: string;
       title: string;
       published_at: string;
       feed_url: string;
-      description?: string;
-    }>;
+      description: string | null;
+    }>(
+      env.DB,
+      `SELECT id, title, published_at, feed_url, description FROM episodes WHERE id = ?`,
+      episodeId
+    );
     
-    if (!episodes.length) {
+    if (!episode) {
       console.error(`[SuperMemory] Episode not found: ${episodeId}`);
       return;
     }
     
-    const episode = episodes[0];
-    
     // Get subscription info via feed_url
-    const subResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/subscriptions?feed_url=eq.${encodeURIComponent(episode.feed_url)}&select=user_id,podcast_title&limit=1`,
-      { headers }
+    const sub = await one<{ user_id: string; podcast_title: string | null }>(
+      env.DB,
+      `SELECT user_id, podcast_title FROM subscriptions WHERE feed_url = ? LIMIT 1`,
+      episode.feed_url
     );
-    const subs = await subResponse.json() as Array<{ user_id: string; podcast_title: string }>;
     
-    const userId = subs[0]?.user_id || "unknown";
+    const userId = sub?.user_id || "unknown";
     
     // Extract original podcast name from description (for ListenNotes aggregated feeds)
     const originalPodcastName = extractOriginalPodcastName(episode.description || "");
-    const podcastTitle = originalPodcastName || subs[0]?.podcast_title || "Unknown Podcast";
-    console.log(`[SuperMemory] Using podcast title: ${podcastTitle} (original: ${originalPodcastName}, fallback: ${subs[0]?.podcast_title})`);
+    const podcastTitle = originalPodcastName || sub?.podcast_title || "Unknown Podcast";
+    console.log(`[SuperMemory] Using podcast title: ${podcastTitle} (original: ${originalPodcastName}, fallback: ${sub?.podcast_title})`);
     
     // Get transcription ID first
-    const transcriptionResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episodeId}&select=id`,
-      { headers }
+    const transcription = await one<{ id: string }>(
+      env.DB,
+      `SELECT id FROM transcriptions WHERE episode_id = ?`,
+      episodeId
     );
-    const transcriptions = await transcriptionResponse.json() as Array<{ id: string }>;
-    const transcriptionId = transcriptions[0]?.id;
+    const transcriptionId = transcription?.id;
     
-    // Get topic extraction if available
+    // Get topic extraction if available (topics is a TEXT JSON column)
     let topics: TopicExtractionResult | undefined;
     if (transcriptionId) {
-      const topicsResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/topic_extractions?transcription_id=eq.${transcriptionId}&select=topics`,
-        { headers }
+      const topicRow = await one<{ topics: string | null }>(
+        env.DB,
+        `SELECT topics FROM topic_extractions WHERE transcription_id = ?`,
+        transcriptionId
       );
-      const topicExtractions = await topicsResponse.json() as Array<{ topics: TopicExtractionResult }>;
-      topics = topicExtractions[0]?.topics;
+      if (topicRow?.topics) {
+        topics = parseJson<TopicExtractionResult | undefined>(topicRow.topics, undefined);
+      }
     }
     
     // Send to SuperMemory
@@ -2085,13 +2108,11 @@ async function embedInSuperMemory(episodeId: string, transcriptText: string, env
     console.log(`[SuperMemory] Embedded episode ${episodeId} as doc ${result.id}`);
     
     // Update transcription with SuperMemory doc ID
-    await fetch(
-      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episodeId}`,
-      {
-        method: "PATCH",
-        headers,
-        body: JSON.stringify({ supermemory_doc_id: result.id }),
-      }
+    await run(
+      env.DB,
+      `UPDATE transcriptions SET supermemory_doc_id = ? WHERE episode_id = ?`,
+      result.id,
+      episodeId
     );
     
     console.log(`[SuperMemory] Embedding complete for episode: ${episodeId}`);
@@ -2106,64 +2127,51 @@ async function embedInSuperMemory(episodeId: string, transcriptText: string, env
 // ============================================
 
 /**
- * Generate pgvector embeddings for a transcript using the user's OpenAI key.
+ * Generate vector embeddings for a transcript using the user's OpenAI key.
+ * Chunk text/metadata is stored in D1 (transcript_chunks); vectors go to
+ * Vectorize with vector id == transcript_chunks.id.
  * Requires user to have OpenAI key configured - no fallbacks.
  */
 async function generateEmbeddingsForTranscript(episodeId: string, transcriptText: string, env: Env): Promise<void> {
-  console.log(`[Embeddings] Starting pgvector embedding for episode: ${episodeId}`);
-  
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
+  console.log(`[Embeddings] Starting Vectorize embedding for episode: ${episodeId}`);
   
   try {
     // 1. Get episode to find the feed_url
-    const episodeResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episodeId}&select=id,feed_url`,
-      { headers }
+    const episode = await one<{ id: string; feed_url: string }>(
+      env.DB,
+      `SELECT id, feed_url FROM episodes WHERE id = ?`,
+      episodeId
     );
-    
-    if (!episodeResponse.ok) {
-      console.error(`[Embeddings] Failed to fetch episode: ${episodeResponse.status}`);
-      return;
-    }
-    
-    const episodes = await episodeResponse.json() as Array<{ id: string; feed_url: string }>;
-    if (!episodes.length) {
+    if (!episode) {
       console.error(`[Embeddings] Episode not found: ${episodeId}`);
       return;
     }
     
     // 2. Find ALL users subscribed to this feed (not just one!)
-    const subResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/subscriptions?feed_url=eq.${encodeURIComponent(episodes[0].feed_url)}&select=user_id`,
-      { headers }
+    const subs = await all<{ user_id: string }>(
+      env.DB,
+      `SELECT user_id FROM subscriptions WHERE feed_url = ?`,
+      episode.feed_url
     );
     
-    const subs = await subResponse.json() as Array<{ user_id: string }>;
-    
     if (!subs.length) {
-      console.log(`[Embeddings] No users subscribed to this feed, skipping pgvector embedding`);
+      console.log(`[Embeddings] No users subscribed to this feed, skipping embedding`);
       return;
     }
     
     console.log(`[Embeddings] Found ${subs.length} users subscribed to this feed`);
     
-    // 3. Get transcription ID (shared across all users)
-    const transcriptionResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episodeId}&select=id`,
-      { headers }
+    // 3. Verify the transcription exists (shared across all users)
+    const transcription = await one<{ id: string }>(
+      env.DB,
+      `SELECT id FROM transcriptions WHERE episode_id = ?`,
+      episodeId
     );
-    const transcriptions = await transcriptionResponse.json() as Array<{ id: string }>;
     
-    if (!transcriptions.length) {
+    if (!transcription) {
       console.error(`[Embeddings] Transcription not found for episode: ${episodeId}`);
       return;
     }
-    
-    const transcriptionId = transcriptions[0].id;
     
     // 4. Generate embeddings ONCE using first user's key, then store for ALL users
     // Find a user with a valid OpenAI key
@@ -2173,8 +2181,7 @@ async function generateEmbeddingsForTranscript(episodeId: string, transcriptText
     for (const sub of subs) {
       try {
         const userKeys = await getUserApiKeys(
-          env.SUPABASE_URL,
-          env.SUPABASE_SERVICE_ROLE_KEY,
+          env.DB,
           sub.user_id,
           env.API_KEY_ENCRYPTION_KEY
         );
@@ -2202,33 +2209,51 @@ async function generateEmbeddingsForTranscript(episodeId: string, transcriptText
     
     console.log(`[Embeddings] Generated ${chunkedEmbeddings.length} chunks for episode ${episodeId}`);
     
-    // 6. Store embeddings for EACH subscribed user
+    const createdAtDate = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    
+    // 6. Store chunks + vectors for EACH subscribed user
     for (const sub of subs) {
       console.log(`[Embeddings] Storing embeddings for user ${sub.user_id}...`);
       
+      // Skip if this user already has chunks for this episode (matches old duplicate-key behavior)
+      const existingChunk = await one<{ id: string }>(
+        env.DB,
+        `SELECT id FROM transcript_chunks WHERE episode_id = ? AND user_id = ? LIMIT 1`,
+        episodeId,
+        sub.user_id
+      );
+      if (existingChunk) {
+        console.log(`[Embeddings] User ${sub.user_id} already has chunks for this episode, skipping`);
+        continue;
+      }
+      
       for (const chunk of chunkedEmbeddings) {
-        const insertResponse = await fetch(
-          `${env.SUPABASE_URL}/rest/v1/transcript_embeddings`,
-          {
-            method: "POST",
-            headers: { ...headers, "Prefer": "return=minimal" },
-            body: JSON.stringify({
-              user_id: sub.user_id,
+        try {
+          const chunkId = crypto.randomUUID();
+          await run(
+            env.DB,
+            `INSERT INTO transcript_chunks (id, episode_id, user_id, chunk_index, chunk_text, word_count)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            chunkId,
+            episodeId,
+            sub.user_id,
+            chunk.chunkIndex,
+            chunk.chunkText,
+            chunk.wordCount
+          );
+          
+          await env.VECTORIZE.upsert([{
+            id: chunkId,
+            values: chunk.embedding,
+            metadata: {
+              type: "transcript",
               episode_id: episodeId,
-              chunk_index: chunk.chunkIndex,
-              chunk_text: chunk.chunkText,
-              word_count: chunk.wordCount,
-              embedding: JSON.stringify(chunk.embedding), // pgvector expects array as string
-            }),
-          }
-        );
-        
-        if (!insertResponse.ok) {
-          const err = await insertResponse.text();
-          // Ignore duplicate key errors (user already has this embedding)
-          if (!err.includes('duplicate')) {
-            console.error(`[Embeddings] Failed to insert chunk ${chunk.chunkIndex} for user ${sub.user_id}: ${err}`);
-          }
+              user_id: sub.user_id,
+              created_at: createdAtDate,
+            },
+          }]);
+        } catch (insertErr) {
+          console.error(`[Embeddings] Failed to insert chunk ${chunk.chunkIndex} for user ${sub.user_id}: ${insertErr}`);
         }
       }
       
@@ -2250,23 +2275,14 @@ async function handleEmbedContent(request: Request, env: Env): Promise<Response>
       return json({ error: "episode_id required" }, 400);
     }
     
-    const headers = {
-      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-    };
+    // Get transcript from R2
+    const transcriptObj = await env.TRANSCRIPTS.get(`${episode_id}/transcript.json`);
     
-    // Get transcript
-    const transcriptResponse = await fetch(
-      `${env.SUPABASE_URL}/storage/v1/object/transcripts/${episode_id}/transcript.json`,
-      { headers }
-    );
-    
-    if (!transcriptResponse.ok) {
+    if (!transcriptObj) {
       return json({ error: "Transcript not found" }, 404);
     }
     
-    const transcript = await transcriptResponse.json() as { text: string };
+    const transcript = await transcriptObj.json() as { text: string };
     
     await embedInSuperMemory(episode_id, transcript.text, env);
     
@@ -2301,27 +2317,25 @@ async function handleUpdateProfile(request: Request, env: Env): Promise<Response
       return json({ error: "No updates provided" }, 400);
     }
     
-    const response = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${body.user_id}`,
-      {
-        method: "PATCH",
-        headers: {
-          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-          "Content-Type": "application/json",
-          "Prefer": "return=representation",
-        },
-        body: JSON.stringify(updates),
-      }
-    );
-    
-    if (!response.ok) {
-      const error = await response.text();
-      console.error("[UpdateProfile] Supabase error:", error);
+    try {
+      // Column names come from a fixed allowlist above, values are bound
+      const setClause = Object.keys(updates).map(k => `${k} = ?`).join(", ");
+      await run(
+        env.DB,
+        `UPDATE profiles SET ${setClause} WHERE id = ?`,
+        ...Object.values(updates),
+        body.user_id
+      );
+    } catch (error) {
+      console.error("[UpdateProfile] D1 error:", error);
       return json({ error: "Failed to update profile" }, 500);
     }
     
-    const updated = await response.json();
+    const updated = await all(
+      env.DB,
+      `SELECT * FROM profiles WHERE id = ?`,
+      body.user_id
+    );
     return json({ success: true, profile: updated });
     
   } catch (error) {
@@ -2336,50 +2350,35 @@ async function handleUpdateProfile(request: Request, env: Env): Promise<Response
 
 // List all users with their status
 async function handleAdminListUsers(env: Env): Promise<Response> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-  
   try {
     // Get all profiles
-    const profilesResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?select=id,email,display_name,timezone,created_at`,
-      { headers }
-    );
-    
-    if (!profilesResponse.ok) {
-      return json({ error: "Failed to fetch profiles" }, 500);
-    }
-    
-    const profiles = await profilesResponse.json() as Array<{
+    const profiles = await all<{
       id: string;
       email: string;
       display_name: string | null;
       timezone: string;
       created_at: string;
-    }>;
+    }>(env.DB, `SELECT id, email, display_name, timezone, created_at FROM profiles`);
     
     // Get subscription counts and status for each user
     const users = await Promise.all(profiles.map(async (profile) => {
-      const subsResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${profile.id}&select=id,is_active`,
-        { headers }
+      const subs = await all<{ id: string; is_active: number }>(
+        env.DB,
+        `SELECT id, is_active FROM subscriptions WHERE user_id = ?`,
+        profile.id
       );
-      const subs = await subsResponse.json() as Array<{ id: string; is_active: boolean }>;
       
-      const digestsResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${profile.id}&select=id&limit=1&order=created_at.desc`,
-        { headers }
+      const digests = await all<{ id: string }>(
+        env.DB,
+        `SELECT id FROM digests WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`,
+        profile.id
       );
-      const digests = await digestsResponse.json() as Array<{ id: string }>;
       
-      const apiKeysResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${profile.id}&select=anthropic_key_encrypted,openai_key_encrypted`,
-        { headers }
+      const apiKeys = await all<{ anthropic_key_encrypted: string | null; openai_key_encrypted: string | null }>(
+        env.DB,
+        `SELECT anthropic_key_encrypted, openai_key_encrypted FROM user_api_keys WHERE user_id = ?`,
+        profile.id
       );
-      const apiKeys = await apiKeysResponse.json() as Array<{ anthropic_key_encrypted: string | null; openai_key_encrypted: string | null }>;
       
       const activeSubs = subs.filter(s => s.is_active).length;
       const totalSubs = subs.length;
@@ -2408,48 +2407,38 @@ async function handleAdminListUsers(env: Env): Promise<Response> {
 
 // Deactivate user - soft delete (disables subscriptions, keeps all data)
 async function handleAdminDeactivateUser(userId: string, env: Env): Promise<Response> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-    "Prefer": "return=representation",
-  };
-  
   try {
     // Get user info first
-    const profileResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=email`,
-      { headers }
+    const profile = await one<{ email: string }>(
+      env.DB,
+      `SELECT email FROM profiles WHERE id = ?`,
+      userId
     );
-    const profiles = await profileResponse.json() as Array<{ email: string }>;
     
-    if (profiles.length === 0) {
+    if (!profile) {
       return json({ error: "User not found" }, 404);
     }
     
     // Deactivate all subscriptions
-    const response = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}`,
-      {
-        method: "PATCH",
-        headers,
-        body: JSON.stringify({ is_active: false }),
-      }
-    );
-    
-    if (!response.ok) {
-      console.error("[AdminDeactivateUser] Error:", await response.text());
+    let deactivatedCount = 0;
+    try {
+      const result = await run(
+        env.DB,
+        `UPDATE subscriptions SET is_active = 0 WHERE user_id = ?`,
+        userId
+      );
+      deactivatedCount = result.meta.changes ?? 0;
+    } catch (error) {
+      console.error("[AdminDeactivateUser] Error:", error);
       return json({ error: "Failed to deactivate subscriptions" }, 500);
     }
-    
-    const deactivated = await response.json() as unknown[];
     
     return json({
       success: true,
       action: "deactivated",
       user_id: userId,
-      email: profiles[0].email,
-      subscriptions_deactivated: deactivated.length,
+      email: profile.email,
+      subscriptions_deactivated: deactivatedCount,
       message: "User deactivated. All subscriptions disabled. Data preserved.",
     });
     
@@ -2461,48 +2450,38 @@ async function handleAdminDeactivateUser(userId: string, env: Env): Promise<Resp
 
 // Reactivate user - re-enables subscriptions
 async function handleAdminReactivateUser(userId: string, env: Env): Promise<Response> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-    "Prefer": "return=representation",
-  };
-  
   try {
     // Get user info first
-    const profileResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=email`,
-      { headers }
+    const profile = await one<{ email: string }>(
+      env.DB,
+      `SELECT email FROM profiles WHERE id = ?`,
+      userId
     );
-    const profiles = await profileResponse.json() as Array<{ email: string }>;
     
-    if (profiles.length === 0) {
+    if (!profile) {
       return json({ error: "User not found" }, 404);
     }
     
     // Reactivate all subscriptions
-    const response = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}`,
-      {
-        method: "PATCH",
-        headers,
-        body: JSON.stringify({ is_active: true }),
-      }
-    );
-    
-    if (!response.ok) {
-      console.error("[AdminReactivateUser] Error:", await response.text());
+    let reactivatedCount = 0;
+    try {
+      const result = await run(
+        env.DB,
+        `UPDATE subscriptions SET is_active = 1 WHERE user_id = ?`,
+        userId
+      );
+      reactivatedCount = result.meta.changes ?? 0;
+    } catch (error) {
+      console.error("[AdminReactivateUser] Error:", error);
       return json({ error: "Failed to reactivate subscriptions" }, 500);
     }
-    
-    const reactivated = await response.json() as unknown[];
     
     return json({
       success: true,
       action: "reactivated",
       user_id: userId,
-      email: profiles[0].email,
-      subscriptions_reactivated: reactivated.length,
+      email: profile.email,
+      subscriptions_reactivated: reactivatedCount,
       message: "User reactivated. All subscriptions enabled.",
     });
     
@@ -2514,41 +2493,32 @@ async function handleAdminReactivateUser(userId: string, env: Env): Promise<Resp
 
 // Delete user - hard delete (removes all user data permanently)
 async function handleAdminDeleteUser(userId: string, env: Env): Promise<Response> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-  
   try {
     // Get user info first
-    const profileResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=email`,
-      { headers }
+    const profile = await one<{ email: string }>(
+      env.DB,
+      `SELECT email FROM profiles WHERE id = ?`,
+      userId
     );
-    const profiles = await profileResponse.json() as Array<{ email: string }>;
     
-    if (profiles.length === 0) {
+    if (!profile) {
       return json({ error: "User not found" }, 404);
     }
     
-    const email = profiles[0].email;
+    const email = profile.email;
     const deletionLog: string[] = [];
     
     // 1. Get digest IDs to delete storage files
-    const digestsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&select=id`,
-      { headers }
+    const digests = await all<{ id: string }>(
+      env.DB,
+      `SELECT id FROM digests WHERE user_id = ?`,
+      userId
     );
-    const digests = await digestsResponse.json() as Array<{ id: string }>;
     
-    // 2. Delete digest audio files from storage
+    // 2. Delete digest audio files from R2
     for (const digest of digests) {
       try {
-        await fetch(
-          `${env.SUPABASE_URL}/storage/v1/object/digests/${digest.id}/digest.mp3`,
-          { method: "DELETE", headers }
-        );
+        await env.MEDIA.delete(`digests/${digest.id}/digest.mp3`);
       } catch {
         // Storage deletion failures are non-fatal
       }
@@ -2556,40 +2526,28 @@ async function handleAdminDeleteUser(userId: string, env: Env): Promise<Response
     deletionLog.push(`Deleted ${digests.length} digest audio files from storage`);
     
     // 3. Delete user_api_keys
-    const apiKeysResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${userId}`,
-      { method: "DELETE", headers }
-    );
-    if (apiKeysResponse.ok) {
+    try {
+      await run(env.DB, `DELETE FROM user_api_keys WHERE user_id = ?`, userId);
       deletionLog.push("Deleted user API keys");
-    }
+    } catch { /* non-fatal */ }
     
     // 4. Delete digests
-    const digestDeleteResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}`,
-      { method: "DELETE", headers }
-    );
-    if (digestDeleteResponse.ok) {
+    try {
+      await run(env.DB, `DELETE FROM digests WHERE user_id = ?`, userId);
       deletionLog.push(`Deleted ${digests.length} digests`);
-    }
+    } catch { /* non-fatal */ }
     
     // 5. Delete subscriptions
-    const subsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}`,
-      { method: "DELETE", headers }
-    );
-    if (subsResponse.ok) {
+    try {
+      await run(env.DB, `DELETE FROM subscriptions WHERE user_id = ?`, userId);
       deletionLog.push("Deleted subscriptions");
-    }
+    } catch { /* non-fatal */ }
     
     // 6. Delete profile (this removes the user from our system)
-    const profileDeleteResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}`,
-      { method: "DELETE", headers }
-    );
-    if (profileDeleteResponse.ok) {
+    try {
+      await run(env.DB, `DELETE FROM profiles WHERE id = ?`, userId);
       deletionLog.push("Deleted user profile");
-    }
+    } catch { /* non-fatal */ }
     
     // Note: auth.users record remains (managed by Supabase Auth)
     // To fully delete the auth user, use Supabase Dashboard or Admin API
@@ -2611,78 +2569,52 @@ async function handleAdminDeleteUser(userId: string, env: Env): Promise<Response
 
 // Self-service account deletion - authenticated user deletes their own account
 async function handleDeleteAccount(userId: string, env: Env): Promise<Response> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-
   try {
     if (!isValidUUID(userId)) {
       return json({ error: "Invalid user ID" }, 400);
     }
 
     // Verify the user exists
-    const profileResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=email`,
-      { headers }
+    const profile = await one<{ email: string }>(
+      env.DB,
+      `SELECT email FROM profiles WHERE id = ?`,
+      userId
     );
-    const profiles = await profileResponse.json() as Array<{ email: string }>;
-    if (!profiles.length) {
+    if (!profile) {
       return json({ error: "User not found" }, 404);
     }
 
-    const email = profiles[0].email;
+    const email = profile.email;
     console.log(`[DeleteAccount] User ${email} (${userId}) requested account deletion`);
 
     // 1. Delete subscriptions
-    await fetch(
-      `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}`,
-      { method: "DELETE", headers }
-    );
+    await run(env.DB, `DELETE FROM subscriptions WHERE user_id = ?`, userId);
 
     // 2. Delete digest audio from storage
-    const digestsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&select=id`,
-      { headers }
+    const digests = await all<{ id: string }>(
+      env.DB,
+      `SELECT id FROM digests WHERE user_id = ?`,
+      userId
     );
-    const digests = await digestsResponse.json() as Array<{ id: string }>;
     for (const digest of digests) {
-      await fetch(
-        `${env.SUPABASE_URL}/storage/v1/object/digests/${digest.id}/digest.mp3`,
-        { method: "DELETE", headers }
-      );
+      await env.MEDIA.delete(`digests/${digest.id}/digest.mp3`);
     }
 
     // 3. Delete API keys
-    await fetch(
-      `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${userId}`,
-      { method: "DELETE", headers }
-    );
+    await run(env.DB, `DELETE FROM user_api_keys WHERE user_id = ?`, userId);
 
     // 4. Delete digests
-    await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}`,
-      { method: "DELETE", headers }
-    );
+    await run(env.DB, `DELETE FROM digests WHERE user_id = ?`, userId);
 
-    // 5. Delete MCP tokens
-    await fetch(
-      `${env.SUPABASE_URL}/rest/v1/mcp_tokens?user_id=eq.${userId}`,
-      { method: "DELETE", headers }
-    );
+    // Note: the legacy mcp_tokens table does not exist in D1 (MCP tokens now live in KV/Better Auth)
 
-    // 6. Delete profile
-    await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}`,
-      { method: "DELETE", headers }
-    );
+    // 5. Delete profile
+    await run(env.DB, `DELETE FROM profiles WHERE id = ?`, userId);
 
-    // 7. Delete the auth.users record via Supabase Admin API
-    await fetch(
-      `${env.SUPABASE_URL}/auth/v1/admin/users/${userId}`,
-      { method: "DELETE", headers }
-    );
+    // 6. Delete the Better Auth records (sessions, linked accounts, user)
+    await run(env.DB, `DELETE FROM "session" WHERE userId = ?`, userId);
+    await run(env.DB, `DELETE FROM "account" WHERE userId = ?`, userId);
+    await run(env.DB, `DELETE FROM "user" WHERE id = ?`, userId);
 
     console.log(`[DeleteAccount] Successfully deleted account for ${email} (${userId})`);
 
@@ -2697,11 +2629,6 @@ async function handleDeleteAccount(userId: string, env: Env): Promise<Response> 
 // Serve the latest digest transcript for ElevenReader
 // URL: /transcript/latest or /transcript/{userId}
 async function handleLatestTranscript(pathname: string, env: Env): Promise<Response> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-  };
-  
   // Get user ID - either from path or use default
   let userId = "18f513bd-8ecf-4922-84b7-4ab7c7cc14df"; // Default user
   const pathParts = pathname.split("/");
@@ -2710,27 +2637,26 @@ async function handleLatestTranscript(pathname: string, env: Env): Promise<Respo
   }
   
   // Get the latest completed digest for this user
-  const digestResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&status=eq.completed&order=created_at.desc&limit=1`,
-    { headers }
-  );
-  
-  if (!digestResponse.ok) {
+  let digest: {
+    id: string;
+    digest_date: string;
+    topic_clusters: string | null;
+    script_text: string | null;
+  } | null;
+  try {
+    digest = await one(
+      env.DB,
+      `SELECT id, digest_date, topic_clusters, script_text FROM digests
+       WHERE user_id = ? AND status = 'completed' ORDER BY created_at DESC LIMIT 1`,
+      userId
+    );
+  } catch {
     return new Response("Error fetching digest", { status: 500 });
   }
   
-  const digests = await digestResponse.json() as Array<{
-    id: string;
-    digest_date: string;
-    topic_clusters: { title: string; topics: string[] };
-    script_text?: string;
-  }>;
-  
-  if (!digests.length) {
+  if (!digest) {
     return new Response("No digest found", { status: 404 });
   }
-  
-  const digest = digests[0];
   
   // If we have script_text stored, use that
   if (digest.script_text) {
@@ -2742,9 +2668,10 @@ async function handleLatestTranscript(pathname: string, env: Env): Promise<Respo
     });
   }
   
-  // Otherwise, generate a summary from topic_clusters
-  const topics = digest.topic_clusters?.topics || [];
-  const title = digest.topic_clusters?.title || `Podgest - ${digest.digest_date}`;
+  // Otherwise, generate a summary from topic_clusters (TEXT JSON column)
+  const topicClusters = parseJson<{ title?: string; topics?: string[] }>(digest.topic_clusters, {});
+  const topics = topicClusters.topics || [];
+  const title = topicClusters.title || `Podgest - ${digest.digest_date}`;
   
   const transcript = `${title}
 
@@ -2752,7 +2679,7 @@ Today's topics:
 ${topics.map((t, i) => `${i + 1}. ${t}`).join("\n")}
 
 Listen to the full audio digest at:
-https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/${digest.id}/digest.mp3
+${MEDIA_BASE_URL}/digests/${digest.id}/digest.mp3
 `;
   
   return new Response(transcript, {
@@ -2785,24 +2712,15 @@ async function logPipelineEvent(
       user_id: userId,
     };
     
-    await fetch(
-      `${env.SUPABASE_URL}/rest/v1/pipeline_logs`,
-      {
-        method: "POST",
-        headers: {
-          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-          "Content-Type": "application/json",
-          "Prefer": "return=minimal",
-        },
-        body: JSON.stringify({
-          run_id: metadata.run_id || crypto.randomUUID(),
-          step: eventType,
-          status: metadata.status || 'completed',
-          details: details,
-          error: metadata.error || null,
-        }),
-      }
+    // pipeline_logs.id is AUTOINCREMENT - no id generated here
+    await run(
+      env.DB,
+      `INSERT INTO pipeline_logs (run_id, step, status, details, error) VALUES (?, ?, ?, ?, ?)`,
+      (metadata.run_id as string | undefined) || crypto.randomUUID(),
+      eventType,
+      (metadata.status as string | undefined) || 'completed',
+      JSON.stringify(details),
+      (metadata.error as string | undefined) || null
     );
   } catch (e) {
     console.error(`[PipelineEvent] Failed to log ${eventType}:`, e);
@@ -2821,28 +2739,13 @@ async function handleDispatcher(env: Env): Promise<Response> {
     triggered_at: new Date().toISOString(),
   });
   
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-  
   try {
     // Get all active users
-    const profilesResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?select=id,email,timezone`,
-      { headers }
-    );
-    
-    if (!profilesResponse.ok) {
-      throw new Error("Failed to fetch profiles");
-    }
-    
-    const profiles = await profilesResponse.json() as Array<{
+    const profiles = await all<{
       id: string;
       email: string;
       timezone: string;
-    }>;
+    }>(env.DB, `SELECT id, email, timezone FROM profiles`);
     
     console.log(`[Dispatcher] Found ${profiles.length} users to queue`);
     
@@ -2915,30 +2818,23 @@ async function pollSubscriptionsForUser(
   const errors: string[] = [];
   let newEpisodesTotal = 0;
   
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-  
   await logPipelineEvent(env, userId, 'polling_started', { run_id: runId });
   
   // Get user's subscriptions
-  const subscriptionsResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&is_active=eq.true&select=id,feed_url,podcast_title`,
-    { headers }
-  );
-  
-  if (!subscriptionsResponse.ok) {
-    const errorBody = await subscriptionsResponse.text();
-    throw new Error(`Failed to fetch user subscriptions: ${subscriptionsResponse.status} - ${errorBody}`);
-  }
-  
-  const subscriptions = await subscriptionsResponse.json() as Array<{
+  let subscriptions: Array<{
     id: string;
     feed_url: string;
     podcast_title: string;
   }>;
+  try {
+    subscriptions = await all(
+      env.DB,
+      `SELECT id, feed_url, podcast_title FROM subscriptions WHERE user_id = ? AND is_active = 1`,
+      userId
+    );
+  } catch (e) {
+    throw new Error(`Failed to fetch user subscriptions: ${e instanceof Error ? e.message : String(e)}`);
+  }
   
   console.log(`[Poll-${userId.slice(0,8)}] Polling ${subscriptions.length} subscriptions`);
   
@@ -2995,12 +2891,12 @@ async function pollSubscriptionsForUser(
       for (const item of items) {
         // Check if episode exists for THIS feed_url (not globally by guid)
         // This allows the same episode content to exist in multiple feeds (e.g., direct subscription vs ListenNotes aggregator)
-        const existingResponse = await fetch(
-          `${env.SUPABASE_URL}/rest/v1/episodes?guid=eq.${encodeURIComponent(item.guid)}&feed_url=eq.${encodeURIComponent(sub.feed_url)}&select=id`,
-          { headers }
+        const existing = await all<{ id: string }>(
+          env.DB,
+          `SELECT id FROM episodes WHERE guid = ? AND feed_url = ?`,
+          item.guid,
+          sub.feed_url
         );
-        
-        const existing = await existingResponse.json() as Array<{ id: string }>;
         
         if (existing.length === 0 && item.enclosure) {
           // Check exclusion list
@@ -3010,41 +2906,39 @@ async function pollSubscriptionsForUser(
           }
           
           // Insert new episode
-          const insertResponse = await fetch(
-            `${env.SUPABASE_URL}/rest/v1/episodes`,
-            {
-              method: "POST",
-              headers: { ...headers, "Prefer": "return=representation" },
-              body: JSON.stringify({
-                feed_url: sub.feed_url,  // Use feed_url to match subscription
-                title: item.title,
-                guid: item.guid,
-                audio_url: item.enclosure,
-                published_at: item.pubDate ? new Date(item.pubDate).toISOString() : new Date().toISOString(),
-                description: item.description || null,
-              }),
-            }
-          );
+          let episodeId: string | undefined;
+          try {
+            const newEpisodeId = crypto.randomUUID();
+            await run(
+              env.DB,
+              `INSERT INTO episodes (id, feed_url, title, guid, audio_url, published_at, description)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              newEpisodeId,
+              sub.feed_url,  // Use feed_url to match subscription
+              item.title,
+              item.guid,
+              item.enclosure,
+              item.pubDate ? new Date(item.pubDate).toISOString() : new Date().toISOString(),
+              item.description || null
+            );
+            episodeId = newEpisodeId;
+          } catch (insertErr) {
+            console.error(`[Poll-${userId.slice(0,8)}] Failed to insert episode: ${insertErr}`);
+          }
           
-          if (insertResponse.ok) {
+          if (episodeId) {
             newEpisodesTotal++;
-            const inserted = await insertResponse.json() as Array<{ id: string }>;
-            const episodeId = inserted?.[0]?.id;
             console.log(`[Poll-${userId.slice(0,8)}] New episode: ${item.title}`);
 
             // Trigger transcription for clip extraction
-            if (episodeId && item.enclosure) {
+            if (item.enclosure) {
               try {
-                await fetch(
-                  `${env.SUPABASE_URL}/rest/v1/transcriptions`,
-                  {
-                    method: "POST",
-                    headers,
-                    body: JSON.stringify({
-                      episode_id: episodeId,
-                      status: "processing",
-                    }),
-                  }
+                await run(
+                  env.DB,
+                  `INSERT INTO transcriptions (id, episode_id, status) VALUES (?, ?, ?)`,
+                  crypto.randomUUID(),
+                  episodeId,
+                  "processing"
                 );
 
                 const modalResponse = await fetch(
@@ -3125,38 +3019,27 @@ async function processUserDigest(
     triggered_at,
   });
   
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-  
   // Get user's timezone
-  const profileResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${user_id}&select=timezone`,
-    { headers }
+  const profile = await one<{ timezone: string | null }>(
+    env.DB,
+    `SELECT timezone FROM profiles WHERE id = ?`,
+    user_id
   );
-  
-  if (!profileResponse.ok) {
-    throw new Error("Failed to fetch user profile");
-  }
-  
-  const profiles = await profileResponse.json() as Array<{ timezone: string }>;
-  if (profiles.length === 0) {
+  if (!profile) {
     throw new Error("User not found");
   }
   
-  const timezone = profiles[0].timezone || "America/Mexico_City";
+  const timezone = profile.timezone || "America/Mexico_City";
   const dateFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: timezone });
   const today = dateFormatter.format(new Date());
   
   // Step 1: Check if digest already exists for today
-  const existingResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${user_id}&digest_date=eq.${today}&select=id`,
-    { headers }
+  const existing = await all<{ id: string }>(
+    env.DB,
+    `SELECT id FROM digests WHERE user_id = ? AND digest_date = ?`,
+    user_id,
+    today
   );
-  
-  const existing = await existingResponse.json() as Array<{ id: string }>;
   
   if (existing.length > 0) {
     console.log(`[Consumer-${user_id.slice(0,8)}] Digest already exists for ${today}, skipping`);
@@ -3294,48 +3177,45 @@ async function handleRequeueUsers(request: Request, env: Env): Promise<Response>
 
 // Queue status check - shows recent queue activity
 async function handleQueueStatus(env: Env): Promise<Response> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-  
   try {
     // Get recent pipeline events related to queue
-    const logsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/pipeline_logs?step=in.(dispatcher_started,dispatcher_completed,queue_message_received,queue_message_error,queue_message_failed,digest_published,digest_skipped)&order=created_at.desc&limit=50`,
-      { headers }
-    );
-    
-    if (!logsResponse.ok) {
-      throw new Error("Failed to fetch queue logs");
-    }
-    
-    const logs = await logsResponse.json() as Array<{
+    const queueSteps = [
+      'dispatcher_started', 'dispatcher_completed', 'queue_message_received',
+      'queue_message_error', 'queue_message_failed', 'digest_published', 'digest_skipped',
+    ];
+    const logRows = await all<{
       run_id: string;
       step: string;
       status: string;
-      user_id: string | null;
-      details: Record<string, unknown>;
+      details: string | null;
       created_at: string;
-    }>;
+    }>(
+      env.DB,
+      `SELECT run_id, step, status, details, created_at FROM pipeline_logs
+       WHERE step IN (${queueSteps.map(() => '?').join(',')})
+       ORDER BY created_at DESC LIMIT 50`,
+      ...queueSteps
+    );
+    
+    // Parse the TEXT JSON details column
+    const logs = logRows.map(row => ({
+      ...row,
+      details: parseJson<Record<string, unknown>>(row.details, {}),
+    }));
     
     // Get today's digest counts
     const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'UTC' }).format(new Date());
-    const digestsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?digest_date=eq.${today}&select=user_id,status`,
-      { headers }
+    const todayDigests = await all<{ user_id: string; status: string }>(
+      env.DB,
+      `SELECT user_id, status FROM digests WHERE digest_date = ?`,
+      today
     );
-    
-    const todayDigests = await digestsResponse.json() as Array<{ user_id: string; status: string }>;
     
     // Get all users to check who's missing a digest
-    const profilesResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?select=id,email`,
-      { headers }
+    const profiles = await all<{ id: string; email: string }>(
+      env.DB,
+      `SELECT id, email FROM profiles`
     );
-    
-    const profiles = await profilesResponse.json() as Array<{ id: string; email: string }>;
     
     const usersWithDigest = new Set(todayDigests.map(d => d.user_id));
     const missingDigests = profiles.filter(p => !usersWithDigest.has(p.id));
@@ -3357,45 +3237,35 @@ async function handleQueueStatus(env: Env): Promise<Response> {
 
 // Test endpoint: Check API key status for a user
 async function handleTestKeyStatus(env: Env, userId: string): Promise<Response> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-  
   try {
     // Get user profile
-    const profileResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,email`,
-      { headers }
+    const profile = await one<{ id: string; email: string }>(
+      env.DB,
+      `SELECT id, email FROM profiles WHERE id = ?`,
+      userId
     );
     
-    const profiles = await profileResponse.json() as Array<{ id: string; email: string }>;
-    
-    if (profiles.length === 0) {
+    if (!profile) {
       return json({ error: "User not found" }, 404);
     }
     
     // Get API key status (encrypted keys and validation status)
-    const keysResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${userId}&select=*`,
-      { headers }
-    );
-    
-    const keysRows = await keysResponse.json() as Array<{
+    const keysRows = await all<{
       openai_key_encrypted: string | null;
       anthropic_key_encrypted: string | null;
-      elevenlabs_key_encrypted: string | null;
-      openai_valid: boolean;
-      anthropic_valid: boolean;
-      elevenlabs_valid: boolean;
-    }>;
+      openai_valid: number | null;
+      anthropic_valid: number | null;
+    }>(
+      env.DB,
+      `SELECT * FROM user_api_keys WHERE user_id = ?`,
+      userId
+    );
     
     const hasKeyRow = keysRows.length > 0;
     const keyRow = keysRows[0];
     
     // Try to decrypt keys to verify they work
-    let decryptionStatus = { openai: 'not_set', anthropic: 'not_set', elevenlabs: 'not_set' };
+    let decryptionStatus = { openai: 'not_set', anthropic: 'not_set' };
     
     if (hasKeyRow) {
       if (keyRow.openai_key_encrypted) {
@@ -3416,34 +3286,21 @@ async function handleTestKeyStatus(env: Env, userId: string): Promise<Response> 
         }
       }
       
-      if (keyRow.elevenlabs_key_encrypted) {
-        try {
-          const key = await decryptApiKey(keyRow.elevenlabs_key_encrypted, env.API_KEY_ENCRYPTION_KEY);
-          decryptionStatus.elevenlabs = key ? `decrypted (${key.slice(0, 10)}...)` : 'decrypt_failed';
-        } catch (e) {
-          decryptionStatus.elevenlabs = `decrypt_error: ${e instanceof Error ? e.message : String(e)}`;
-        }
-      }
     }
     
     return json({
-      user: profiles[0],
+      user: profile,
       has_key_row: hasKeyRow,
       keys: hasKeyRow ? {
         openai: {
           encrypted_length: keyRow.openai_key_encrypted?.length || 0,
-          valid: keyRow.openai_valid,
+          valid: !!keyRow.openai_valid,
           decryption: decryptionStatus.openai,
         },
         anthropic: {
           encrypted_length: keyRow.anthropic_key_encrypted?.length || 0,
-          valid: keyRow.anthropic_valid,
+          valid: !!keyRow.anthropic_valid,
           decryption: decryptionStatus.anthropic,
-        },
-        elevenlabs: {
-          encrypted_length: keyRow.elevenlabs_key_encrypted?.length || 0,
-          valid: keyRow.elevenlabs_valid,
-          decryption: decryptionStatus.elevenlabs,
         },
       } : null,
     });
@@ -3456,37 +3313,25 @@ async function handleTestKeyStatus(env: Env, userId: string): Promise<Response> 
 
 // Test endpoint: Delete today's digest for a user
 async function handleTestDeleteDigest(env: Env, userId: string): Promise<Response> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-  
   try {
     const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'UTC' }).format(new Date());
     
     // Find today's digest for this user
-    const findResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=eq.${today}&select=id,status`,
-      { headers }
+    const digests = await all<{ id: string; status: string }>(
+      env.DB,
+      `SELECT id, status FROM digests WHERE user_id = ? AND digest_date = ?`,
+      userId,
+      today
     );
-    
-    const digests = await findResponse.json() as Array<{ id: string; status: string }>;
     
     if (digests.length === 0) {
       return json({ message: "No digest found for today", user_id: userId, date: today });
     }
     
     // Delete the digest
-    const deleteResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?id=eq.${digests[0].id}`,
-      {
-        method: "DELETE",
-        headers,
-      }
-    );
-    
-    if (!deleteResponse.ok) {
+    try {
+      await run(env.DB, `DELETE FROM digests WHERE id = ?`, digests[0].id);
+    } catch {
       return json({ error: "Failed to delete digest" }, 500);
     }
     
@@ -3504,58 +3349,55 @@ async function handleTestDeleteDigest(env: Env, userId: string): Promise<Respons
 }
 
 async function handleDebugEpisodes(env: Env, userId: string): Promise<Response> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-  
   try {
     // Get user's subscriptions
-    const subsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&is_active=eq.true&select=id,feed_url,podcast_title`,
-      { headers }
-    );
-    
-    const subscriptions = await subsResponse.json() as Array<{
+    const subscriptions = await all<{
       id: string;
       feed_url: string;
       podcast_title: string;
-    }>;
+    }>(
+      env.DB,
+      `SELECT id, feed_url, podcast_title FROM subscriptions WHERE user_id = ? AND is_active = 1`,
+      userId
+    );
     
     if (subscriptions.length === 0) {
       return json({ error: "No subscriptions found", user_id: userId });
     }
     
     const feedUrls = subscriptions.map(s => s.feed_url);
-    const feedUrlFilter = feedUrls.map(u => `"${u}"`).join(",");
     
     // Get ALL episodes from those feeds (no date filter)
-    const episodesResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/episodes?feed_url=in.(${feedUrlFilter})&select=id,title,feed_url,published_at,created_at&order=created_at.desc&limit=20`,
-      { headers }
-    );
-    
-    const episodes = await episodesResponse.json() as Array<{
+    const episodes = await all<{
       id: string;
       title: string;
       feed_url: string;
       published_at: string;
       created_at: string;
-    }>;
-    
-    // Get already covered episodes
-    const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-    const digestsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=gte.${weekAgo}&select=id,digest_date,episodes_included`,
-      { headers }
+    }>(
+      env.DB,
+      `SELECT id, title, feed_url, published_at, created_at FROM episodes
+       WHERE feed_url IN (${feedUrls.map(() => '?').join(',')})
+       ORDER BY created_at DESC LIMIT 20`,
+      ...feedUrls
     );
     
-    const recentDigests = await digestsResponse.json() as Array<{
+    // Get already covered episodes (episodes_included is a TEXT JSON column)
+    const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const recentDigestRows = await all<{
       id: string;
       digest_date: string;
-      episodes_included: string[];
-    }>;
+      episodes_included: string | null;
+    }>(
+      env.DB,
+      `SELECT id, digest_date, episodes_included FROM digests WHERE user_id = ? AND digest_date >= ?`,
+      userId,
+      weekAgo
+    );
+    const recentDigests = recentDigestRows.map(d => ({
+      ...d,
+      episodes_included: parseJson<string[]>(d.episodes_included, []),
+    }));
     
     const coveredEpisodeIds = new Set<string>();
     for (const d of recentDigests) {
@@ -3598,25 +3440,20 @@ async function handleDebugEpisodes(env: Env, userId: string): Promise<Response> 
 }
 
 async function cleanupOldDigestAudio(env: Env): Promise<{ deleted: number; errors: number }> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-
   const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
-  const response = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/digests?select=id&audio_url=not.is.null&created_at=lt.${cutoff}`,
-    { headers }
-  );
-
-  if (!response.ok) {
-    console.error(`[Retention] Failed to query old digests: ${response.status}`);
+  let oldDigests: Array<{ id: string }>;
+  try {
+    oldDigests = await all<{ id: string }>(
+      env.DB,
+      `SELECT id FROM digests WHERE audio_url IS NOT NULL AND created_at < ?`,
+      cutoff
+    );
+  } catch (e) {
+    console.error(`[Retention] Failed to query old digests: ${e}`);
     return { deleted: 0, errors: 1 };
   }
 
-  const oldDigests = await response.json() as Array<{ id: string }>;
   if (oldDigests.length === 0) {
     console.log("[Retention] No expired digest audio to clean up");
     return { deleted: 0, errors: 0 };
@@ -3628,27 +3465,22 @@ async function cleanupOldDigestAudio(env: Env): Promise<{ deleted: number; error
 
   for (const digest of oldDigests) {
     try {
-      await fetch(
-        `${env.SUPABASE_URL}/storage/v1/object/digests/${digest.id}/digest.mp3`,
-        { method: "DELETE", headers }
-      );
+      await env.MEDIA.delete(`digests/${digest.id}/digest.mp3`);
       deleted++;
-    } catch {
+    } catch (e) {
+      console.error(`[Retention] R2 delete failed for digest ${digest.id}: ${e}`);
       errors++;
     }
   }
 
-  const patchResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/digests?audio_url=not.is.null&created_at=lt.${cutoff}`,
-    {
-      method: "PATCH",
-      headers: { ...headers, "Prefer": "return=minimal" },
-      body: JSON.stringify({ audio_url: null }),
-    }
-  );
-
-  if (!patchResponse.ok) {
-    console.error(`[Retention] Failed to null out audio_url: ${patchResponse.status}`);
+  try {
+    await run(
+      env.DB,
+      `UPDATE digests SET audio_url = NULL WHERE audio_url IS NOT NULL AND created_at < ?`,
+      cutoff
+    );
+  } catch (e) {
+    console.error(`[Retention] Failed to null out audio_url: ${e}`);
     errors++;
   }
 
@@ -3659,23 +3491,11 @@ async function cleanupOldDigestAudio(env: Env): Promise<{ deleted: number; error
 // Poll-only cron — polls all users' RSS feeds and triggers transcriptions
 // Run 30-60 min before daily-cron so transcripts are ready for clip extraction
 async function handlePollCron(env: Env): Promise<Response> {
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-
   try {
-    const profilesResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?select=id,email`,
-      { headers }
+    const profiles = await all<{ id: string; email: string }>(
+      env.DB,
+      `SELECT id, email FROM profiles`
     );
-
-    if (!profilesResponse.ok) {
-      return json({ error: "Failed to fetch profiles" }, 500);
-    }
-
-    const profiles = await profilesResponse.json() as Array<{ id: string; email: string }>;
     console.log(`[PollCron] Polling feeds for ${profiles.length} users`);
 
     const results: Array<{ user_id: string; new_episodes: number }> = [];
@@ -3798,29 +3618,20 @@ async function handleReembedAll(env: Env, request?: Request): Promise<Response> 
   
   console.log(`[ReembedAll] Starting re-embedding with offset=${offset}, limit=${limit}`);
   
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-  };
-  
   try {
     // Get completed transcriptions with pagination
-    const transcriptionsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/transcriptions?status=eq.completed&select=id,episode_id,supermemory_doc_id,transcript_storage_path&order=id&offset=${offset}&limit=${limit}`,
-      { headers }
-    );
-    
-    if (!transcriptionsResponse.ok) {
-      return json({ error: "Failed to fetch transcriptions" }, 500);
-    }
-    
-    const transcriptions = await transcriptionsResponse.json() as Array<{
+    const transcriptions = await all<{
       id: string;
       episode_id: string;
       supermemory_doc_id: string | null;
       transcript_storage_path: string;
-    }>;
+    }>(
+      env.DB,
+      `SELECT id, episode_id, supermemory_doc_id, transcript_storage_path FROM transcriptions
+       WHERE status = 'completed' ORDER BY id LIMIT ? OFFSET ?`,
+      limit,
+      offset
+    );
     
     console.log(`[ReembedAll] Found ${transcriptions.length} transcriptions to re-embed`);
     
@@ -3846,21 +3657,15 @@ async function handleReembedAll(env: Env, request?: Request): Promise<Response> 
           }
         }
         
-        // Download transcript from storage
-        const transcriptUrl = `${env.SUPABASE_URL}/storage/v1/object/transcripts/${t.transcript_storage_path}`;
-        const transcriptResponse = await fetch(transcriptUrl, {
-          headers: {
-            "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-            "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-          },
-        });
+        // Download transcript from R2
+        const transcriptObj = await env.TRANSCRIPTS.get(t.transcript_storage_path);
         
-        if (!transcriptResponse.ok) {
+        if (!transcriptObj) {
           results.push({ episode_id: t.episode_id, status: "error", error: "Transcript not found" });
           continue;
         }
         
-        const transcript = await transcriptResponse.json() as { text: string };
+        const transcript = await transcriptObj.json() as { text: string };
         
         // Re-embed with correct metadata
         await embedInSuperMemory(t.episode_id, transcript.text, env);
@@ -3911,30 +3716,24 @@ async function handleExtractTopics(request: Request, env: Env): Promise<Response
       return json({ error: "episode_id required" }, 400);
     }
     
-    const headers = {
-      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-    };
-    
     // Get episode to find user via subscription
-    const episodeResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episode_id}&select=id,feed_url`,
-      { headers }
+    const episode = await one<{ id: string; feed_url: string }>(
+      env.DB,
+      `SELECT id, feed_url FROM episodes WHERE id = ?`,
+      episode_id
     );
-    const episodes = await episodeResponse.json() as Array<{ id: string; feed_url: string }>;
     
-    if (!episodes.length) {
+    if (!episode) {
       return json({ error: "Episode not found" }, 404);
     }
     
     // Find user via subscription
-    const subResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/subscriptions?feed_url=eq.${encodeURIComponent(episodes[0].feed_url)}&select=user_id&limit=1`,
-      { headers }
+    const sub = await one<{ user_id: string }>(
+      env.DB,
+      `SELECT user_id FROM subscriptions WHERE feed_url = ? LIMIT 1`,
+      episode.feed_url
     );
-    const subs = await subResponse.json() as Array<{ user_id: string }>;
-    const userId = subs[0]?.user_id;
+    const userId = sub?.user_id;
     
     if (!userId) {
       return json({ error: "No user found for this episode" }, 400);
@@ -3942,8 +3741,7 @@ async function handleExtractTopics(request: Request, env: Env): Promise<Response
     
     // Get user's Anthropic key (required - no fallback)
     const userKeys = await getUserApiKeys(
-      env.SUPABASE_URL,
-      env.SUPABASE_SERVICE_ROLE_KEY,
+      env.DB,
       userId,
       env.API_KEY_ENCRYPTION_KEY
     );
@@ -3952,48 +3750,40 @@ async function handleExtractTopics(request: Request, env: Env): Promise<Response
       return json({ error: "Anthropic API key not configured. Please add your API key in Settings." }, 400);
     }
     
-    // Get transcript from storage
-    const transcriptResponse = await fetch(
-      `${env.SUPABASE_URL}/storage/v1/object/transcripts/${episode_id}/transcript.json`,
-      { headers }
-    );
+    // Get transcript from R2
+    const transcriptObj2 = await env.TRANSCRIPTS.get(`${episode_id}/transcript.json`);
     
-    if (!transcriptResponse.ok) {
+    if (!transcriptObj2) {
       return json({ error: "Transcript not found" }, 404);
     }
     
-    const transcript = await transcriptResponse.json() as { text: string };
+    const transcript = await transcriptObj2.json() as { text: string };
     
     // Extract topics
     const result = await callClaudeForTopics(transcript.text, userKeys.anthropicKey);
     
     // Get transcription ID
-    const transcriptionResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episode_id}&select=id`,
-      { headers }
+    const transcription = await one<{ id: string }>(
+      env.DB,
+      `SELECT id FROM transcriptions WHERE episode_id = ?`,
+      episode_id
     );
-    const transcriptions = await transcriptionResponse.json() as { id: string }[];
     
-    if (!transcriptions.length) {
+    if (!transcription) {
       return json({ error: "Transcription record not found" }, 404);
     }
     
-    // Insert or update topic extraction
-    const insertResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/topic_extractions`,
-      {
-        method: "POST",
-        headers: { ...headers, "Prefer": "return=representation" },
-        body: JSON.stringify({
-          transcription_id: transcriptions[0].id,
-          topics: result,
-        }),
-      }
-    );
-    
-    if (!insertResponse.ok) {
-      const err = await insertResponse.text();
-      return json({ error: `Failed to save: ${err}` }, 500);
+    // Insert topic extraction
+    try {
+      await run(
+        env.DB,
+        `INSERT INTO topic_extractions (id, transcription_id, topics) VALUES (?, ?, ?)`,
+        crypto.randomUUID(),
+        transcription.id,
+        JSON.stringify(result)
+      );
+    } catch (insertErr) {
+      return json({ error: `Failed to save: ${insertErr instanceof Error ? insertErr.message : String(insertErr)}` }, 500);
     }
     
     return json({
@@ -4035,6 +3825,7 @@ interface ResolvedClip {
   start_seconds: number;
   end_seconds: number;
   quote: string;
+  marker_index: number;
 }
 
 interface TranscriptSegment {
@@ -4047,75 +3838,107 @@ function findClipTimestamps(
   quote: string,
   segments: TranscriptSegment[]
 ): { start: number; end: number } | null {
+  if (!segments.length) return null;
+
   const normalizedQuote = quote.toLowerCase().replace(/[^\w\s]/g, "").trim();
   const quoteWords = normalizedQuote.split(/\s+/);
-  if (quoteWords.length < 3) return null;
+  if (quoteWords.length < 4) return null;
 
-  // Build a sliding window over segments to find the best match
-  let bestMatch = { score: 0, startIdx: 0, endIdx: 0 };
-
+  // Build word-level index: each word maps to its segment
+  const wordEntries: Array<{ word: string; segIdx: number }> = [];
   for (let i = 0; i < segments.length; i++) {
-    let windowText = "";
-    for (let j = i; j < Math.min(i + 10, segments.length); j++) {
-      windowText += " " + segments[j].text;
-      const normalizedWindow = windowText.toLowerCase().replace(/[^\w\s]/g, "").trim();
+    const segWords = segments[i].text.toLowerCase().replace(/[^\w\s]/g, "").trim().split(/\s+/).filter(w => w);
+    for (const w of segWords) {
+      wordEntries.push({ word: w, segIdx: i });
+    }
+  }
 
-      // Count matching words in sequence
-      const windowWords = normalizedWindow.split(/\s+/);
-      let matchCount = 0;
-      let searchStart = 0;
-      for (const word of quoteWords) {
-        const idx = windowWords.indexOf(word, searchStart);
-        if (idx >= 0) {
-          matchCount++;
-          searchStart = idx + 1;
-        }
+  if (wordEntries.length === 0) return null;
+
+  // Collect all matches above threshold, then pick the best one (preferring non-intro)
+  const INTRO_THRESHOLD_SECS = 90;
+  const matches: Array<{ score: number; startWordIdx: number; endWordIdx: number }> = [];
+
+  const step = Math.max(1, Math.floor(wordEntries.length / 500));
+  for (let startPos = 0; startPos < wordEntries.length; startPos += step) {
+    let matched = 0;
+    let quotePtr = 0;
+    let lastMatchPos = startPos;
+
+    for (let pos = startPos; pos < Math.min(startPos + quoteWords.length * 3, wordEntries.length); pos++) {
+      if (quotePtr >= quoteWords.length) break;
+      if (wordEntries[pos].word === quoteWords[quotePtr]) {
+        matched++;
+        quotePtr++;
+        lastMatchPos = pos;
       }
+    }
 
-      const score = matchCount / quoteWords.length;
-      if (score > bestMatch.score) {
-        bestMatch = { score, startIdx: i, endIdx: j };
+    const score = matched / quoteWords.length;
+    if (score >= 0.7) {
+      matches.push({ score, startWordIdx: startPos, endWordIdx: lastMatchPos });
+    }
+  }
+
+  // Refine: for each match found with step > 1, search nearby positions
+  if (step > 1) {
+    const toRefine = [...matches];
+    for (const m of toRefine) {
+      const refineStart = Math.max(0, m.startWordIdx - step);
+      const refineEnd = Math.min(wordEntries.length, m.startWordIdx + step);
+      for (let startPos = refineStart; startPos < refineEnd; startPos++) {
+        let matched = 0;
+        let quotePtr = 0;
+        let lastMatchPos = startPos;
+
+        for (let pos = startPos; pos < Math.min(startPos + quoteWords.length * 3, wordEntries.length); pos++) {
+          if (quotePtr >= quoteWords.length) break;
+          if (wordEntries[pos].word === quoteWords[quotePtr]) {
+            matched++;
+            quotePtr++;
+            lastMatchPos = pos;
+          }
+        }
+
+        const score = matched / quoteWords.length;
+        if (score >= 0.7) {
+          matches.push({ score, startWordIdx: startPos, endWordIdx: lastMatchPos });
+        }
       }
     }
   }
 
-  // Require at least 60% word match
-  if (bestMatch.score < 0.6) return null;
+  if (matches.length === 0) return null;
 
-  const startSeg = segments[bestMatch.startIdx];
-  const endSeg = segments[bestMatch.endIdx];
+  // Prefer matches NOT in the intro (first 90 seconds), then by score
+  const best = matches.sort((a, b) => {
+    const aTime = segments[wordEntries[a.startWordIdx].segIdx].start;
+    const bTime = segments[wordEntries[b.startWordIdx].segIdx].start;
+    const aIsIntro = aTime < INTRO_THRESHOLD_SECS ? 1 : 0;
+    const bIsIntro = bTime < INTRO_THRESHOLD_SECS ? 1 : 0;
+    if (aIsIntro !== bIsIntro) return aIsIntro - bIsIntro;
+    return b.score - a.score;
+  })[0];
 
-  // Add a small buffer and cap clip length at 20 seconds
-  const start = Math.max(0, startSeg.start - 0.5);
-  const end = Math.min(endSeg.end + 0.5, startSeg.start + 20);
+  const startSegIdx = wordEntries[best.startWordIdx].segIdx;
+  const endSegIdx = wordEntries[best.endWordIdx].segIdx;
 
+  const start = Math.max(0, segments[startSegIdx].start - 0.5);
+  const end = Math.min(segments[endSegIdx].end + 1.0, start + 25);
+
+  console.log(`[findClipTimestamps] score=${best.score.toFixed(3)}, time=${start.toFixed(1)}s-${end.toFixed(1)}s, matches_found=${matches.length}`);
   return { start, end };
 }
 
 // Check which users need digests generated based on their timezone and digest_time
 async function handleScheduledDigest(env: Env): Promise<Response> {
   try {
-    const headers = {
-      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-    };
-    
     // Get all users with their timezone and digest preferences
-    const profilesResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?select=id,timezone,digest_time`,
-      { headers }
-    );
-    
-    if (!profilesResponse.ok) {
-      return json({ error: "Failed to fetch profiles" }, 500);
-    }
-    
-    const profiles = await profilesResponse.json() as Array<{
+    const profiles = await all<{
       id: string;
       timezone: string;
       digest_time: string;
-    }>;
+    }>(env.DB, `SELECT id, timezone, digest_time FROM profiles`);
     
     const now = new Date();
     const generatedFor: string[] = [];
@@ -4158,12 +3981,12 @@ async function handleScheduledDigest(env: Env): Promise<Response> {
         const dateFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: profile.timezone });
         const today = dateFormatter.format(now); // Returns YYYY-MM-DD format
         
-        const existingResponse = await fetch(
-          `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${profile.id}&digest_date=eq.${today}&select=id`,
-          { headers }
+        const existing = await all<{ id: string }>(
+          env.DB,
+          `SELECT id FROM digests WHERE user_id = ? AND digest_date = ?`,
+          profile.id,
+          today
         );
-        
-        const existing = await existingResponse.json() as Array<{ id: string }>;
         
         if (existing.length === 0) {
           // Generate digest for this user
@@ -4234,12 +4057,6 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     
     const forceGenerate = body.force === true;
     
-    const headers = {
-      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-    };
-    
     const hoursBack = body.hours_back || 24;
     const userId = body.user_id || "00000000-0000-0000-0000-000000000000";
     
@@ -4251,15 +4068,13 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     // Fetch user's digest length preference (default 5 minutes)
     let maxLengthMinutes = 5;
     try {
-      const profileResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=digest_length_minutes`,
-        { headers }
+      const profileRow = await one<{ digest_length_minutes: number | null }>(
+        env.DB,
+        `SELECT digest_length_minutes FROM profiles WHERE id = ?`,
+        userId
       );
-      if (profileResponse.ok) {
-        const profiles = await profileResponse.json() as Array<{ digest_length_minutes?: number }>;
-        if (profiles.length > 0 && profiles[0].digest_length_minutes) {
-          maxLengthMinutes = profiles[0].digest_length_minutes;
-        }
+      if (profileRow?.digest_length_minutes) {
+        maxLengthMinutes = profileRow.digest_length_minutes;
       }
     } catch (e) {
       console.log(`[Digest] Could not fetch digest length preference, using default ${maxLengthMinutes} minutes`);
@@ -4270,7 +4085,6 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     // BYOK: Fetch user's API keys (required - no fallbacks)
     let userAnthropicKey: string | undefined;
     let userOpenAIKey: string | undefined;
-    let userElevenLabsKey: string | undefined;
     
     if (userId === "00000000-0000-0000-0000-000000000000") {
       return json({ error: "Valid user ID is required" }, 400);
@@ -4278,15 +4092,13 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     
     try {
       const userKeys = await getUserApiKeys(
-        env.SUPABASE_URL,
-        env.SUPABASE_SERVICE_ROLE_KEY,
+        env.DB,
         userId,
         env.API_KEY_ENCRYPTION_KEY
       );
       
       userAnthropicKey = userKeys.anthropicKey;
       userOpenAIKey = userKeys.openaiKey;
-      userElevenLabsKey = userKeys.elevenlabsKey;
       
       if (!userAnthropicKey) {
         console.error(`[Digest] User ${userId} does not have Anthropic key configured`);
@@ -4301,37 +4113,41 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     
     // 1. Get episodes already covered in THIS USER's recent digests (last 7 days) to avoid repeats
     const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-    const recentDigestsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=gte.${weekAgo}&select=episodes_included`,
-      { headers }
-    );
     
     let alreadyCoveredEpisodes = new Set<string>();
-    if (recentDigestsResponse.ok) {
-      const recentDigests = await recentDigestsResponse.json() as Array<{ episodes_included: string[] }>;
+    try {
+      const recentDigests = await all<{ episodes_included: string | null }>(
+        env.DB,
+        `SELECT episodes_included FROM digests WHERE user_id = ? AND digest_date >= ?`,
+        userId,
+        weekAgo
+      );
       for (const digest of recentDigests) {
-        for (const epId of (digest.episodes_included || [])) {
+        for (const epId of parseJson<string[]>(digest.episodes_included, [])) {
           alreadyCoveredEpisodes.add(epId);
         }
       }
+    } catch {
+      // Non-fatal: worst case we may repeat an episode
     }
     console.log(`[Digest] Found ${alreadyCoveredEpisodes.size} episodes already covered in recent digests`);
     
     // 2. Get THIS USER's subscriptions first - only include episodes from podcasts they subscribe to
-    const userSubscriptionsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&is_active=eq.true&select=feed_url,podcast_title,publication_frequency_days`,
-      { headers }
-    );
-    
-    if (!userSubscriptionsResponse.ok) {
-      return json({ error: "Failed to fetch user subscriptions" }, 500);
-    }
-    
-    const userSubscriptions = await userSubscriptionsResponse.json() as Array<{ 
+    let userSubscriptions: Array<{ 
       feed_url: string; 
       podcast_title: string;
       publication_frequency_days: number | null;
     }>;
+    try {
+      userSubscriptions = await all(
+        env.DB,
+        `SELECT feed_url, podcast_title, publication_frequency_days FROM subscriptions
+         WHERE user_id = ? AND is_active = 1`,
+        userId
+      );
+    } catch {
+      return json({ error: "Failed to fetch user subscriptions" }, 500);
+    }
     
     if (userSubscriptions.length === 0) {
       return json({ error: "No active subscriptions found for user" }, 404);
@@ -4352,19 +4168,8 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     // 3. Fetch recent episodes ONLY from user's subscribed feeds
     const cutoffDate = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
     
-    // Build feed URL filter for the query
-    const feedUrlFilter = [...userFeedUrls].map(u => `"${u}"`).join(",");
-    
-    const episodesResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/episodes?created_at=gte.${cutoffDate}&feed_url=in.(${feedUrlFilter})&select=id,title,description,published_at,feed_url,audio_url`,
-      { headers }
-    );
-    
-    if (!episodesResponse.ok) {
-      return json({ error: "Failed to fetch episodes" }, 500);
-    }
-    
-    let episodes = await episodesResponse.json() as Array<{
+    const feedUrlList = [...userFeedUrls];
+    let episodes: Array<{
       id: string;
       title: string;
       description: string;
@@ -4372,6 +4177,17 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
       feed_url: string;
       audio_url: string;
     }>;
+    try {
+      episodes = await all(
+        env.DB,
+        `SELECT id, title, description, published_at, feed_url, audio_url FROM episodes
+         WHERE published_at >= ? AND feed_url IN (${feedUrlList.map(() => '?').join(',')})`,
+        cutoffDate,
+        ...feedUrlList
+      );
+    } catch {
+      return json({ error: "Failed to fetch episodes" }, 500);
+    }
     
     console.log(`[Digest] Found ${episodes.length} episodes from user's subscriptions`);
     
@@ -4422,21 +4238,26 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     
     // 2. Get topic extractions for these episodes
     const episodeIds = episodes.map(e => e.id);
-    const topicsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=in.(${episodeIds.join(",")})&select=episode_id,id`,
-      { headers }
+    const transcriptions = await all<{ episode_id: string; id: string }>(
+      env.DB,
+      `SELECT episode_id, id FROM transcriptions WHERE episode_id IN (${episodeIds.map(() => '?').join(',')})`,
+      ...episodeIds
     );
-    const transcriptions = await topicsResponse.json() as Array<{ episode_id: string; id: string }>;
     
     const transcriptionIds = transcriptions.map(t => t.id);
-    const extractionsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/topic_extractions?transcription_id=in.(${transcriptionIds.join(",")})&select=transcription_id,topics`,
-      { headers }
-    );
-    const extractions = await extractionsResponse.json() as Array<{ 
-      transcription_id: string; 
-      topics: TopicExtractionResult;
-    }>;
+    const extractionRows = transcriptionIds.length > 0
+      ? await all<{ transcription_id: string; topics: string | null }>(
+          env.DB,
+          `SELECT transcription_id, topics FROM topic_extractions
+           WHERE transcription_id IN (${transcriptionIds.map(() => '?').join(',')})`,
+          ...transcriptionIds
+        )
+      : [];
+    // topics is a TEXT JSON column
+    const extractions = extractionRows.map(row => ({
+      transcription_id: row.transcription_id,
+      topics: parseJson<TopicExtractionResult | undefined>(row.topics, undefined),
+    })).filter((row): row is { transcription_id: string; topics: TopicExtractionResult } => !!row.topics);
     
     // Map extractions to episodes
     const transcriptionToEpisode = new Map(transcriptions.map(t => [t.id, t.episode_id]));
@@ -4452,12 +4273,9 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     const episodeTranscripts = new Map<string, { text: string; segments: TranscriptSegment[] }>();
     for (const ep of episodes) {
       try {
-        const transcriptResponse = await fetch(
-          `${env.SUPABASE_URL}/storage/v1/object/transcripts/${ep.id}/transcript.json`,
-          { headers }
-        );
-        if (transcriptResponse.ok) {
-          const transcript = await transcriptResponse.json() as { text: string; segments: TranscriptSegment[] };
+        const transcriptObj = await env.TRANSCRIPTS.get(`${ep.id}/transcript.json`);
+        if (transcriptObj) {
+          const transcript = await transcriptObj.json() as { text: string; segments: TranscriptSegment[] };
           episodeTranscripts.set(ep.id, transcript);
         }
       } catch {
@@ -4481,7 +4299,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
         topics: topics?.topics || [],
         themes: topics?.themes || [],
         key_points: topics?.key_points || [],
-        transcript_excerpt: transcript?.text?.substring(0, 2000) || "",
+        transcript_excerpt: transcript?.text?.substring(0, 4000) || "",
       };
     });
     
@@ -4494,12 +4312,19 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
 
     // 6. Resolve clip markers to actual timestamps using transcript segments
     const resolvedClips: ResolvedClip[] = [];
-    for (const clip of script.clips) {
+    for (let clipIdx = 0; clipIdx < script.clips.length; clipIdx++) {
+      const clip = script.clips[clipIdx];
       const transcript = episodeTranscripts.get(clip.episode_id);
       const episode = episodes.find(ep => ep.id === clip.episode_id);
+      
+      console.log(`[Clip ${clipIdx + 1}] episode_id=${clip.episode_id}, has_segments=${!!transcript?.segments}, segment_count=${transcript?.segments?.length || 0}, has_audio=${!!episode?.audio_url}`);
+      console.log(`[Clip ${clipIdx + 1}] quote: "${clip.quote.substring(0, 80)}..."`);
+      
       if (!transcript?.segments || !episode?.audio_url) continue;
 
       const resolved = findClipTimestamps(clip.quote, transcript.segments);
+      console.log(`[Clip ${clipIdx + 1}] match result: ${resolved ? `${resolved.start.toFixed(1)}s-${resolved.end.toFixed(1)}s` : 'NO MATCH'}`);
+      
       if (resolved) {
         resolvedClips.push({
           episode_id: clip.episode_id,
@@ -4507,45 +4332,66 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
           start_seconds: resolved.start,
           end_seconds: resolved.end,
           quote: clip.quote,
+          marker_index: clipIdx + 1,
         });
       }
     }
+    resolvedClips.sort((a, b) => a.marker_index - b.marker_index);
     console.log(`[Digest] Resolved ${resolvedClips.length}/${script.clips.length} clips to timestamps`);
     
     // 5. Save pending digest record first (so we can update it when TTS completes)
     const digestId = crypto.randomUUID();
     const estimatedDuration = Math.round(script.word_count / 2.5);
+    const digestDate = new Date().toISOString().split('T')[0];
+    const topicClustersJson = JSON.stringify({ topics: script.topics_covered, title: script.title });
+    const episodesIncludedJson = JSON.stringify(episodeIds);
     
-    const digestRecord = {
-      id: digestId,
-      user_id: userId,
-      digest_date: new Date().toISOString().split('T')[0],
-      status: "generating", // Will be updated to "completed" by webhook
-      topic_clusters: { topics: script.topics_covered, title: script.title },
-      script_text: script.script, // Store full script for ElevenReader
-      audio_storage_path: `${digestId}/digest.mp3`,
-      audio_url: null, // Will be set by webhook
-      duration_seconds: estimatedDuration,
-      episodes_included: episodeIds,
-      completed_at: null,
-    };
-    
-    // Use upsert to allow regenerating same-day digests
-    const insertDigestResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?on_conflict=user_id,digest_date`,
-      {
-        method: "POST",
-        headers: { 
-          ...headers, 
-          "Prefer": "return=representation,resolution=merge-duplicates" 
-        },
-        body: JSON.stringify(digestRecord),
+    // Upsert to allow regenerating same-day digests. D1 has no unique constraint on
+    // (user_id, digest_date), so emulate PostgREST's merge-duplicates manually.
+    try {
+      const existingDigest = await one<{ id: string }>(
+        env.DB,
+        `SELECT id FROM digests WHERE user_id = ? AND digest_date = ?`,
+        userId,
+        digestDate
+      );
+      if (existingDigest) {
+        // Replace the existing row's content (including id, matching Postgres merge-duplicates)
+        await run(
+          env.DB,
+          `UPDATE digests SET id = ?, status = ?, topic_clusters = ?, script_text = ?,
+             audio_storage_path = ?, audio_url = NULL, duration_seconds = ?,
+             episodes_included = ?, completed_at = NULL
+           WHERE user_id = ? AND digest_date = ?`,
+          digestId,
+          "generating", // Will be updated to "completed" by webhook
+          topicClustersJson,
+          script.script, // Store full script for ElevenReader
+          `${digestId}/digest.mp3`,
+          estimatedDuration,
+          episodesIncludedJson,
+          userId,
+          digestDate
+        );
+      } else {
+        await run(
+          env.DB,
+          `INSERT INTO digests (id, user_id, digest_date, status, topic_clusters, script_text,
+             audio_storage_path, audio_url, duration_seconds, episodes_included, completed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL)`,
+          digestId,
+          userId,
+          digestDate,
+          "generating",
+          topicClustersJson,
+          script.script,
+          `${digestId}/digest.mp3`,
+          estimatedDuration,
+          episodesIncludedJson
+        );
       }
-    );
-    
-    if (!insertDigestResponse.ok) {
-      const errorText = await insertDigestResponse.text();
-      console.error(`[Digest] Failed to save record: ${errorText}`);
+    } catch (saveErr) {
+      console.error(`[Digest] Failed to save record: ${saveErr}`);
       return json({ error: "Failed to save digest record" }, 500);
     }
     
@@ -4564,8 +4410,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
       openai_api_key: userOpenAIKey,
       voice: "echo",
       model: "tts-1-hd",
-      supabase_url: env.SUPABASE_URL,
-      supabase_key: env.SUPABASE_SERVICE_ROLE_KEY,
+      upload_url: `https://api.podgest.app/api/webhooks/tts-audio?digest_id=${digestId}`,
       digest_id: digestId,
       webhook_url: "https://api.podgest.app/api/webhooks/tts",
       admin_key: env.ADMIN_API_KEY,
@@ -4576,6 +4421,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
         audio_url: c.audio_url,
         start_seconds: c.start_seconds,
         end_seconds: c.end_seconds,
+        marker_index: c.marker_index,
       }));
     }
     
@@ -4712,8 +4558,8 @@ Topics: ${ep.topics.join(", ")}`
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 4096,
+      model: "claude-sonnet-5",
+      max_tokens: 16000,
       system: systemPrompt,
       messages: [
         {
@@ -4794,11 +4640,11 @@ you can insert a clip marker: [CLIP:episode_index] where episode_index is the St
 The clip will be automatically extracted and spliced into the audio at that point.
 
 CLIP GUIDELINES:
-- Include 2-4 clips total across the digest (don't overdo it)
+- Include 3-4 clips per digest (aim for at least 3)
 - Place the [CLIP:N] marker AFTER your lead-in to the quote (e.g., "Here's how they put it: [CLIP:2]")
 - Only clip moments that are genuinely compelling: a strong quote, a surprising stat, an emotional moment
 - Each clip will be 5-15 seconds of the original audio
-- In the "clips" array of your response, provide the exact quote text that should be clipped
+- In the "clips" array of your response, provide the EXACT VERBATIM quote text from the transcript excerpt — do NOT paraphrase or shorten it, copy it word-for-word so it can be matched precisely
 
 STRUCTURE YOUR SCRIPT EXACTLY LIKE THIS:
 
@@ -4853,7 +4699,7 @@ Source Podcast: ${ep.podcast_name}
 Summary: ${ep.summary}
 Key Points: ${ep.key_points.join("; ")}
 Topics: ${ep.topics.join(", ")}
-Transcript Excerpt: ${ep.transcript_excerpt.substring(0, 1500)}`
+Transcript Excerpt: ${ep.transcript_excerpt.substring(0, 3000)}`
   ).join("\n\n");
 
   const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -4864,8 +4710,8 @@ Transcript Excerpt: ${ep.transcript_excerpt.substring(0, 1500)}`
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 4096,
+      model: "claude-sonnet-5",
+      max_tokens: 16000,
       system: systemPrompt,
       messages: [
         {
@@ -4930,46 +4776,29 @@ Transcript Excerpt: ${ep.transcript_excerpt.substring(0, 1500)}`
 
 async function handleRSSFeed(userId: string, env: Env, baseUrl?: string): Promise<Response> {
   try {
-    const headers = {
-      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-    };
-    
     // Fetch user profile for personalization
-    const profileResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,email,display_name`,
-      { headers }
+    const profile = await one<{ id: string; email: string | null; display_name: string | null }>(
+      env.DB,
+      `SELECT id, email, display_name FROM profiles WHERE id = ?`,
+      userId
     );
     
     let userName = "there";
-    if (profileResponse.ok) {
-      const profiles = await profileResponse.json() as Array<{ id: string; email?: string; display_name?: string }>;
-      if (profiles.length > 0) {
-        // Prefer display_name, fall back to first name from email
-        if (profiles[0].display_name) {
-          userName = profiles[0].display_name.split(' ')[0]; // First name from display name
-        } else if (profiles[0].email) {
-          const emailPart = profiles[0].email.split('@')[0];
-          const firstName = emailPart.split(/[._0-9]/)[0];
-          if (firstName && firstName.length > 1) {
-            userName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
-          }
+    if (profile) {
+      // Prefer display_name, fall back to first name from email
+      if (profile.display_name) {
+        userName = profile.display_name.split(' ')[0]; // First name from display name
+      } else if (profile.email) {
+        const emailPart = profile.email.split('@')[0];
+        const firstName = emailPart.split(/[._0-9]/)[0];
+        if (firstName && firstName.length > 1) {
+          userName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
         }
       }
     }
     
-    // Fetch completed digests for this user
-    const digestsResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&status=eq.completed&order=digest_date.desc&limit=50`,
-      { headers }
-    );
-    
-    if (!digestsResponse.ok) {
-      return new Response("Failed to fetch digests", { status: 500 });
-    }
-    
-    const digests = await digestsResponse.json() as Array<{
+    // Fetch completed digests for this user (topic_clusters is a TEXT JSON column)
+    let digests: Array<{
       id: string;
       digest_date: string;
       topic_clusters: { topics: string[]; title: string };
@@ -4977,13 +4806,35 @@ async function handleRSSFeed(userId: string, env: Env, baseUrl?: string): Promis
       duration_seconds: number;
       completed_at: string;
     }>;
+    try {
+      const digestRows = await all<{
+        id: string;
+        digest_date: string;
+        topic_clusters: string | null;
+        audio_url: string | null;
+        duration_seconds: number;
+        completed_at: string;
+      }>(
+        env.DB,
+        `SELECT id, digest_date, topic_clusters, audio_url, duration_seconds, completed_at
+         FROM digests WHERE user_id = ? AND status = 'completed'
+         ORDER BY digest_date DESC LIMIT 50`,
+        userId
+      );
+      digests = digestRows.map(d => ({
+        ...d,
+        topic_clusters: parseJson<{ topics: string[]; title: string }>(d.topic_clusters, { topics: [], title: "" }),
+      }));
+    } catch {
+      return new Response("Failed to fetch digests", { status: 500 });
+    }
     
     // Build RSS XML - use the actual request URL for self-references
     const feedBaseUrl = baseUrl || "https://api.podgest.app";
     const feedUrl = `${feedBaseUrl}/feed/${userId}.xml`;
     const now = new Date().toUTCString();
-    const coverImage = "https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/cover.png";
-    const welcomeAudio = "https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/welcome.mp3";
+    const coverImage = `${MEDIA_BASE_URL}/static/cover.png`;
+    const welcomeAudio = `${MEDIA_BASE_URL}/static/welcome.mp3`;
     
     // Build items with actual file sizes
     const items: string[] = [];
@@ -4992,23 +4843,26 @@ async function handleRSSFeed(userId: string, env: Env, baseUrl?: string): Promis
     const hasPlayableDigests = digests.some(d => d.audio_url);
     if (!hasPlayableDigests) {
       // Fetch welcome episode if it exists (marked with date 1970-01-01)
-      const welcomeResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/digests?user_id=eq.${userId}&digest_date=eq.1970-01-01&status=eq.completed&select=*`,
-        { headers }
+      const welcomeRows = await all<{
+        id: string;
+        topic_clusters: string | null;
+        audio_url: string | null;
+        duration_seconds: number;
+        completed_at: string;
+        script_text: string | null;
+      }>(
+        env.DB,
+        `SELECT * FROM digests WHERE user_id = ? AND digest_date = '1970-01-01' AND status = 'completed'`,
+        userId
       );
+      const welcomeDigests = welcomeRows.map(w => ({
+        ...w,
+        topic_clusters: parseJson<{ title?: string; topics?: string[] }>(w.topic_clusters, {}),
+      }));
       
       let hasWelcomeEpisode = false;
       
-      if (welcomeResponse.ok) {
-        const welcomeDigests = await welcomeResponse.json() as Array<{
-          id: string;
-          topic_clusters: { title: string; topics: string[] };
-          audio_url: string | null;
-          duration_seconds: number;
-          completed_at: string;
-          script_text: string;
-        }>;
-        
+      {
         if (welcomeDigests.length > 0 && welcomeDigests[0].audio_url) {
           hasWelcomeEpisode = true;
           const welcome = welcomeDigests[0];
@@ -5151,36 +5005,28 @@ ${items.join("\n")}
 // Handle OG preview for social media crawlers hitting RSS feed URLs
 async function handleFeedOGPreview(userId: string, env: Env, baseUrl: string): Promise<Response> {
   try {
-    const headers = {
-      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-    };
-    
     // Get user profile for personalization
-    const profileResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,email,display_name`,
-      { headers }
+    const profile = await one<{ id: string; email: string | null; display_name: string | null }>(
+      env.DB,
+      `SELECT id, email, display_name FROM profiles WHERE id = ?`,
+      userId
     );
     
     let userName = "Your";
-    if (profileResponse.ok) {
-      const profiles = await profileResponse.json() as Array<{ id: string; email?: string; display_name?: string }>;
-      if (profiles.length > 0) {
-        if (profiles[0].display_name) {
-          userName = profiles[0].display_name.split(' ')[0] + "'s";
-        } else if (profiles[0].email) {
-          const emailPart = profiles[0].email.split('@')[0];
-          const firstName = emailPart.split(/[._0-9]/)[0];
-          if (firstName && firstName.length > 1) {
-            userName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase() + "'s";
-          }
+    if (profile) {
+      if (profile.display_name) {
+        userName = profile.display_name.split(' ')[0] + "'s";
+      } else if (profile.email) {
+        const emailPart = profile.email.split('@')[0];
+        const firstName = emailPart.split(/[._0-9]/)[0];
+        if (firstName && firstName.length > 1) {
+          userName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase() + "'s";
         }
       }
     }
     
     const feedUrl = `${baseUrl}/feed/${encodeURIComponent(userId)}.xml`;
-    const ogImage = "https://xpviiukiavtpsnafpdmy.supabase.co/storage/v1/object/public/digests/og-image.png";
+    const ogImage = `${MEDIA_BASE_URL}/static/og-image.png`;
     // Escape user-controlled data for safe HTML embedding
     const safeUserName = escapeHtml(userName);
     const title = `Podgest - ${safeUserName} AI Podcast Digest`;
@@ -5250,25 +5096,27 @@ async function handlePipelineRuns(env: Env, url: URL): Promise<Response> {
   const limit = parseInt(url.searchParams.get("limit") || "10");
   
   try {
-    const response = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/rpc/get_recent_pipeline_runs`,
-      {
-        method: "POST",
-        headers: {
-          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ limit_count: limit }),
-      }
+    // Replaces the old get_recent_pipeline_runs Postgres RPC
+    const runs = await all<{
+      run_id: string;
+      started_at: string;
+      last_event: string;
+      events: number;
+      failed_steps: number;
+    }>(
+      env.DB,
+      `SELECT run_id,
+              MIN(created_at) AS started_at,
+              MAX(created_at) AS last_event,
+              COUNT(*) AS events,
+              SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_steps
+       FROM pipeline_logs
+       WHERE run_id IS NOT NULL
+       GROUP BY run_id
+       ORDER BY started_at DESC
+       LIMIT ?`,
+      limit
     );
-    
-    if (!response.ok) {
-      const err = await response.text();
-      return json({ error: "Failed to fetch pipeline runs", details: err }, 500);
-    }
-    
-    const runs = await response.json();
     return json({ runs });
     
   } catch (error) {
@@ -5278,25 +5126,24 @@ async function handlePipelineRuns(env: Env, url: URL): Promise<Response> {
 
 async function handlePipelineRunLogs(env: Env, runId: string): Promise<Response> {
   try {
-    const response = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/rpc/get_pipeline_run_logs`,
-      {
-        method: "POST",
-        headers: {
-          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ p_run_id: runId }),
-      }
+    // Replaces the old get_pipeline_run_logs Postgres RPC
+    const logRows = await all<{
+      id: number;
+      run_id: string;
+      step: string;
+      status: string;
+      details: string | null;
+      error: string | null;
+      created_at: string;
+    }>(
+      env.DB,
+      `SELECT * FROM pipeline_logs WHERE run_id = ? ORDER BY created_at`,
+      runId
     );
-    
-    if (!response.ok) {
-      const err = await response.text();
-      return json({ error: "Failed to fetch pipeline logs", details: err }, 500);
-    }
-    
-    const logs = await response.json();
+    const logs = logRows.map(row => ({
+      ...row,
+      details: parseJson<Record<string, unknown> | null>(row.details, null),
+    }));
     return json({ run_id: runId, logs });
     
   } catch (error) {
@@ -5311,7 +5158,7 @@ async function handlePipelineRunLogs(env: Env, runId: string): Promise<Response>
 /**
  * Validate an API key by testing it against the provider's API.
  * POST /api/validate-key
- * Body: { key_type: 'openai' | 'anthropic' | 'elevenlabs', key: string }
+ * Body: { key_type: 'openai' | 'anthropic', key: string }
  * 
  * Basic format validation is performed before making external API calls
  * to avoid being used as an oracle for brute-forcing API keys.
@@ -5319,7 +5166,7 @@ async function handlePipelineRunLogs(env: Env, runId: string): Promise<Response>
 async function handleValidateKey(request: Request): Promise<Response> {
   try {
     const body = await request.json() as {
-      key_type: 'openai' | 'anthropic' | 'elevenlabs';
+      key_type: 'openai' | 'anthropic';
       key: string;
     };
     
@@ -5353,10 +5200,6 @@ async function handleValidateKey(request: Request): Promise<Response> {
         result = await validateAnthropicKeyDetailed(key);
         break;
         
-      case 'elevenlabs':
-        result = await validateElevenLabsKeyDetailed(key);
-        break;
-        
       default:
         return json({ valid: false, error: "Invalid key_type" }, 400);
     }
@@ -5376,22 +5219,22 @@ async function handleValidateKey(request: Request): Promise<Response> {
 /**
  * Save an encrypted API key for a user.
  * POST /api/user-keys
- * Body: { user_id: string, key_type: 'openai' | 'anthropic' | 'elevenlabs', encrypted_key: string }
+ * Body: { user_id: string, key_type: 'openai' | 'anthropic', encrypted_key: string }
  * 
  * Note: The frontend should encrypt the key before sending using the same encryption scheme.
  * Alternatively, we can accept the plaintext key and encrypt it here.
  */
 async function handleSaveUserKey(request: Request, env: Env): Promise<Response> {
   try {
-    // Verify JWT token via Supabase Auth
-    const auth = await verifySupabaseJWT(request, env);
+    // Verify Better Auth session
+    const auth = await verifySession(request, env);
     if (!auth) {
       return json({ error: "Unauthorized: invalid or expired token" }, 401);
     }
     const userId = auth.userId;
     
     const body = await request.json() as {
-      key_type: 'openai' | 'anthropic' | 'elevenlabs';
+      key_type: 'openai' | 'anthropic';
       key: string;  // Plaintext key (we'll encrypt it)
     };
     
@@ -5412,9 +5255,6 @@ async function handleSaveUserKey(request: Request, env: Env): Promise<Response> 
       case 'anthropic':
         validationResult = await validateAnthropicKeyDetailed(body.key);
         break;
-      case 'elevenlabs':
-        validationResult = await validateElevenLabsKeyDetailed(body.key);
-        break;
       default:
         return json({ error: `Invalid key_type: ${body.key_type}` }, 400);
     }
@@ -5433,59 +5273,44 @@ async function handleSaveUserKey(request: Request, env: Env): Promise<Response> 
     const columnMap = {
       openai: 'openai_key_encrypted',
       anthropic: 'anthropic_key_encrypted',
-      elevenlabs: 'elevenlabs_key_encrypted',
     };
     
     const validColumnMap = {
       openai: 'openai_valid',
       anthropic: 'anthropic_valid',
-      elevenlabs: 'elevenlabs_valid',
     };
     
     const validatedAtColumnMap = {
       openai: 'openai_validated_at',
       anthropic: 'anthropic_validated_at',
-      elevenlabs: 'elevenlabs_validated_at',
     };
     
+    // Column names come from the fixed maps above (never user input)
     const column = columnMap[body.key_type];
     const validColumn = validColumnMap[body.key_type];
     const validatedAtColumn = validatedAtColumnMap[body.key_type];
     
-    const headers = {
-      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-    };
+    const now = new Date().toISOString();
     
     // Check if user already has a row
-    const existingResponse = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${userId}&select=id`,
-      { headers }
+    const existing = await one<{ id: string }>(
+      env.DB,
+      `SELECT id FROM user_api_keys WHERE user_id = ?`,
+      userId
     );
     
-    const existing = await existingResponse.json() as Array<{ id: string }>;
-    
-    const updateData: Record<string, unknown> = {
-      [column]: encryptedKey,
-      [validColumn]: true,  // Key was validated above
-      [validatedAtColumn]: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-    
-    if (existing.length > 0) {
-      // Update existing row
-      const updateResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/user_api_keys?user_id=eq.${userId}`,
-        {
-          method: "PATCH",
-          headers: { ...headers, "Prefer": "return=representation" },
-          body: JSON.stringify(updateData),
-        }
-      );
-      
-      if (!updateResponse.ok) {
-        const err = await updateResponse.text();
+    if (existing) {
+      // Update existing row (key was validated above, hence valid = 1)
+      try {
+        await run(
+          env.DB,
+          `UPDATE user_api_keys SET ${column} = ?, ${validColumn} = 1, ${validatedAtColumn} = ?, updated_at = ? WHERE user_id = ?`,
+          encryptedKey,
+          now,
+          now,
+          userId
+        );
+      } catch (err) {
         console.error("[SaveUserKey] Update failed:", err);
         return json({ error: "Failed to save key" }, 500);
       }
@@ -5493,22 +5318,18 @@ async function handleSaveUserKey(request: Request, env: Env): Promise<Response> 
       return json({ success: true, action: "updated" });
     } else {
       // Insert new row
-      const insertData = {
-        user_id: userId,
-        ...updateData,
-      };
-      
-      const insertResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/user_api_keys`,
-        {
-          method: "POST",
-          headers: { ...headers, "Prefer": "return=representation" },
-          body: JSON.stringify(insertData),
-        }
-      );
-      
-      if (!insertResponse.ok) {
-        const err = await insertResponse.text();
+      try {
+        await run(
+          env.DB,
+          `INSERT INTO user_api_keys (id, user_id, ${column}, ${validColumn}, ${validatedAtColumn}, updated_at)
+           VALUES (?, ?, ?, 1, ?, ?)`,
+          crypto.randomUUID(),
+          userId,
+          encryptedKey,
+          now,
+          now
+        );
+      } catch (err) {
         console.error("[SaveUserKey] Insert failed:", err);
         return json({ error: "Failed to save key" }, 500);
       }
@@ -5519,6 +5340,277 @@ async function handleSaveUserKey(request: Request, env: Env): Promise<Response> 
   } catch (error) {
     console.error("[SaveUserKey] Error:", error);
     return json({ error: "Failed to save key" }, 500);
+  }
+}
+
+// ============================================
+// USER-FACING DATA HANDLERS (Better Auth session)
+// ============================================
+
+async function handleListSubscriptions(userId: string, env: Env): Promise<Response> {
+  try {
+    const subscriptions = await all<{
+      id: string;
+      podcast_title: string | null;
+      feed_url: string;
+      is_active: number;
+      priority: number;
+      publication_frequency_days: number | null;
+    }>(
+      env.DB,
+      `SELECT id, podcast_title, feed_url, is_active, priority, publication_frequency_days
+       FROM subscriptions WHERE user_id = ? ORDER BY priority DESC, created_at ASC`,
+      userId
+    );
+    return json({
+      subscriptions: subscriptions.map(s => ({ ...s, is_active: !!s.is_active })),
+    });
+  } catch (error) {
+    console.error("[Subscriptions] List failed:", error);
+    return json({ error: "Failed to load subscriptions" }, 500);
+  }
+}
+
+async function handleAddSubscription(userId: string, request: Request, env: Env): Promise<Response> {
+  try {
+    const body = await request.json() as {
+      feed_url?: string;
+      podcast_title?: string;
+      artwork_url?: string;
+      publication_frequency_days?: number | null;
+      priority?: number;
+    };
+
+    if (!body.feed_url) {
+      return json({ error: "feed_url is required" }, 400);
+    }
+
+    const existing = await one<{ id: string }>(
+      env.DB,
+      `SELECT id FROM subscriptions WHERE user_id = ? AND feed_url = ?`,
+      userId,
+      body.feed_url
+    );
+    if (existing) {
+      return json({ error: "Already subscribed to this podcast", code: "duplicate" }, 409);
+    }
+
+    const id = crypto.randomUUID();
+    await run(
+      env.DB,
+      `INSERT INTO subscriptions (id, user_id, feed_url, podcast_title, artwork_url, publication_frequency_days, is_active, priority)
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+      id,
+      userId,
+      body.feed_url,
+      body.podcast_title ?? null,
+      body.artwork_url ?? null,
+      body.publication_frequency_days ?? null,
+      body.priority ?? 1
+    );
+
+    return json({ success: true, id });
+  } catch (error) {
+    console.error("[Subscriptions] Add failed:", error);
+    return json({ error: "Failed to add subscription" }, 500);
+  }
+}
+
+async function handleUpdateSubscription(userId: string, subscriptionId: string, request: Request, env: Env): Promise<Response> {
+  try {
+    const body = await request.json() as { is_active?: boolean; priority?: number };
+
+    if (body.is_active === undefined && body.priority === undefined) {
+      return json({ error: "Nothing to update" }, 400);
+    }
+
+    const sets: string[] = [];
+    const binds: unknown[] = [];
+    if (body.is_active !== undefined) {
+      sets.push("is_active = ?");
+      binds.push(body.is_active ? 1 : 0);
+    }
+    if (body.priority !== undefined) {
+      sets.push("priority = ?");
+      binds.push(body.priority);
+    }
+
+    const result = await run(
+      env.DB,
+      `UPDATE subscriptions SET ${sets.join(", ")} WHERE id = ? AND user_id = ?`,
+      ...binds,
+      subscriptionId,
+      userId
+    );
+    if (!result.meta.changes) {
+      return json({ error: "Subscription not found" }, 404);
+    }
+    return json({ success: true });
+  } catch (error) {
+    console.error("[Subscriptions] Update failed:", error);
+    return json({ error: "Failed to update subscription" }, 500);
+  }
+}
+
+async function handleDeleteSubscription(userId: string, subscriptionId: string, env: Env): Promise<Response> {
+  try {
+    const result = await run(
+      env.DB,
+      `DELETE FROM subscriptions WHERE id = ? AND user_id = ?`,
+      subscriptionId,
+      userId
+    );
+    if (!result.meta.changes) {
+      return json({ error: "Subscription not found" }, 404);
+    }
+    return json({ success: true });
+  } catch (error) {
+    console.error("[Subscriptions] Delete failed:", error);
+    return json({ error: "Failed to delete subscription" }, 500);
+  }
+}
+
+async function handleGetProfile(userId: string, env: Env): Promise<Response> {
+  try {
+    const profile = await one<{
+      id: string;
+      email: string;
+      display_name: string | null;
+      timezone: string;
+      digest_time: string;
+      digest_length_minutes: number;
+      dark_mode: number;
+    }>(
+      env.DB,
+      `SELECT id, email, display_name, timezone, digest_time, digest_length_minutes, dark_mode
+       FROM profiles WHERE id = ?`,
+      userId
+    );
+    if (!profile) {
+      return json({ error: "Profile not found" }, 404);
+    }
+    return json({ profile: { ...profile, dark_mode: !!profile.dark_mode } });
+  } catch (error) {
+    console.error("[Profile] Get failed:", error);
+    return json({ error: "Failed to load profile" }, 500);
+  }
+}
+
+async function handleUpdateOwnProfile(userId: string, request: Request, env: Env): Promise<Response> {
+  try {
+    const body = await request.json() as {
+      digest_length_minutes?: number;
+      timezone?: string;
+      digest_time?: string;
+      dark_mode?: boolean;
+    };
+
+    const sets: string[] = [];
+    const binds: unknown[] = [];
+    if (body.digest_length_minutes !== undefined) {
+      const minutes = Number(body.digest_length_minutes);
+      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 60) {
+        return json({ error: "Invalid digest_length_minutes" }, 400);
+      }
+      sets.push("digest_length_minutes = ?");
+      binds.push(minutes);
+    }
+    if (body.timezone !== undefined) {
+      sets.push("timezone = ?");
+      binds.push(body.timezone);
+    }
+    if (body.digest_time !== undefined) {
+      if (!/^\d{2}:\d{2}(:\d{2})?$/.test(body.digest_time)) {
+        return json({ error: "Invalid digest_time" }, 400);
+      }
+      sets.push("digest_time = ?");
+      binds.push(body.digest_time.length === 5 ? `${body.digest_time}:00` : body.digest_time);
+    }
+    if (body.dark_mode !== undefined) {
+      sets.push("dark_mode = ?");
+      binds.push(body.dark_mode ? 1 : 0);
+    }
+
+    if (sets.length === 0) {
+      return json({ error: "Nothing to update" }, 400);
+    }
+
+    const result = await run(
+      env.DB,
+      `UPDATE profiles SET ${sets.join(", ")} WHERE id = ?`,
+      ...binds,
+      userId
+    );
+    if (!result.meta.changes) {
+      return json({ error: "Profile not found" }, 404);
+    }
+    return json({ success: true });
+  } catch (error) {
+    console.error("[Profile] Update failed:", error);
+    return json({ error: "Failed to update profile" }, 500);
+  }
+}
+
+async function handleUserKeyStatus(userId: string, env: Env): Promise<Response> {
+  try {
+    const row = await one<{
+      openai_key_encrypted: string | null;
+      openai_valid: number | null;
+      anthropic_key_encrypted: string | null;
+      anthropic_valid: number | null;
+    }>(
+      env.DB,
+      `SELECT openai_key_encrypted, openai_valid, anthropic_key_encrypted, anthropic_valid
+       FROM user_api_keys WHERE user_id = ?`,
+      userId
+    );
+    return json({
+      openai: {
+        configured: !!row?.openai_key_encrypted,
+        valid: row?.openai_valid === null || row?.openai_valid === undefined ? null : !!row.openai_valid,
+      },
+      anthropic: {
+        configured: !!row?.anthropic_key_encrypted,
+        valid: row?.anthropic_valid === null || row?.anthropic_valid === undefined ? null : !!row.anthropic_valid,
+      },
+    });
+  } catch (error) {
+    console.error("[UserKeys] Status failed:", error);
+    return json({ error: "Failed to load key status" }, 500);
+  }
+}
+
+async function handleInProgressDigest(userId: string, env: Env): Promise<Response> {
+  try {
+    const digest = await one<{ id: string; status: string; error_message: string | null }>(
+      env.DB,
+      `SELECT id, status, error_message FROM digests
+       WHERE user_id = ? AND status IN ('pending', 'processing', 'transcribing', 'generating_script', 'generating_audio')
+       ORDER BY created_at DESC LIMIT 1`,
+      userId
+    );
+    return json({ digest });
+  } catch (error) {
+    console.error("[Digests] In-progress lookup failed:", error);
+    return json({ error: "Failed to check digest status" }, 500);
+  }
+}
+
+async function handleDigestStatus(userId: string, digestId: string, env: Env): Promise<Response> {
+  try {
+    const digest = await one<{ id: string; status: string; error_message: string | null }>(
+      env.DB,
+      `SELECT id, status, error_message FROM digests WHERE id = ? AND user_id = ?`,
+      digestId,
+      userId
+    );
+    if (!digest) {
+      return json({ error: "Digest not found" }, 404);
+    }
+    return json({ digest });
+  } catch (error) {
+    console.error("[Digests] Status lookup failed:", error);
+    return json({ error: "Failed to load digest status" }, 500);
   }
 }
 
@@ -5585,7 +5677,7 @@ async function handleParseFeed(request: Request, env: Env): Promise<Response> {
           try {
             const originalFeed = await parseRSSFeed(originalRssUrl);
             originalFrequency = calculateFrequencyFromRSS(originalFeed.episodes);
-            artworkUrl = originalFeed.artwork_url;
+            artworkUrl = originalFeed.artwork_url ?? undefined;
           } catch (e) {
             console.warn(`[ParseFeed] Could not parse original feed for ${podcastName}`);
           }

@@ -10,17 +10,24 @@
  * - compare_takes: Compare perspectives across podcasts on a topic
  * - list_podcasts: List subscribed podcasts
  * - recent_episodes: Get recent episodes
+ * - save_memory / recall / list_memories / forget: Personal memory layer
+ *
+ * Data layer: Cloudflare D1 (relational), Vectorize (embeddings), R2 (transcripts).
+ * Auth still delegates to Supabase — TODO(Phase 5): Better Auth.
  */
 
 import { OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
-import { searchTranscripts, getUserOpenAIKey, type TranscriptSearchResult } from "./pgvector";
+import { searchTranscripts, getUserOpenAIKey, type TranscriptSearchResult } from "./vectorsearch";
+import { generateEmbedding } from "./embeddings";
+import { one, all, run, parseJson, placeholders } from "./db";
 
 // Env interface with OAuth Provider bindings
 export interface Env {
-  SUPABASE_URL: string;
-  SUPABASE_SERVICE_ROLE_KEY: string;
-  SUPABASE_ANON_KEY: string;
   USER_ENCRYPTION_KEY: string;  // For decrypting user API keys
+  // Cloudflare-native data layer
+  DB: D1Database;
+  VECTORIZE: VectorizeIndex;
+  TRANSCRIPTS: R2Bucket;  // private bucket for transcript JSON (`<episode_id>/transcript.json`)
   OAUTH_KV: KVNamespace;
   OAUTH_PROVIDER: OAuthHelpers;
 }
@@ -221,6 +228,108 @@ const TOOLS: MCPTool[] = [
       required: ["episode_id"],
     },
   },
+  {
+    name: "get_transcript",
+    description: "Get the full transcript text for a specific podcast episode. Returns the complete transcript content directly.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        episode_id: {
+          type: "string",
+          description: "The episode UUID",
+        },
+      },
+      required: ["episode_id"],
+    },
+  },
+  {
+    name: "get_digest_transcript",
+    description: "Get the script/transcript of a Podgest daily digest episode. If no date is specified, returns the latest digest.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        date: {
+          type: "string",
+          description: "Date in YYYY-MM-DD format (optional, defaults to latest digest)",
+        },
+      },
+    },
+  },
+  {
+    name: "save_memory",
+    description: "Save a memory (note, fact, or insight) for later semantic recall. Memories are organized into freeform namespaces (suggested: 'podcasts', 'trading'; default: 'general'). Returns the new memory's id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        content: {
+          type: "string",
+          description: "The text content to remember",
+        },
+        namespace: {
+          type: "string",
+          description: "Freeform namespace to file the memory under (e.g. 'podcasts', 'trading'; default: 'general')",
+        },
+        metadata: {
+          type: "object",
+          description: "Optional arbitrary JSON metadata to store alongside the memory",
+        },
+      },
+      required: ["content"],
+    },
+  },
+  {
+    name: "recall",
+    description: "Semantically search saved memories and return the most relevant ones with similarity scores. Optionally restrict to a namespace (e.g. 'podcasts', 'trading').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Natural language query describing what to recall",
+        },
+        namespace: {
+          type: "string",
+          description: "Only recall memories from this namespace (e.g. 'podcasts', 'trading'; optional)",
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of memories to return (default: 5, max: 20)",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "list_memories",
+    description: "List saved memories, most recent first. Optionally filter by namespace (e.g. 'podcasts', 'trading').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        namespace: {
+          type: "string",
+          description: "Only list memories from this namespace (e.g. 'podcasts', 'trading'; optional)",
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of memories to return (default: 20, max: 100)",
+        },
+      },
+    },
+  },
+  {
+    name: "forget",
+    description: "Permanently delete a saved memory by id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        memory_id: {
+          type: "string",
+          description: "The id of the memory to delete (as returned by save_memory or recall/list_memories)",
+        },
+      },
+      required: ["memory_id"],
+    },
+  },
 ];
 
 // ============================================
@@ -235,12 +344,7 @@ async function searchPodcasts(
   env: Env
 ): Promise<{ results: Array<{ episode_id: string; podcast_name: string; title: string; excerpt: string; published_at: string }> } | { error: string }> {
   // Get user's OpenAI key for generating embeddings
-  const openaiKey = await getUserOpenAIKey(
-    env.SUPABASE_URL,
-    env.SUPABASE_SERVICE_ROLE_KEY,
-    userId,
-    env.USER_ENCRYPTION_KEY
-  );
+  const openaiKey = await getUserOpenAIKey(env.DB, userId, env.USER_ENCRYPTION_KEY);
 
   if (!openaiKey) {
     return { 
@@ -249,18 +353,18 @@ async function searchPodcasts(
   }
 
   try {
-    // Search using pgvector
+    // Search using Vectorize
     const results = await searchTranscripts(
       query,
       userId,
       openaiKey,
-      env.SUPABASE_URL,
-      env.SUPABASE_SERVICE_ROLE_KEY,
+      env.VECTORIZE,
+      env.DB,
       { limit: Math.min(limit, 20) }
     );
 
     if (daysBack) {
-      // Log for debugging - date filtering could be added to the RPC in future
+      // Log for debugging - date filtering could be added to the Vectorize filter in future
       const cutoffDate = new Date();
       cutoffDate.setDate(cutoffDate.getDate() - daysBack);
       console.log(`[searchPodcasts] Date filter requested: >= ${cutoffDate.toISOString()}`);
@@ -271,20 +375,12 @@ async function searchPodcasts(
     let episodeDates: Map<string, string> = new Map();
 
     if (episodeIds.length > 0) {
-      const episodesResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/episodes?id=in.(${episodeIds.join(",")})&select=id,published_at`,
-        {
-          headers: {
-            "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-            "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-          },
-        }
+      const episodes = await all<{ id: string; published_at: string }>(
+        env.DB,
+        `SELECT id, published_at FROM episodes WHERE id IN (${placeholders(episodeIds.length)})`,
+        ...episodeIds
       );
-
-      if (episodesResponse.ok) {
-        const episodes = await episodesResponse.json() as Array<{ id: string; published_at: string }>;
-        episodeDates = new Map(episodes.map(e => [e.id, e.published_at]));
-      }
+      episodeDates = new Map(episodes.map(e => [e.id, e.published_at]));
     }
 
     return {
@@ -323,107 +419,75 @@ async function getEpisode(
   published_at: string;
   summary?: string;
   topics?: string[];
-  transcript_url?: string;
+  transcript_excerpt?: string;
+  has_full_transcript?: boolean;
   listen_links?: ListenLinks;
 } | { error: string }> {
   // Fetch episode with description and audio_url
-  const episodeResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episodeId}&select=id,title,published_at,feed_url,description,audio_url`,
-    {
-      headers: {
-        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
-  );
-
-  const episodes = await episodeResponse.json() as Array<{
+  const episode = await one<{
     id: string;
     title: string;
     published_at: string;
     feed_url: string;
-    description?: string;
+    description: string | null;
     audio_url: string;
-  }>;
+  }>(
+    env.DB,
+    `SELECT id, title, published_at, feed_url, description, audio_url FROM episodes WHERE id = ?`,
+    episodeId
+  );
 
-  if (!episodes.length) {
+  if (!episode) {
     return { error: "Episode not found" };
   }
-
-  const episode = episodes[0];
   
   // Verify user has a subscription for this episode's feed
-  const subResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&feed_url=eq.${encodeURIComponent(episode.feed_url)}&select=podcast_title`,
-    {
-      headers: {
-        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
+  const sub = await one<{ podcast_title: string | null }>(
+    env.DB,
+    `SELECT podcast_title FROM subscriptions WHERE user_id = ? AND feed_url = ?`,
+    userId,
+    episode.feed_url
   );
   
-  const subs = await subResponse.json() as Array<{ podcast_title: string }>;
-  
-  if (!subs.length) {
+  if (!sub) {
     return { error: "Episode not found" };
   }
   
   // Extract original podcast name from description (for ListenNotes aggregated feeds)
   const originalName = extractOriginalPodcastName(episode.description || "");
-  const podcastTitle = originalName || subs[0].podcast_title;
+  const podcastTitle = originalName || sub.podcast_title || "Unknown";
 
   // Get transcription
-  const transcriptionResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=eq.${episodeId}&select=transcript_storage_path`,
-    {
-      headers: {
-        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
+  const transcription = await one<{ transcript_storage_path: string | null }>(
+    env.DB,
+    `SELECT transcript_storage_path FROM transcriptions WHERE episode_id = ?`,
+    episodeId
   );
-
-  const transcriptions = await transcriptionResponse.json() as Array<{ transcript_storage_path?: string }>;
   
-  // Get topic extraction
+  // Get topic extraction (topics is a TEXT JSON column; D1 schema has no summary column)
   let summary: string | undefined;
   let topics: string[] | undefined;
   
-  const topicsResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/topic_extractions?transcription_id=eq.${episodeId}&select=topics,summary`,
-    {
-      headers: {
-        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
+  const topicRow = await one<{ topics: string | null }>(
+    env.DB,
+    `SELECT te.topics FROM topic_extractions te
+     JOIN transcriptions t ON t.id = te.transcription_id
+     WHERE t.episode_id = ?`,
+    episodeId
   );
-
-  const topicData = await topicsResponse.json() as Array<{ topics?: string[]; summary?: string }>;
-  if (topicData.length) {
-    summary = topicData[0].summary;
-    topics = topicData[0].topics;
+  if (topicRow) {
+    topics = parseJson<string[] | undefined>(topicRow.topics, undefined);
   }
 
-  // Generate signed URL for transcript if available
-  let transcriptUrl: string | undefined;
-  if (transcriptions.length && transcriptions[0].transcript_storage_path) {
-    const signResponse = await fetch(
-      `${env.SUPABASE_URL}/storage/v1/object/sign/transcripts/${transcriptions[0].transcript_storage_path}`,
-      {
-        method: "POST",
-        headers: {
-          "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-          "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ expiresIn: 3600 }),
+  // Fetch transcript content directly from R2
+  let transcriptExcerpt: string | undefined;
+  if (transcription?.transcript_storage_path) {
+    const transcriptObject = await env.TRANSCRIPTS.get(`${episodeId}/transcript.json`);
+    if (transcriptObject) {
+      const transcriptData = await transcriptObject.json() as { text?: string };
+      if (transcriptData.text) {
+        transcriptExcerpt = transcriptData.text.substring(0, 5000);
       }
-    );
-    const signData = await signResponse.json() as { signedURL?: string };
-    if (signData.signedURL) {
-      transcriptUrl = `${env.SUPABASE_URL}/storage/v1${signData.signedURL}`;
     }
   }
 
@@ -434,7 +498,8 @@ async function getEpisode(
     published_at: episode.published_at,
     summary,
     topics,
-    transcript_url: transcriptUrl,
+    transcript_excerpt: transcriptExcerpt,
+    has_full_transcript: !!transcriptExcerpt,
   };
 }
 
@@ -445,12 +510,7 @@ async function compareTakes(
   env: Env
 ): Promise<{ perspectives: Array<{ podcast_name: string; episode_title: string; take: string; published_at: string }> } | { error: string }> {
   // Get user's OpenAI key for generating embeddings
-  const openaiKey = await getUserOpenAIKey(
-    env.SUPABASE_URL,
-    env.SUPABASE_SERVICE_ROLE_KEY,
-    userId,
-    env.USER_ENCRYPTION_KEY
-  );
+  const openaiKey = await getUserOpenAIKey(env.DB, userId, env.USER_ENCRYPTION_KEY);
 
   if (!openaiKey) {
     return { 
@@ -464,13 +524,13 @@ async function compareTakes(
     cutoffDate.setDate(cutoffDate.getDate() - daysBack);
     console.log(`[compareTakes] Date filter requested: >= ${cutoffDate.toISOString()}`);
 
-    // Search using pgvector
+    // Search using Vectorize
     const results = await searchTranscripts(
       topic,
       userId,
       openaiKey,
-      env.SUPABASE_URL,
-      env.SUPABASE_SERVICE_ROLE_KEY,
+      env.VECTORIZE,
+      env.DB,
       { limit: 15 }  // Get more results to find diverse perspectives
     );
 
@@ -479,20 +539,12 @@ async function compareTakes(
     let episodeDates: Map<string, string> = new Map();
 
     if (episodeIds.length > 0) {
-      const episodesResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/episodes?id=in.(${episodeIds.join(",")})&select=id,published_at`,
-        {
-          headers: {
-            "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-            "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-          },
-        }
+      const episodes = await all<{ id: string; published_at: string }>(
+        env.DB,
+        `SELECT id, published_at FROM episodes WHERE id IN (${placeholders(episodeIds.length)})`,
+        ...episodeIds
       );
-
-      if (episodesResponse.ok) {
-        const episodes = await episodesResponse.json() as Array<{ id: string; published_at: string }>;
-        episodeDates = new Map(episodes.map(e => [e.id, e.published_at]));
-      }
+      episodeDates = new Map(episodes.map(e => [e.id, e.published_at]));
     }
 
     // Group by podcast and take best result from each
@@ -533,53 +585,24 @@ async function listPodcasts(
 ): Promise<{ podcasts: Array<{ id: string; name: string; feed_url: string; episode_count: number }> }> {
   console.log(`[listPodcasts] Fetching for user: ${userId}`);
   
-  const response = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&select=id,podcast_title,feed_url`,
-    {
-      headers: {
-        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
+  // Episodes link by feed_url, so count them in a single joined query
+  const rows = await all<{ id: string; podcast_title: string | null; feed_url: string; episode_count: number }>(
+    env.DB,
+    `SELECT s.id, s.podcast_title, s.feed_url,
+            (SELECT COUNT(*) FROM episodes e WHERE e.feed_url = s.feed_url) AS episode_count
+     FROM subscriptions s
+     WHERE s.user_id = ?`,
+    userId
   );
 
-  if (!response.ok) {
-    console.error(`[listPodcasts] Supabase error: ${response.status} ${await response.text()}`);
-    return { podcasts: [] };
-  }
-
-  const subscriptions = await response.json();
-  console.log(`[listPodcasts] Got subscriptions:`, JSON.stringify(subscriptions));
-  
-  if (!Array.isArray(subscriptions)) {
-    console.error(`[listPodcasts] Expected array, got:`, typeof subscriptions);
-    return { podcasts: [] };
-  }
-
-  // Get episode counts for each subscription (episodes link by feed_url)
-  const podcastsWithCounts = await Promise.all(
-    subscriptions.map(async (sub: { id: string; podcast_title: string; feed_url: string }) => {
-      const countResponse = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/episodes?feed_url=eq.${encodeURIComponent(sub.feed_url)}&select=id`,
-        {
-          headers: {
-            "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-            "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-            "Prefer": "count=exact",
-          },
-        }
-      );
-      const count = parseInt(countResponse.headers.get("content-range")?.split("/")[1] || "0");
-      return { 
-        id: sub.id, 
-        name: sub.podcast_title, 
-        feed_url: sub.feed_url, 
-        episode_count: count 
-      };
-    })
-  );
-
-  return { podcasts: podcastsWithCounts };
+  return {
+    podcasts: rows.map(r => ({
+      id: r.id,
+      name: r.podcast_title || "Unknown",
+      feed_url: r.feed_url,
+      episode_count: r.episode_count,
+    })),
+  };
 }
 
 async function recentEpisodes(
@@ -594,31 +617,14 @@ async function recentEpisodes(
   cutoffDate.setDate(cutoffDate.getDate() - daysBack);
 
   // Get user's subscriptions with feed_url
-  const subsResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&select=feed_url,podcast_title`,
-    {
-      headers: {
-        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
+  const subscriptions = await all<{ feed_url: string; podcast_title: string | null }>(
+    env.DB,
+    `SELECT feed_url, podcast_title FROM subscriptions WHERE user_id = ?`,
+    userId
   );
-
-  if (!subsResponse.ok) {
-    console.error(`[recentEpisodes] Supabase error: ${subsResponse.status} ${await subsResponse.text()}`);
-    return { episodes: [] };
-  }
-
-  const subscriptions = await subsResponse.json();
-  console.log(`[recentEpisodes] Got subscriptions:`, JSON.stringify(subscriptions));
   
-  if (!Array.isArray(subscriptions)) {
-    console.error(`[recentEpisodes] Expected array, got:`, typeof subscriptions);
-    return { episodes: [] };
-  }
-  
-  const feedUrls = subscriptions.map((s: { feed_url: string }) => s.feed_url);
-  const feedNameMap = new Map(subscriptions.map((s: { feed_url: string; podcast_title: string }) => [s.feed_url, s.podcast_title]));
+  const feedUrls = subscriptions.map(s => s.feed_url);
+  const feedNameMap = new Map(subscriptions.map(s => [s.feed_url, s.podcast_title]));
 
   if (feedUrls.length === 0) {
     return { episodes: [] };
@@ -626,54 +632,34 @@ async function recentEpisodes(
 
   // Episodes link by feed_url, not subscription_id
   // Also fetch description to extract original podcast name
-  const episodesResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/episodes?feed_url=in.(${feedUrls.map(u => encodeURIComponent(u)).join(",")})&published_at=gte.${cutoffDate.toISOString()}&order=published_at.desc&limit=${Math.min(limit, 50)}&select=id,title,published_at,feed_url,description`,
-    {
-      headers: {
-        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
+  const episodes = await all<{ id: string; title: string; published_at: string; feed_url: string; description: string | null }>(
+    env.DB,
+    `SELECT id, title, published_at, feed_url, description
+     FROM episodes
+     WHERE feed_url IN (${placeholders(feedUrls.length)})
+       AND published_at >= ?
+     ORDER BY published_at DESC
+     LIMIT ?`,
+    ...feedUrls,
+    cutoffDate.toISOString(),
+    Math.min(limit, 50)
   );
-
-  if (!episodesResponse.ok) {
-    console.error(`[recentEpisodes] Episodes query failed: ${episodesResponse.status} ${await episodesResponse.text()}`);
-    return { episodes: [] };
-  }
-
-  const episodes = await episodesResponse.json();
-  console.log(`[recentEpisodes] Got episodes:`, JSON.stringify(episodes).substring(0, 200));
-  
-  if (!Array.isArray(episodes)) {
-    console.error(`[recentEpisodes] Expected array, got:`, typeof episodes);
-    return { episodes: [] };
-  }
 
   if (episodes.length === 0) {
     return { episodes: [] };
   }
 
   // Check which episodes have transcripts
-  const episodeIds = episodes.map((e: { id: string }) => e.id);
-  const transcriptsResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/transcriptions?episode_id=in.(${episodeIds.join(",")})&select=episode_id`,
-    {
-      headers: {
-        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
+  const episodeIds = episodes.map(e => e.id);
+  const transcripts = await all<{ episode_id: string }>(
+    env.DB,
+    `SELECT episode_id FROM transcriptions WHERE episode_id IN (${placeholders(episodeIds.length)})`,
+    ...episodeIds
   );
-
-  const transcripts = await transcriptsResponse.json();
-  const hasTranscript = new Set(
-    Array.isArray(transcripts) 
-      ? transcripts.map((t: { episode_id: string }) => t.episode_id)
-      : []
-  );
+  const hasTranscript = new Set(transcripts.map(t => t.episode_id));
 
   return {
-    episodes: episodes.map((e: { id: string; feed_url: string; title: string; published_at: string; description?: string }) => {
+    episodes: episodes.map((e) => {
       // Extract original podcast name from description (for ListenNotes aggregated feeds)
       const originalName = extractOriginalPodcastName(e.description || "");
       return {
@@ -684,6 +670,92 @@ async function recentEpisodes(
         has_transcript: hasTranscript.has(e.id),
       };
     }),
+  };
+}
+
+async function getDigestTranscript(
+  userId: string,
+  env: Env,
+  date?: string
+): Promise<{ digest_id: string; title: string; date: string; transcript: string } | { error: string }> {
+  const digest = date
+    ? await one<{ id: string; digest_date: string; script_text: string | null; topic_clusters: string | null }>(
+        env.DB,
+        `SELECT id, digest_date, script_text, topic_clusters FROM digests
+         WHERE user_id = ? AND digest_date = ? AND status = 'completed' LIMIT 1`,
+        userId,
+        date
+      )
+    : await one<{ id: string; digest_date: string; script_text: string | null; topic_clusters: string | null }>(
+        env.DB,
+        `SELECT id, digest_date, script_text, topic_clusters FROM digests
+         WHERE user_id = ? AND status = 'completed' ORDER BY created_at DESC LIMIT 1`,
+        userId
+      );
+
+  if (!digest) {
+    return { error: date ? `No completed digest found for ${date}` : "No completed digests found" };
+  }
+
+  if (!digest.script_text) {
+    return { error: "Digest exists but script text is not available" };
+  }
+
+  const topicClusters = parseJson<{ title?: string; topics?: string[] } | null>(digest.topic_clusters, null);
+
+  return {
+    digest_id: digest.id,
+    title: topicClusters?.title || `Podgest - ${digest.digest_date}`,
+    date: digest.digest_date,
+    transcript: digest.script_text,
+  };
+}
+
+async function getTranscript(
+  episodeId: string,
+  userId: string,
+  env: Env
+): Promise<{ episode_id: string; title: string; podcast_name: string; transcript: string } | { error: string }> {
+  // Verify episode belongs to user's subscriptions
+  const episode = await one<{ id: string; title: string; feed_url: string }>(
+    env.DB,
+    `SELECT id, title, feed_url FROM episodes WHERE id = ?`,
+    episodeId
+  );
+  if (!episode) {
+    return { error: "Episode not found" };
+  }
+
+  // Get podcast name from subscription
+  const sub = await one<{ podcast_title: string | null }>(
+    env.DB,
+    `SELECT podcast_title FROM subscriptions WHERE user_id = ? AND feed_url = ?`,
+    userId,
+    episode.feed_url
+  );
+  const podcastName = sub?.podcast_title || "Unknown Podcast";
+
+  // Fetch transcript content directly from R2
+  const transcriptObject = await env.TRANSCRIPTS.get(`${episodeId}/transcript.json`);
+
+  if (!transcriptObject) {
+    return { error: "Transcript not available for this episode" };
+  }
+
+  const transcriptData = await transcriptObject.json() as { text?: string; segments?: Array<{ text: string }> };
+  const transcriptText = transcriptData.text
+    || transcriptData.segments?.map(s => s.text).join(" ")
+    || "";
+
+  if (!transcriptText) {
+    return { error: "Transcript is empty" };
+  }
+
+  return {
+    episode_id: episodeId,
+    title: episode.title,
+    podcast_name: podcastName,
+    transcript: transcriptText,
   };
 }
 
@@ -698,57 +770,44 @@ async function listenToEpisode(
   links: ListenLinks;
 } | { error: string }> {
   // Fetch episode with audio_url and description
-  const episodeResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/episodes?id=eq.${episodeId}&select=id,title,feed_url,audio_url,description`,
-    {
-      headers: {
-        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
-  );
-
-  const episodes = await episodeResponse.json() as Array<{
+  const episode = await one<{
     id: string;
     title: string;
     feed_url: string;
     audio_url: string;
-    description?: string;
-  }>;
+    description: string | null;
+  }>(
+    env.DB,
+    `SELECT id, title, feed_url, audio_url, description FROM episodes WHERE id = ?`,
+    episodeId
+  );
 
-  if (!episodes.length) {
+  if (!episode) {
     return { error: "Episode not found" };
   }
 
-  const episode = episodes[0];
-
   // Verify user has access to this episode's feed
-  const subResponse = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&feed_url=eq.${encodeURIComponent(episode.feed_url)}&select=podcast_title`,
-    {
-      headers: {
-        "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
+  const sub = await one<{ podcast_title: string | null }>(
+    env.DB,
+    `SELECT podcast_title FROM subscriptions WHERE user_id = ? AND feed_url = ?`,
+    userId,
+    episode.feed_url
   );
 
-  const subs = await subResponse.json() as Array<{ podcast_title: string }>;
-
-  if (!subs.length) {
+  if (!sub) {
     return { error: "Episode not found" };
   }
 
   // Extract original podcast name from description
   const originalName = extractOriginalPodcastName(episode.description || "");
-  const podcastName = originalName || subs[0].podcast_title;
+  const podcastName = originalName || sub.podcast_title || "Unknown";
 
   // Build all listen links (Spotify, Apple, direct audio)
   const links = buildListenLinks(
     episode.audio_url,
     podcastName,
     episode.title,
-    episode.description
+    episode.description ?? undefined
   );
 
   return {
@@ -757,6 +816,202 @@ async function listenToEpisode(
     title: episode.title,
     links,
   };
+}
+
+// ============================================
+// MEMORY TOOLS
+// ============================================
+
+async function saveMemory(
+  content: string,
+  namespace: string | undefined,
+  metadata: Record<string, unknown> | undefined,
+  userId: string,
+  env: Env
+): Promise<{ memory_id: string; namespace: string } | { error: string }> {
+  if (!content || content.trim().length === 0) {
+    return { error: "Memory content cannot be empty" };
+  }
+
+  const openaiKey = await getUserOpenAIKey(env.DB, userId, env.USER_ENCRYPTION_KEY);
+  if (!openaiKey) {
+    return {
+      error: "Saving memories requires an OpenAI API key. Please add your OpenAI API key in the Podgest settings at https://podgest.app/settings"
+    };
+  }
+
+  const ns = namespace?.trim() || "general";
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  try {
+    const values = await generateEmbedding(content, openaiKey);
+
+    await run(
+      env.DB,
+      `INSERT INTO memories (id, user_id, namespace, content, metadata, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      id,
+      userId,
+      ns,
+      content,
+      metadata ? JSON.stringify(metadata) : null,
+      now,
+      now
+    );
+
+    await env.VECTORIZE.upsert([{
+      id,
+      values,
+      metadata: {
+        type: "memory",
+        user_id: userId,
+        namespace: ns,
+        created_at: now.slice(0, 10), // YYYY-MM-DD
+      },
+    }]);
+
+    return { memory_id: id, namespace: ns };
+  } catch (error) {
+    console.error("[saveMemory] Error:", error);
+    if (error instanceof Error) {
+      if (error.message.includes("Invalid OpenAI API key")) {
+        return { error: "Your OpenAI API key is invalid. Please update it in Podgest settings." };
+      }
+      return { error: `Failed to save memory: ${error.message}` };
+    }
+    return { error: "Failed to save memory. Please try again." };
+  }
+}
+
+async function recallMemories(
+  query: string,
+  namespace: string | undefined,
+  limit: number = 5,
+  userId: string,
+  env: Env
+): Promise<{ memories: Array<{ memory_id: string; namespace: string; content: string; metadata: Record<string, unknown> | null; created_at: string; score: number }> } | { error: string }> {
+  const openaiKey = await getUserOpenAIKey(env.DB, userId, env.USER_ENCRYPTION_KEY);
+  if (!openaiKey) {
+    return {
+      error: "Recalling memories requires an OpenAI API key. Please add your OpenAI API key in the Podgest settings at https://podgest.app/settings"
+    };
+  }
+
+  try {
+    const queryEmbedding = await generateEmbedding(query, openaiKey);
+
+    const filter: Record<string, unknown> = {
+      type: "memory",
+      user_id: userId,
+      ...(namespace ? { namespace } : {}),
+    };
+
+    const matches = await env.VECTORIZE.query(queryEmbedding, {
+      topK: Math.min(Math.max(limit, 1), 20),
+      returnMetadata: "all",
+      filter: filter as VectorizeVectorMetadataFilter,
+    });
+
+    if (!matches.matches.length) {
+      return { memories: [] };
+    }
+
+    // Hydrate content/metadata from D1 (user_id check re-scopes for safety)
+    const ids = matches.matches.map((m) => m.id);
+    const rows = await all<{ id: string; namespace: string; content: string; metadata: string | null; created_at: string }>(
+      env.DB,
+      `SELECT id, namespace, content, metadata, created_at FROM memories
+       WHERE user_id = ? AND id IN (${placeholders(ids.length)})`,
+      userId,
+      ...ids
+    );
+    const rowById = new Map(rows.map((r) => [r.id, r]));
+
+    const memories = [];
+    for (const match of matches.matches) {
+      const row = rowById.get(match.id);
+      if (!row) continue;
+      memories.push({
+        memory_id: row.id,
+        namespace: row.namespace,
+        content: row.content,
+        metadata: parseJson<Record<string, unknown> | null>(row.metadata, null),
+        created_at: row.created_at,
+        score: match.score,
+      });
+    }
+
+    return { memories };
+  } catch (error) {
+    console.error("[recallMemories] Error:", error);
+    if (error instanceof Error) {
+      if (error.message.includes("Invalid OpenAI API key")) {
+        return { error: "Your OpenAI API key is invalid. Please update it in Podgest settings." };
+      }
+      return { error: `Recall failed: ${error.message}` };
+    }
+    return { error: "Recall failed. Please try again." };
+  }
+}
+
+async function listMemories(
+  namespace: string | undefined,
+  limit: number = 20,
+  userId: string,
+  env: Env
+): Promise<{ memories: Array<{ memory_id: string; namespace: string; content: string; metadata: Record<string, unknown> | null; created_at: string }> }> {
+  const cappedLimit = Math.min(Math.max(limit, 1), 100);
+
+  const rows = namespace
+    ? await all<{ id: string; namespace: string; content: string; metadata: string | null; created_at: string }>(
+        env.DB,
+        `SELECT id, namespace, content, metadata, created_at FROM memories
+         WHERE user_id = ? AND namespace = ? ORDER BY created_at DESC LIMIT ?`,
+        userId,
+        namespace,
+        cappedLimit
+      )
+    : await all<{ id: string; namespace: string; content: string; metadata: string | null; created_at: string }>(
+        env.DB,
+        `SELECT id, namespace, content, metadata, created_at FROM memories
+         WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`,
+        userId,
+        cappedLimit
+      );
+
+  return {
+    memories: rows.map((r) => ({
+      memory_id: r.id,
+      namespace: r.namespace,
+      content: r.content,
+      metadata: parseJson<Record<string, unknown> | null>(r.metadata, null),
+      created_at: r.created_at,
+    })),
+  };
+}
+
+async function forgetMemory(
+  memoryId: string,
+  userId: string,
+  env: Env
+): Promise<{ deleted: true; memory_id: string } | { error: string }> {
+  // Verify the memory belongs to the requesting user before deleting
+  const row = await one<{ id: string }>(
+    env.DB,
+    `SELECT id FROM memories WHERE id = ? AND user_id = ?`,
+    memoryId,
+    userId
+  );
+
+  if (!row) {
+    return { error: "Memory not found" };
+  }
+
+  await run(env.DB, `DELETE FROM memories WHERE id = ? AND user_id = ?`, memoryId, userId);
+  await env.VECTORIZE.deleteByIds([memoryId]);
+
+  return { deleted: true, memory_id: memoryId };
 }
 
 // ============================================
@@ -840,6 +1095,47 @@ async function handleMCPRequest(
 
           case "listen_to_episode":
             result = await listenToEpisode(toolArgs.episode_id as string, userId, env);
+            break;
+
+          case "get_transcript":
+            result = await getTranscript(toolArgs.episode_id as string, userId, env);
+            break;
+
+          case "get_digest_transcript":
+            result = await getDigestTranscript(userId, env, toolArgs.date as string | undefined);
+            break;
+
+          case "save_memory":
+            result = await saveMemory(
+              toolArgs.content as string,
+              toolArgs.namespace as string | undefined,
+              toolArgs.metadata as Record<string, unknown> | undefined,
+              userId,
+              env
+            );
+            break;
+
+          case "recall":
+            result = await recallMemories(
+              toolArgs.query as string,
+              toolArgs.namespace as string | undefined,
+              (toolArgs.limit as number | undefined) ?? 5,
+              userId,
+              env
+            );
+            break;
+
+          case "list_memories":
+            result = await listMemories(
+              toolArgs.namespace as string | undefined,
+              (toolArgs.limit as number | undefined) ?? 20,
+              userId,
+              env
+            );
+            break;
+
+          case "forget":
+            result = await forgetMemory(toolArgs.memory_id as string, userId, env);
             break;
 
           default:
@@ -985,73 +1281,31 @@ const defaultHandler = {
       });
     }
 
-    // OAuth authorize page - show Google sign-in
+    // OAuth authorize - authenticate the user via the shared Better Auth session.
+    // The Better Auth session cookie is set on .podgest.app (crossSubDomainCookies),
+    // so we can verify it by forwarding cookies to the API's get-session endpoint.
     if (url.pathname === "/authorize") {
-      // Parse the OAuth request
       const oauthReqInfo = await typedEnv.OAUTH_PROVIDER.parseAuthRequest(request);
-      
-      // Store OAuth params in session and redirect to Supabase Google auth
-      const state = crypto.randomUUID();
-      await typedEnv.OAUTH_KV.put(`oauth_state:${state}`, JSON.stringify(oauthReqInfo), { expirationTtl: 600 });
-      
-      const callbackUrl = `${MCP_SERVER_URL}/oauth/callback?state=${encodeURIComponent(state)}`;
-      const supabaseAuthUrl = `${typedEnv.SUPABASE_URL}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(callbackUrl)}`;
-      
-      return Response.redirect(supabaseAuthUrl, 302);
-    }
 
-    // OAuth callback - receive Google auth result
-    if (url.pathname === "/oauth/callback") {
-      const state = url.searchParams.get("state");
-      
-      if (!state) {
-        return new Response(renderErrorPage("Missing state parameter"), {
-          status: 400,
-          headers: { "Content-Type": "text/html" },
-        });
+      // Check for an existing Better Auth session
+      const cookie = request.headers.get("Cookie") || "";
+      let user: { id: string; email: string } | null = null;
+      if (cookie) {
+        try {
+          const sessionResponse = await fetch("https://api.podgest.app/api/auth/get-session", {
+            headers: { "Cookie": cookie },
+          });
+          if (sessionResponse.ok) {
+            const data = await sessionResponse.json() as { user?: { id: string; email: string } } | null;
+            if (data?.user?.id) user = data.user;
+          }
+        } catch {
+          // fall through to login redirect
+        }
       }
 
-      // Supabase returns token in fragment, need JS to extract
-      return new Response(renderOAuthCallbackPage(state), {
-        headers: { "Content-Type": "text/html" },
-      });
-    }
-
-    // Process Supabase token and complete OAuth flow
-    if (url.pathname === "/oauth/complete" && request.method === "POST") {
-      try {
-        const { access_token, state } = await request.json() as { access_token: string; state: string };
-        
-        // Retrieve stored OAuth request
-        const oauthReqStr = await typedEnv.OAUTH_KV.get(`oauth_state:${state}`);
-        if (!oauthReqStr) {
-          return new Response(JSON.stringify({ error: "Invalid or expired state" }), {
-            status: 400,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          });
-        }
-        
-        const oauthReqInfo = JSON.parse(oauthReqStr);
-        await typedEnv.OAUTH_KV.delete(`oauth_state:${state}`);
-
-        // Validate Supabase JWT and get user
-        const userResponse = await fetch(`${typedEnv.SUPABASE_URL}/auth/v1/user`, {
-          headers: {
-            "apikey": typedEnv.SUPABASE_ANON_KEY,
-            "Authorization": `Bearer ${access_token}`,
-          },
-        });
-
-        if (!userResponse.ok) {
-          return new Response(JSON.stringify({ error: "Invalid Supabase token" }), {
-            status: 401,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          });
-        }
-
-        const user = await userResponse.json() as { id: string; email: string };
-
-        // Complete OAuth authorization
+      if (user) {
+        // Already signed in - complete the MCP OAuth grant immediately
         const { redirectTo } = await typedEnv.OAUTH_PROVIDER.completeAuthorization({
           request: oauthReqInfo,
           userId: user.id,
@@ -1062,17 +1316,15 @@ const defaultHandler = {
             email: user.email,
           },
         });
-
-        return new Response(JSON.stringify({ redirect_url: redirectTo }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      } catch (error) {
-        console.error("OAuth complete error:", error);
-        return new Response(JSON.stringify({ error: "Authentication failed" }), {
-          status: 500,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+        return Response.redirect(redirectTo, 302);
       }
+
+      // No session - render a page that kicks off Google sign-in on the API's
+      // Better Auth endpoint (must run in the browser so cookies get set),
+      // returning to this /authorize URL (with its query intact) afterwards.
+      return new Response(renderSignInPage(request.url), {
+        headers: { "Content-Type": "text/html" },
+      });
     }
 
     return new Response("Not found", { status: 404, headers: corsHeaders });
@@ -1083,13 +1335,19 @@ const defaultHandler = {
 // PAGE TEMPLATES
 // ============================================
 
-function renderOAuthCallbackPage(state: string): string {
+/**
+ * Sign-in bootstrap page. Runs in the browser so the Better Auth state and
+ * session cookies get set on the user's browser (they wouldn't if this worker
+ * called the sign-in endpoint server-side). After Google sign-in completes,
+ * Better Auth redirects back to the /authorize URL, which then finds a session.
+ */
+function renderSignInPage(returnUrl: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Podgest - Authenticating</title>
+  <title>Podgest - Sign in</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -1120,41 +1378,30 @@ function renderOAuthCallbackPage(state: string): string {
 <body>
   <div class="container">
     <div class="spinner" id="spinner"></div>
-    <h1>Completing sign-in...</h1>
-    <p class="status" id="status">Redirecting back to your app.</p>
+    <h1>Signing you in...</h1>
+    <p class="status" id="status">Redirecting to Google.</p>
     <p class="error" id="error"></p>
   </div>
   <script>
     (async function() {
-      const hash = window.location.hash.substring(1);
-      const params = new URLSearchParams(hash);
-      const accessToken = params.get('access_token');
-      
-      if (!accessToken) {
-        document.getElementById('spinner').style.display = 'none';
-        document.getElementById('status').style.display = 'none';
-        document.getElementById('error').style.display = 'block';
-        document.getElementById('error').textContent = 'No access token received. Please try again.';
-        return;
-      }
-      
       try {
-        const response = await fetch('/oauth/complete', {
+        const response = await fetch('https://api.podgest.app/api/auth/sign-in/social', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
           body: JSON.stringify({
-            access_token: accessToken,
-            state: ${JSON.stringify(state)}
+            provider: 'google',
+            callbackURL: ${JSON.stringify(returnUrl)}
           })
         });
-        
+
         if (!response.ok) {
-          const data = await response.json();
-          throw new Error(data.error || 'Authentication failed');
+          throw new Error('Could not start sign-in (HTTP ' + response.status + ')');
         }
-        
+
         const data = await response.json();
-        window.location.href = data.redirect_url;
+        if (!data.url) throw new Error('No sign-in URL returned');
+        window.location.href = data.url;
       } catch (err) {
         document.getElementById('spinner').style.display = 'none';
         document.getElementById('status').style.display = 'none';
