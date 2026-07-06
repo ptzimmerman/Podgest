@@ -6,6 +6,7 @@ import { Login } from './pages/Login'
 import { Callback } from './pages/Callback'
 import { Settings } from './pages/Settings'
 import { Subscriptions } from './pages/Subscriptions'
+import { Activity } from './pages/Activity'
 import { OnboardingKeys } from './pages/onboarding/Keys'
 import { OnboardingPodcasts } from './pages/onboarding/Podcasts'
 
@@ -53,15 +54,16 @@ function App() {
               </ProtectedRoute>
             }
           >
+            <Route path="/activity" element={<Activity />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/subscriptions" element={<Subscriptions />} />
           </Route>
 
-          {/* Redirect root to settings */}
-          <Route path="/" element={<Navigate to="/settings" replace />} />
+          {/* Redirect root to activity */}
+          <Route path="/" element={<Navigate to="/activity" replace />} />
 
-          {/* Catch all - redirect to settings */}
-          <Route path="*" element={<Navigate to="/settings" replace />} />
+          {/* Catch all - redirect to activity */}
+          <Route path="*" element={<Navigate to="/activity" replace />} />
         </Routes>
       </BrowserRouter>
     </QueryClientProvider>

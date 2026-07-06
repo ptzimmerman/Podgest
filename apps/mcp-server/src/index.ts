@@ -137,7 +137,7 @@ interface MCPTool {
 const TOOLS: MCPTool[] = [
   {
     name: "search_podcasts",
-    description: "Semantic search across all podcast transcripts. Returns relevant excerpts with source attribution.",
+    description: "Semantic search across all podcast transcripts. Returns relevant excerpts with source attribution (podcast_name is the episode's real show name, even for episodes that arrived via an aggregator feed).",
     inputSchema: {
       type: "object",
       properties: {
@@ -173,7 +173,7 @@ const TOOLS: MCPTool[] = [
   },
   {
     name: "compare_takes",
-    description: "Find how different podcasts covered the same topic. Returns contrasting perspectives.",
+    description: "Find how different podcasts covered the same topic. Returns contrasting perspectives, grouped by each episode's real show name (aggregator feeds are resolved to the underlying shows).",
     inputSchema: {
       type: "object",
       properties: {
@@ -191,7 +191,7 @@ const TOOLS: MCPTool[] = [
   },
   {
     name: "list_podcasts",
-    description: "List all podcasts you're subscribed to.",
+    description: "List all podcast subscriptions. A subscription may be an aggregator feed (e.g. a ListenNotes playlist) that bundles many different shows into one RSS feed - these are marked is_aggregator=true and include shows_included listing the real shows inside. Treat those shows as if the user subscribed to each individually; other tools already resolve episodes to their real show names.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -199,7 +199,7 @@ const TOOLS: MCPTool[] = [
   },
   {
     name: "recent_episodes",
-    description: "Get the most recent episodes across all subscribed podcasts.",
+    description: "Get the most recent episodes across all subscribed podcasts. podcast_name is always the episode's real show name, even when the episode arrived via an aggregator feed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -579,10 +579,21 @@ async function compareTakes(
   }
 }
 
+interface PodcastListing {
+  id: string;
+  name: string;
+  feed_url: string;
+  episode_count: number;
+  is_aggregator: boolean;
+  // Aggregator feeds only: the real shows bundled inside, by recent episode volume
+  shows_included?: Array<{ name: string; recent_episode_count: number }>;
+  note?: string;
+}
+
 async function listPodcasts(
   userId: string,
   env: Env
-): Promise<{ podcasts: Array<{ id: string; name: string; feed_url: string; episode_count: number }> }> {
+): Promise<{ podcasts: PodcastListing[] }> {
   console.log(`[listPodcasts] Fetching for user: ${userId}`);
   
   // Episodes link by feed_url, so count them in a single joined query
@@ -595,14 +606,47 @@ async function listPodcasts(
     userId
   );
 
-  return {
-    podcasts: rows.map(r => ({
+  const podcasts: PodcastListing[] = [];
+  for (const r of rows) {
+    // Detect aggregator feeds by scanning recent episode descriptions for the
+    // embedded original-show marker (works for ListenNotes playlists; a plain
+    // single-show feed never carries it).
+    const recentEpisodes = await all<{ description: string | null }>(
+      env.DB,
+      `SELECT substr(description, 1, 4000) AS description
+       FROM episodes WHERE feed_url = ?
+       ORDER BY published_at DESC LIMIT 200`,
+      r.feed_url
+    );
+
+    const showCounts = new Map<string, number>();
+    for (const ep of recentEpisodes) {
+      const name = extractOriginalPodcastName(ep.description || "");
+      if (name) showCounts.set(name, (showCounts.get(name) || 0) + 1);
+    }
+
+    const isAggregator = showCounts.size > 0;
+    podcasts.push({
       id: r.id,
       name: r.podcast_title || "Unknown",
       feed_url: r.feed_url,
       episode_count: r.episode_count,
-    })),
-  };
+      is_aggregator: isAggregator,
+      ...(isAggregator
+        ? {
+            shows_included: [...showCounts.entries()]
+              .sort((a, b) => b[1] - a[1])
+              .map(([name, count]) => ({ name, recent_episode_count: count })),
+            note:
+              "This is an aggregator feed (e.g. a ListenNotes playlist) bundling episodes from the shows listed in shows_included. " +
+              "Treat each of those shows as an individual subscription: recent_episodes, search_podcasts, compare_takes, and " +
+              "get_episode already resolve every episode to its real show name, so query them normally.",
+          }
+        : {}),
+    });
+  }
+
+  return { podcasts };
 }
 
 async function recentEpisodes(
@@ -1040,6 +1084,12 @@ async function handleMCPRequest(
               name: "podgest-mcp",
               version: "1.0.0",
             },
+            instructions: [
+              "Podgest tracks the user's podcast subscriptions, transcripts, and daily digests.",
+              "IMPORTANT: A subscription may be an AGGREGATOR feed (e.g. a ListenNotes playlist) that bundles episodes from many different shows into a single RSS feed. list_podcasts marks these with is_aggregator=true and lists the real shows inside (shows_included).",
+              "Treat the shows inside an aggregator exactly like individual subscriptions: recent_episodes, search_podcasts, compare_takes, get_episode, and get_transcript all resolve and return the REAL show name (e.g. 'The Daily', 'Prof G Markets') automatically.",
+              "Never tell the user they are 'only subscribed to' the aggregator, and never ask them to explain the aggregator - just use the underlying show names naturally.",
+            ].join(" "),
           },
         };
 

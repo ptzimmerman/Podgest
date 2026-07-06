@@ -1240,6 +1240,13 @@ export default {
       return withCors(await handleUserKeyStatus(auth.userId, env), request);
     }
 
+    // Recent digests with hydrated episode info (activity log)
+    if (url.pathname === "/api/digests" && request.method === "GET") {
+      const auth = await verifySession(request, env);
+      if (!auth) return withCors(json({ error: "Unauthorized" }, 401), request);
+      return withCors(await handleRecentDigests(auth.userId, env), request);
+    }
+
     // Latest in-progress digest for the authenticated user (for resuming the progress UI)
     if (url.pathname === "/api/digests/in-progress" && request.method === "GET") {
       const auth = await verifySession(request, env);
@@ -5577,6 +5584,109 @@ async function handleUserKeyStatus(userId: string, env: Env): Promise<Response> 
   } catch (error) {
     console.error("[UserKeys] Status failed:", error);
     return json({ error: "Failed to load key status" }, 500);
+  }
+}
+
+/**
+ * Activity log: recent digests with the episodes each one covered.
+ * GET /api/digests
+ */
+async function handleRecentDigests(userId: string, env: Env): Promise<Response> {
+  try {
+    const digests = await all<{
+      id: string;
+      digest_date: string;
+      status: string;
+      audio_url: string | null;
+      duration_seconds: number | null;
+      episodes_included: string | null;
+      error_message: string | null;
+      created_at: string;
+      completed_at: string | null;
+    }>(
+      env.DB,
+      `SELECT id, digest_date, status, audio_url, duration_seconds, episodes_included,
+              error_message, created_at, completed_at
+       FROM digests WHERE user_id = ?
+       ORDER BY created_at DESC LIMIT 20`,
+      userId
+    );
+
+    // Collect every episode id referenced by these digests, then hydrate in one query
+    const episodeIds = new Set<string>();
+    const digestEpisodeIds = digests.map((d) => {
+      const ids = parseJson<string[]>(d.episodes_included, []);
+      ids.forEach((id) => episodeIds.add(id));
+      return ids;
+    });
+
+    interface EpisodeInfo {
+      id: string;
+      title: string | null;
+      feed_url: string;
+      audio_url: string | null;
+      published_at: string | null;
+      duration_seconds: number | null;
+      description: string | null;
+    }
+    const episodeById = new Map<string, EpisodeInfo>();
+    if (episodeIds.size > 0) {
+      const idList = [...episodeIds];
+      // Chunk the IN clause to stay well under D1's bound-parameter limit
+      for (let i = 0; i < idList.length; i += 50) {
+        const chunk = idList.slice(i, i + 50);
+        const rows = await all<EpisodeInfo>(
+          env.DB,
+          `SELECT id, title, feed_url, audio_url, published_at, duration_seconds, description
+           FROM episodes WHERE id IN (${chunk.map(() => "?").join(",")})`,
+          ...chunk
+        );
+        rows.forEach((r) => episodeById.set(r.id, r));
+      }
+    }
+
+    // Podcast titles come from the user's subscriptions (keyed by feed_url)
+    const subs = await all<{ feed_url: string; podcast_title: string | null; artwork_url: string | null }>(
+      env.DB,
+      `SELECT feed_url, podcast_title, artwork_url FROM subscriptions WHERE user_id = ?`,
+      userId
+    );
+    const subByFeed = new Map(subs.map((s) => [s.feed_url, s]));
+
+    const result = digests.map((d, i) => ({
+      id: d.id,
+      digest_date: d.digest_date,
+      status: d.status,
+      audio_url: d.audio_url,
+      duration_seconds: d.duration_seconds,
+      error_message: d.error_message,
+      created_at: d.created_at,
+      completed_at: d.completed_at,
+      episodes: digestEpisodeIds[i]
+        .map((epId) => {
+          const ep = episodeById.get(epId);
+          if (!ep) return null;
+          const sub = subByFeed.get(ep.feed_url);
+          // Aggregator feeds (ListenNotes) wrap many shows in one subscription;
+          // the real podcast name is embedded in the episode description.
+          const originalName = extractOriginalPodcastName(ep.description || "");
+          return {
+            id: ep.id,
+            title: ep.title,
+            podcast_title: originalName || sub?.podcast_title || null,
+            artwork_url: sub?.artwork_url ?? null,
+            audio_url: ep.audio_url,
+            published_at: ep.published_at,
+            duration_seconds: ep.duration_seconds,
+          };
+        })
+        .filter((e) => e !== null),
+    }));
+
+    return json({ digests: result });
+  } catch (error) {
+    console.error("[Digests] Recent lookup failed:", error);
+    return json({ error: "Failed to load digests" }, 500);
   }
 }
 

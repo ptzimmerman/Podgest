@@ -11,6 +11,20 @@ import { decryptApiKey } from './encryption';
 import { all, one, placeholders } from './db';
 
 /**
+ * Extract the original podcast name from an aggregator episode description.
+ * Aggregator feeds (e.g. ListenNotes playlists) bundle episodes from many
+ * different shows into one RSS feed; the real show name is embedded in each
+ * episode's description as: <strong>Podcast</strong>: <a href="...">Name</a>
+ */
+export function extractOriginalPodcastName(description: string): string | null {
+  const listenNotesMatch = description.match(/<strong>Podcast<\/strong>:\s*<a[^>]*>([^<]+)<\/a>/i);
+  if (listenNotesMatch) {
+    return listenNotesMatch[1].trim();
+  }
+  return null;
+}
+
+/**
  * Search result from transcript search
  */
 export interface TranscriptSearchResult {
@@ -123,7 +137,9 @@ export async function searchTranscripts(
       return [];
     }
 
-    // Hydrate chunk text + episode/podcast titles from D1 by matched vector ids
+    // Hydrate chunk text + episode/podcast titles from D1 by matched vector ids.
+    // The episode description is fetched to recover the real show name for
+    // episodes that arrived via an aggregator feed (see extractOriginalPodcastName).
     const ids = matches.matches.map((m) => m.id);
     const rows = await all<{
       id: string;
@@ -131,11 +147,12 @@ export async function searchTranscripts(
       chunk_text: string;
       chunk_index: number;
       episode_title: string | null;
+      episode_description: string | null;
       podcast_title: string | null;
     }>(
       db,
       `SELECT tc.id, tc.episode_id, tc.chunk_text, tc.chunk_index,
-              e.title AS episode_title, s.podcast_title
+              e.title AS episode_title, e.description AS episode_description, s.podcast_title
        FROM transcript_chunks tc
        LEFT JOIN episodes e ON e.id = tc.episode_id
        LEFT JOIN subscriptions s ON s.feed_url = e.feed_url AND s.user_id = ?
@@ -150,11 +167,12 @@ export async function searchTranscripts(
     for (const match of matches.matches) {
       const row = rowById.get(match.id);
       if (!row) continue; // vector without a D1 chunk row; skip
+      const originalName = extractOriginalPodcastName(row.episode_description || '');
       results.push({
         id: row.id,
         episode_id: row.episode_id,
         episode_title: row.episode_title || 'Unknown',
-        podcast_title: row.podcast_title || 'Unknown',
+        podcast_title: originalName || row.podcast_title || 'Unknown',
         chunk_text: row.chunk_text,
         chunk_index: row.chunk_index,
         similarity: match.score,
