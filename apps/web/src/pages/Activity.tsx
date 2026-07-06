@@ -249,7 +249,16 @@ export function Activity() {
                               </p>
                             </div>
                             <div className="flex items-center gap-2 flex-shrink-0">
-                              <span className={`px-2.5 py-0.5 rounded-full text-xs font-medium ${status.classes}`}>
+                              <span
+                                className={`px-2.5 py-0.5 rounded-full text-xs font-medium ${status.classes} ${
+                                  digest.status === 'failed' && digest.error_message ? 'cursor-help' : ''
+                                }`}
+                                title={
+                                  digest.status === 'failed' && digest.error_message
+                                    ? digest.error_message
+                                    : undefined
+                                }
+                              >
                                 {status.label}
                               </span>
                               <svg
@@ -265,10 +274,6 @@ export function Activity() {
 
                           {digestOpen && (
                             <div className="px-4 sm:px-5 pb-4">
-                              {digest.status === 'failed' && digest.error_message && (
-                                <p className="mb-3 text-xs text-red-600 dark:text-red-400">{digest.error_message}</p>
-                              )}
-
                               {/* Digest player (audio is purged after 7 days) */}
                               {digest.audio_url ? (
                                 <audio
