@@ -368,21 +368,6 @@ export function Settings() {
 
       // Refresh status
       await fetchKeyStatus()
-      
-      // If we just saved an OpenAI key (required for TTS), try to generate welcome episode
-      // This handles users who skipped onboarding and added keys later
-      if (results.includes('OpenAI')) {
-        // Fire and forget - don't block on this
-        fetch(`${API_URL}/api/generate-welcome`, {
-          method: 'POST',
-          credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        }).catch(() => {
-          // Silently ignore errors - welcome episode is optional
-        })
-      }
     } finally {
       setSaving(false)
     }

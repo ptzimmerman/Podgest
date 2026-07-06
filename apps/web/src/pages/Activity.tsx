@@ -56,6 +56,16 @@ function parseLocalDate(dateStr: string): Date {
   return new Date(y, m - 1, d)
 }
 
+// The welcome episode is stored with a special 1970-01-01 date marker
+function isWelcomeDigest(digest: Digest): boolean {
+  return digest.digest_date === '1970-01-01'
+}
+
+// Welcome digests group by when they were created, not their 1970 marker date
+function digestGroupDate(digest: Digest): Date {
+  return isWelcomeDigest(digest) ? new Date(digest.created_at) : parseLocalDate(digest.digest_date)
+}
+
 function formatDigestDate(dateStr: string): string {
   return parseLocalDate(dateStr).toLocaleDateString(undefined, {
     weekday: 'long',
@@ -113,7 +123,7 @@ export function Activity() {
         setDigests(list)
         // Latest week expanded, latest digest card expanded
         if (list.length > 0) {
-          setOpenWeeks(new Set([weekStart(parseLocalDate(list[0].digest_date)).toISOString()]))
+          setOpenWeeks(new Set([weekStart(digestGroupDate(list[0])).toISOString()]))
           setOpenDigests(new Set([list[0].id]))
         }
       } catch (err) {
@@ -129,7 +139,7 @@ export function Activity() {
   const weeks: WeekGroup[] = useMemo(() => {
     const groups = new Map<string, WeekGroup>()
     for (const digest of digests) {
-      const start = weekStart(parseLocalDate(digest.digest_date))
+      const start = weekStart(digestGroupDate(digest))
       const key = start.toISOString()
       if (!groups.has(key)) {
         groups.set(key, { key, label: weekLabel(start), digests: [] })
@@ -236,7 +246,7 @@ export function Activity() {
                           >
                             <div className="min-w-0">
                               <p className="text-sm font-medium text-gray-900 dark:text-white">
-                                {formatDigestDate(digest.digest_date)}
+                                {isWelcomeDigest(digest) ? 'Welcome to Podgest' : formatDigestDate(digest.digest_date)}
                               </p>
                               <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
                                 {digest.completed_at

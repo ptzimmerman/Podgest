@@ -10,12 +10,31 @@ type UserInfo = {
   avatarUrl: string | null
 }
 
+type CreditAlert = {
+  digestId: string
+  provider: 'Anthropic' | 'OpenAI'
+}
+
+const CREDIT_ERROR_PATTERNS = [
+  /credit balance is too low/i,   // Anthropic
+  /insufficient_quota/i,          // OpenAI
+  /exceeded your current quota/i, // OpenAI
+]
+
+function detectCreditAlert(digest: { id: string; status: string; error_message: string | null }): CreditAlert | null {
+  if (digest.status !== 'failed' || !digest.error_message) return null
+  if (!CREDIT_ERROR_PATTERNS.some((p) => p.test(digest.error_message!))) return null
+  const provider = /claude|anthropic/i.test(digest.error_message) ? 'Anthropic' : 'OpenAI'
+  return { digestId: digest.id, provider }
+}
+
 export function Layout() {
   const navigate = useNavigate()
   const { data: session } = authClient.useSession()
   const [user, setUser] = useState<UserInfo | null>(null)
   const [userId, setUserId] = useState<string | null>(null)
   const [menuOpen, setMenuOpen] = useState(false)
+  const [creditAlert, setCreditAlert] = useState<CreditAlert | null>(null)
   const [darkMode, setDarkMode] = useState(() => {
     // Initialize from localStorage as fallback
     if (typeof window !== 'undefined') {
@@ -80,7 +99,37 @@ export function Layout() {
       }
     }
     fetchDarkMode()
+
+    // Check the latest digest for an out-of-credits failure so the user
+    // doesn't have to dig through the activity log to find out.
+    const checkCreditStatus = async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/digests`, { credentials: 'include' })
+        if (!res.ok) return
+        const { digests } = await res.json() as {
+          digests: { id: string; digest_date: string; status: string; error_message: string | null }[]
+        }
+        // Latest real digest run (skip the welcome episode, marked 1970-01-01)
+        const latest = digests?.find((d) => d.digest_date !== '1970-01-01')
+        if (!latest) return
+        const alert = detectCreditAlert(latest)
+        if (alert && localStorage.getItem(`creditBannerDismissed:${alert.digestId}`) !== 'true') {
+          setCreditAlert(alert)
+        }
+      } catch {
+        // Non-fatal: banner is best-effort
+      }
+    }
+    checkCreditStatus()
   }, [session?.user])
+
+  const dismissCreditAlert = () => {
+    if (creditAlert) {
+      // Keyed by digest id so the banner reappears if a *new* run fails
+      localStorage.setItem(`creditBannerDismissed:${creditAlert.digestId}`, 'true')
+    }
+    setCreditAlert(null)
+  }
 
   // Close menu when clicking outside
   useEffect(() => {
@@ -202,6 +251,37 @@ export function Layout() {
           </div>
         </div>
       </nav>
+
+      {/* Out-of-credits banner */}
+      {creditAlert && (
+        <div className="bg-amber-50 dark:bg-amber-900/30 border-b border-amber-200 dark:border-amber-800">
+          <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-start gap-3">
+            <svg className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+            </svg>
+            <div className="flex-1 text-sm text-amber-800 dark:text-amber-200">
+              <span className="font-medium">Your {creditAlert.provider} API key is out of credits</span>
+              {' — '}your latest digest couldn't be generated. Add credits to your {creditAlert.provider} account
+              {creditAlert.provider === 'Anthropic'
+                ? ' at console.anthropic.com'
+                : ' at platform.openai.com'}
+              , or update your key in{' '}
+              <Link to="/settings" className="underline font-medium hover:text-amber-900 dark:hover:text-amber-100">
+                Settings
+              </Link>.
+            </div>
+            <button
+              onClick={dismissCreditAlert}
+              className="flex-shrink-0 p-1 rounded hover:bg-amber-100 dark:hover:bg-amber-800/50 transition-colors"
+              title="Dismiss"
+            >
+              <svg className="w-4 h-4 text-amber-600 dark:text-amber-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Main Content */}
       <main className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">

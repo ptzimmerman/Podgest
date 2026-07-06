@@ -1124,6 +1124,16 @@ export default {
       return withCors(await handleGenerateWelcome(request, env, ctx), request);
     }
     
+    // Admin: (re)generate the static welcome.mp3 fallback asset in R2.
+    // Served at ${MEDIA_BASE_URL}/static/welcome.mp3 and used as the RSS
+    // placeholder enclosure for users who haven't generated a personalized
+    // welcome episode yet (e.g. no OpenAI key configured).
+    if (url.pathname === "/api/admin/generate-static-welcome" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
+      return handleGenerateStaticWelcome(env);
+    }
+    
     // Async queue: Dispatch all users (admin only)
     if (url.pathname === "/api/dispatch" && request.method === "POST") {
       const authError = requireAdminAuth(request, env);
@@ -1843,6 +1853,63 @@ Alright, that's the quick tour. I'll catch you tomorrow with your first digest. 
   } catch (error) {
     console.error("[Welcome] Error:", error);
     return json({ error: "Internal error" }, 500);
+  }
+}
+
+/**
+ * Generate the generic (non-personalized) static welcome.mp3 and store it
+ * in R2 at static/welcome.mp3. Uses the platform OpenAI key, not a user key.
+ * Runs synchronously; the script is short so TTS completes well within limits.
+ */
+async function handleGenerateStaticWelcome(env: Env): Promise<Response> {
+  const script = `Hey there! Welcome to Podgest, your personal podcast digest.
+
+Here's how it works: Every morning, Podgest checks your subscribed podcasts for new episodes. When it finds new content, it transcribes it using AI and identifies the most interesting topics and insights.
+
+Then it creates a personalized audio digest just for you, summarizing the best moments from all your shows. Think of it like having a friend who listens to all your podcasts and gives you the highlights.
+
+To get started, head to dash.podgest.app, add some podcasts, and configure your API keys. Your first digest will arrive the next morning.
+
+You can also connect Podgest to Claude or ChatGPT using the MCP server, and ask questions about any podcast content across all your shows.
+
+Alright, that's the quick tour. Welcome aboard!`;
+
+  try {
+    const ttsResponse = await fetch("https://api.openai.com/v1/audio/speech", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "tts-1-hd",
+        voice: "echo",
+        input: script,
+        response_format: "mp3",
+      }),
+    });
+
+    if (!ttsResponse.ok) {
+      const errText = await ttsResponse.text();
+      console.error(`[StaticWelcome] OpenAI TTS error ${ttsResponse.status}: ${errText.slice(0, 300)}`);
+      return json({ error: `OpenAI TTS failed: ${ttsResponse.status}` }, 502);
+    }
+
+    const audio = await ttsResponse.arrayBuffer();
+    if (audio.byteLength < 1000) {
+      return json({ error: "TTS returned suspiciously small audio" }, 502);
+    }
+
+    const key = "static/welcome.mp3";
+    await env.MEDIA.put(key, audio, {
+      httpMetadata: { contentType: "audio/mpeg" },
+    });
+
+    console.log(`[StaticWelcome] Stored ${audio.byteLength} bytes at ${key}`);
+    return json({ success: true, url: `${MEDIA_BASE_URL}/${key}`, bytes: audio.byteLength });
+  } catch (error) {
+    console.error("[StaticWelcome] Error:", error);
+    return json({ error: "Failed to generate static welcome audio" }, 500);
   }
 }
 
@@ -3451,9 +3518,11 @@ async function cleanupOldDigestAudio(env: Env): Promise<{ deleted: number; error
 
   let oldDigests: Array<{ id: string }>;
   try {
+    // Welcome episodes (digest_date 1970-01-01) are exempt: their audio is the
+    // permanent static asset (or a small one-off file) and should never expire.
     oldDigests = await all<{ id: string }>(
       env.DB,
-      `SELECT id FROM digests WHERE audio_url IS NOT NULL AND created_at < ?`,
+      `SELECT id FROM digests WHERE audio_url IS NOT NULL AND created_at < ? AND digest_date != '1970-01-01'`,
       cutoff
     );
   } catch (e) {
@@ -3483,7 +3552,7 @@ async function cleanupOldDigestAudio(env: Env): Promise<{ deleted: number; error
   try {
     await run(
       env.DB,
-      `UPDATE digests SET audio_url = NULL WHERE audio_url IS NOT NULL AND created_at < ?`,
+      `UPDATE digests SET audio_url = NULL WHERE audio_url IS NOT NULL AND created_at < ? AND digest_date != '1970-01-01'`,
       cutoff
     );
   } catch (e) {
@@ -4055,6 +4124,7 @@ async function handleScheduledDigest(env: Env): Promise<Response> {
 }
 
 async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  let userId = "00000000-0000-0000-0000-000000000000";
   try {
     const body = await request.json() as { 
       user_id?: string; 
@@ -4065,7 +4135,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     const forceGenerate = body.force === true;
     
     const hoursBack = body.hours_back || 24;
-    const userId = body.user_id || "00000000-0000-0000-0000-000000000000";
+    userId = body.user_id || "00000000-0000-0000-0000-000000000000";
     
     // Validate user_id is a proper UUID
     if (!isValidUUID(userId)) {
@@ -4461,9 +4531,45 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     
   } catch (error) {
     console.error("[Digest] Error:", error);
-    // Return user-friendly errors for known issues, generic message for unknown
     const message = error instanceof Error ? error.message : String(error);
-    if (message.includes("API key") || message.includes("quota") || message.includes("rate limit")) {
+
+    // Record the failure so it surfaces in the Activity page and the
+    // out-of-credits banner. Never clobber a completed digest for the day.
+    if (isValidUUID(userId) && userId !== "00000000-0000-0000-0000-000000000000") {
+      try {
+        const digestDate = new Date().toISOString().split('T')[0];
+        const existing = await one<{ id: string; status: string }>(
+          env.DB,
+          `SELECT id, status FROM digests WHERE user_id = ? AND digest_date = ?`,
+          userId,
+          digestDate
+        );
+        if (!existing) {
+          await run(
+            env.DB,
+            `INSERT INTO digests (id, user_id, digest_date, status, error_message, episodes_included, created_at)
+             VALUES (?, ?, ?, 'failed', ?, '[]', ?)`,
+            crypto.randomUUID(),
+            userId,
+            digestDate,
+            message.slice(0, 1000),
+            new Date().toISOString()
+          );
+        } else if (existing.status !== "completed") {
+          await run(
+            env.DB,
+            `UPDATE digests SET status = 'failed', error_message = ? WHERE id = ?`,
+            message.slice(0, 1000),
+            existing.id
+          );
+        }
+      } catch (recordErr) {
+        console.error(`[Digest] Failed to record failure: ${recordErr}`);
+      }
+    }
+
+    // Return user-friendly errors for known issues, generic message for unknown
+    if (message.includes("API key") || message.includes("quota") || message.includes("rate limit") || message.includes("credit balance")) {
       return json({ error: message }, 500);
     }
     return json({ error: "Digest generation failed. Please try again later." }, 500);
@@ -4905,19 +5011,37 @@ async function handleRSSFeed(userId: string, env: Env, baseUrl?: string): Promis
         }
       }
       
-      // If no welcome episode exists, add a placeholder so the feed isn't empty
+      // If no welcome episode exists, add a placeholder backed by the generic
+      // static welcome audio so the feed isn't empty (many podcast apps hide
+      // items without an enclosure entirely).
       if (!hasWelcomeEpisode) {
         const placeholderDate = new Date().toUTCString();
         // Use a static placeholder GUID based on user ID so it's consistent
         const placeholderGuid = `placeholder-${userId}`;
-        
+
+        // Get the static welcome file size for the enclosure (0 if missing)
+        let welcomeSize = 0;
+        try {
+          const headResponse = await fetch(welcomeAudio, { method: "HEAD" });
+          const contentLength = headResponse.headers.get("content-length");
+          if (headResponse.ok && contentLength) {
+            welcomeSize = parseInt(contentLength, 10);
+          }
+        } catch {
+          console.error(`[RSS] Failed to get static welcome file size`);
+        }
+
+        const enclosure = welcomeSize > 0
+          ? `\n      <enclosure url="${welcomeAudio}" length="${welcomeSize}" type="audio/mpeg"/>`
+          : "";
+
         items.push(`
     <item>
       <title><![CDATA[Welcome to Podgest, ${userName}!]]></title>
       <description><![CDATA[Your personalized podcast digest is being set up. Add some podcasts and configure your API keys at dash.podgest.app, then your first digest will arrive tomorrow morning!]]></description>
       <pubDate>${placeholderDate}</pubDate>
-      <guid isPermaLink="false">${placeholderGuid}</guid>
-      <itunes:duration>0:00</itunes:duration>
+      <guid isPermaLink="false">${placeholderGuid}</guid>${enclosure}
+      <itunes:duration>1:00</itunes:duration>
       <itunes:explicit>no</itunes:explicit>
       <itunes:episodeType>trailer</itunes:episodeType>
       <itunes:summary>Your first daily digest arrives tomorrow morning! Set up your podcasts at dash.podgest.app</itunes:summary>

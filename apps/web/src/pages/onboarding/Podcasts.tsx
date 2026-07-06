@@ -184,22 +184,7 @@ export function OnboardingPodcasts() {
         return
       }
 
-      // Generate welcome episode in the background
-      fetch(`${API_URL}/api/generate-welcome`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      }).then(res => {
-        if (res.ok) {
-          console.log('Welcome episode generation triggered')
-        }
-      }).catch(err => {
-        console.error('Failed to trigger welcome episode:', err)
-      })
-
-      // Navigate immediately - welcome episode generates in background
+      // Welcome episode is seeded automatically at account creation
       navigate('/settings')
     } catch (err) {
       console.error('Error finishing setup:', err)

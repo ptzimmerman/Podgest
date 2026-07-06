@@ -60,10 +60,36 @@ export function createAuth(env: Env) {
         create: {
           // Mirror the old Supabase trigger: every auth user gets a profile row.
           after: async (user) => {
+            const now = new Date().toISOString();
             await env.DB.prepare(
               `INSERT OR IGNORE INTO profiles (id, email, display_name, timezone, digest_time, digest_length_minutes, dark_mode, created_at)
                VALUES (?, ?, ?, 'America/Chicago', '06:00:00', 5, 0, ?)`
-            ).bind(user.id, user.email, user.name ?? null, new Date().toISOString()).run();
+            ).bind(user.id, user.email, user.name ?? null, now).run();
+
+            // Seed the welcome episode so new users immediately see one item in
+            // their Activity log and RSS feed, before any API keys are added.
+            // Uses the generic static welcome audio (no user keys required).
+            // digest_date 1970-01-01 is the special welcome-episode marker.
+            const firstName = (user.name ?? "").split(" ")[0] || null;
+            const title = firstName ? `Welcome to Podgest, ${firstName}!` : "Welcome to Podgest!";
+            try {
+              await env.DB.prepare(
+                `INSERT INTO digests (id, user_id, digest_date, status, audio_url, topic_clusters, script_text, episodes_included, duration_seconds, completed_at, created_at)
+                 SELECT ?, ?, '1970-01-01', 'completed', 'https://cdn.podgest.app/static/welcome.mp3', ?, ?, '[]', 49, ?, ?
+                 WHERE NOT EXISTS (SELECT 1 FROM digests WHERE user_id = ? AND digest_date = '1970-01-01')`
+              ).bind(
+                crypto.randomUUID(),
+                user.id,
+                JSON.stringify({ title, topics: ["Introduction", "How it works", "Getting started"] }),
+                "Welcome to Podgest, your personal podcast digest! Every morning, Podgest checks your subscribed podcasts for new episodes, transcribes them, and creates a personalized audio digest of the best moments. Add podcasts and API keys at dash.podgest.app to get your first digest tomorrow morning.",
+                now,
+                now,
+                user.id
+              ).run();
+            } catch (e) {
+              // Non-fatal: worst case the user just sees an empty activity log
+              console.error(`[Auth] Failed to seed welcome episode for ${user.id}: ${e}`);
+            }
           },
         },
       },
