@@ -9,6 +9,7 @@ const TIMEZONES = [
   { value: 'America/Chicago', label: 'Central Time (CT)' },
   { value: 'America/Denver', label: 'Mountain Time (MT)' },
   { value: 'America/Los_Angeles', label: 'Pacific Time (PT)' },
+  { value: 'America/Mexico_City', label: 'Mexico City (CST)' },
   { value: 'America/Anchorage', label: 'Alaska Time (AKT)' },
   { value: 'Pacific/Honolulu', label: 'Hawaii Time (HT)' },
   { value: 'Europe/London', label: 'London (GMT/BST)' },
@@ -19,6 +20,15 @@ const TIMEZONES = [
   { value: 'Australia/Sydney', label: 'Sydney (AEST)' },
   { value: 'UTC', label: 'UTC' },
 ]
+
+/** Include stored IANA zones missing from TIMEZONES so the select reflects the backend. */
+function timezoneOptions(stored?: string | null) {
+  if (!stored || TIMEZONES.some((tz) => tz.value === stored)) {
+    return TIMEZONES
+  }
+  const label = stored.replace(/_/g, ' ').replace(/\//g, ' — ')
+  return [...TIMEZONES, { value: stored, label: `${label} (saved)` }]
+}
 
 // Generate 30-minute increments from 00:00 to 23:30
 const DIGEST_TIMES = Array.from({ length: 48 }, (_, i) => {
@@ -619,7 +629,7 @@ export function Settings() {
                     onChange={handleTimezoneChange}
                     className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm bg-white dark:bg-gray-900 dark:text-white"
                   >
-                    {TIMEZONES.map(tz => (
+                    {timezoneOptions(timezone).map(tz => (
                       <option key={tz.value} value={tz.value}>{tz.label}</option>
                     ))}
                   </select>
