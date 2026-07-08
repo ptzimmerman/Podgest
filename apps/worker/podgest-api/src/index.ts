@@ -5673,7 +5673,15 @@ async function handleUpdateOwnProfile(userId: string, request: Request, env: Env
       userId
     );
     if (!result.meta.changes) {
-      return json({ error: "Profile not found" }, 404);
+      // No row change can mean the value was already set (idempotent PATCH).
+      const exists = await one<{ id: string }>(
+        env.DB,
+        `SELECT id FROM profiles WHERE id = ?`,
+        userId
+      );
+      if (!exists) {
+        return json({ error: "Profile not found" }, 404);
+      }
     }
     return json({ success: true });
   } catch (error) {

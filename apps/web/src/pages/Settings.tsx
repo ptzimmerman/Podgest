@@ -250,8 +250,10 @@ export function Settings() {
     setDigestLength(value)
   }
 
-  const handleDigestLengthCommit = () => {
-    saveDigestPreferences({ digest_length_minutes: digestLength })
+  const handleDigestLengthCommit = (e: React.SyntheticEvent<HTMLInputElement>) => {
+    const value = parseInt(e.currentTarget.value, 10)
+    setDigestLength(value)
+    saveDigestPreferences({ digest_length_minutes: value })
   }
   
   const handleTimezoneChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
