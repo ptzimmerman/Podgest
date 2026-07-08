@@ -819,7 +819,7 @@ function getCorsHeaders(request: Request): Record<string, string> {
   
   return {
     "Access-Control-Allow-Origin": allowedOrigin,
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
+    "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS, DELETE",
     "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Key",
     // Cookie-based Better Auth sessions require credentialed CORS
     "Access-Control-Allow-Credentials": "true",
@@ -832,7 +832,7 @@ function withCors(response: Response, request?: Request): Response {
   const newHeaders = new Headers(response.headers);
   const corsHeaders = request ? getCorsHeaders(request) : {
     "Access-Control-Allow-Origin": ALLOWED_ORIGINS[0],
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
+    "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS, DELETE",
     "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Key",
     "Vary": "Origin",
   };
