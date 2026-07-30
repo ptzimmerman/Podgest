@@ -12,6 +12,13 @@ import {
   classifyApiKeyFailure,
   notifyApiKeyFailureOnce,
 } from './api-key-alerts';
+import {
+  handleSpecialEpisode,
+  isSpecialQueueMessage,
+  processSpecialEpisodeBatch,
+  processSpecialEpisodeUser,
+  type SpecialQueueMessage,
+} from './special-episode';
 
 export interface Env {
   ANTHROPIC_API_KEY: string;
@@ -21,7 +28,7 @@ export interface Env {
   // Generate with: openssl rand -hex 32
   API_KEY_ENCRYPTION_KEY: string;
   // Cloudflare Queue for async digest processing
-  DIGEST_QUEUE: Queue<DigestQueueMessage>;
+  DIGEST_QUEUE: Queue<DigestQueueMessage | SpecialQueueMessage>;
   // Admin API key for protecting admin/test/debug endpoints
   // Generate with: openssl rand -hex 32
   // Set with: wrangler secret put ADMIN_API_KEY
@@ -1144,6 +1151,14 @@ export default {
       if (authError) return authError;
       return handleGenerateStaticWelcome(env);
     }
+
+    // Admin: one-off special episode from a document (summary, not narration).
+    // Inserts a NEW digest for today alongside the daily digest — never replaces it.
+    if (url.pathname === "/api/admin/special-episode" && request.method === "POST") {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
+      return handleSpecialEpisode(request, env);
+    }
     
     // Async queue: Dispatch all users (admin only)
     if (url.pathname === "/api/dispatch" && request.method === "POST") {
@@ -1288,7 +1303,7 @@ export default {
   
   // Queue consumer for async digest processing
   // Each message = one user's digest job with independent timeout/retry
-  async queue(batch: MessageBatch<DigestQueueMessage>, env: Env, ctx: ExecutionContext): Promise<void> {
+  async queue(batch: MessageBatch<DigestQueueMessage | SpecialQueueMessage>, env: Env, ctx: ExecutionContext): Promise<void> {
     await handleQueueBatch(batch, env, ctx);
   },
 
@@ -3211,15 +3226,55 @@ async function processUserDigest(
 
 // Queue consumer handler - called by Cloudflare when messages arrive
 async function handleQueueBatch(
-  batch: MessageBatch<DigestQueueMessage>,
+  batch: MessageBatch<DigestQueueMessage | SpecialQueueMessage>,
   env: Env,
   ctx: ExecutionContext
 ): Promise<void> {
   for (const message of batch.messages) {
-    const { user_id, run_id } = message.body;
+    const body = message.body;
+
+    if (isSpecialQueueMessage(body)) {
+      try {
+        if (body.type === "special_episode_batch") {
+          await processSpecialEpisodeBatch(env, body);
+          console.log(`[Queue] Special batch ${body.run_id.slice(0, 8)} summarized + fanned out`);
+        } else {
+          await processSpecialEpisodeUser(env, body);
+          console.log(`[Queue] Special user job ${body.digest_id.slice(0, 8)} scripted + TTS triggered`);
+        }
+        message.ack();
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        console.error(`[Queue] Special episode error: ${errorMsg}`);
+        if (body.type === "special_episode_user") {
+          await run(
+            env.DB,
+            `UPDATE digests SET status = 'failed', error_message = ? WHERE id = ?`,
+            errorMsg.slice(0, 1000),
+            body.digest_id
+          ).catch(() => undefined);
+        } else {
+          for (const job of body.jobs) {
+            await run(
+              env.DB,
+              `UPDATE digests SET status = 'failed', error_message = ? WHERE id = ? AND status = 'generating'`,
+              errorMsg.slice(0, 1000),
+              job.digest_id
+            ).catch(() => undefined);
+          }
+        }
+        if (message.attempts >= 3) {
+          console.error(`[Queue] Special episode failed after ${message.attempts} attempts`);
+        }
+        message.retry();
+      }
+      continue;
+    }
+
+    const { user_id, run_id } = body;
     
     try {
-      await processUserDigest(env, ctx, message.body);
+      await processUserDigest(env, ctx, body);
       message.ack();
       
       console.log(`[Queue] Successfully processed message for user ${user_id.slice(0,8)}`);
@@ -4997,7 +5052,7 @@ async function handleRSSFeed(userId: string, env: Env, baseUrl?: string): Promis
         env.DB,
         `SELECT id, digest_date, topic_clusters, audio_url, duration_seconds, completed_at
          FROM digests WHERE user_id = ? AND status = 'completed'
-         ORDER BY digest_date DESC LIMIT 50`,
+         ORDER BY digest_date DESC, completed_at DESC, created_at DESC LIMIT 50`,
         userId
       );
       digests = digestRows.map(d => ({
