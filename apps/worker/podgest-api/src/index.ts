@@ -3,6 +3,15 @@ import { generateChunkedEmbeddings } from './embeddings';
 import { encryptApiKey, decryptApiKey } from './encryption';
 import { one, all, run, parseJson } from './db';
 import { createAuth } from './auth';
+import {
+  ELIGIBLE_DIGEST_PROFILES_SQL,
+  MAX_WATCHDOG_REQUEUES_PER_DAY,
+  usableDigestStatus,
+} from './digest-recovery';
+import {
+  classifyApiKeyFailure,
+  notifyApiKeyFailureOnce,
+} from './api-key-alerts';
 
 export interface Env {
   ANTHROPIC_API_KEY: string;
@@ -21,6 +30,7 @@ export interface Env {
   BETTER_AUTH_SECRET: string;
   GOOGLE_CLIENT_ID: string;
   GOOGLE_CLIENT_SECRET: string;
+  RESEND_API_KEY: string;
   // Cloudflare-native data layer (Supabase migration, Jul 2026)
   MEDIA: R2Bucket;        // public bucket (digest audio + static assets), served via cdn.podgest.app
   TRANSCRIPTS: R2Bucket;  // private bucket for transcript JSON
@@ -38,6 +48,7 @@ interface DigestQueueMessage {
   triggered_at: string;
   run_id: string;
 }
+
 // Note: Inngest removed - now using Supabase pg_cron for scheduling
 
 /**
@@ -891,7 +902,7 @@ export default {
     if (url.pathname === "/api/webhooks/tts" && request.method === "POST") {
       const authError = requireAdminAuth(request, env);
       if (authError) return authError;
-      return handleTTSWebhook(request, env);
+      return handleTTSWebhook(request, env, ctx);
     }
 
     // Modal TTS audio upload -> R2 (admin key required)
@@ -1301,15 +1312,28 @@ export default {
   },
 };
 
-// Watchdog (was pg_cron watchdog_check_digests_per_user): requeue any user
-// who has no digest row for today's UTC date.
+// Requeue eligible users with no usable digest, at most twice per UTC day.
 async function runDigestWatchdog(env: Env): Promise<void> {
   const today = new Date().toISOString().slice(0, 10);
+  const dayStart = `${today}T00:00:00.000Z`;
   const missing = await env.DB.prepare(
-    `SELECT p.id, p.email FROM profiles p
-     LEFT JOIN digests d ON d.user_id = p.id AND d.digest_date = ?
-     WHERE d.id IS NULL`
-  ).bind(today).all<{ id: string; email: string }>();
+    `WITH eligible AS (${ELIGIBLE_DIGEST_PROFILES_SQL})
+     SELECT eligible.id, eligible.email
+     FROM eligible
+     WHERE NOT EXISTS (
+       SELECT 1 FROM digests digest
+       WHERE digest.user_id = eligible.id
+         AND digest.digest_date = ?
+         AND digest.status IN ('generating', 'completed')
+     )
+     AND (
+       SELECT COUNT(*) FROM pipeline_logs logs
+       WHERE logs.step = 'watchdog_requeued'
+         AND logs.created_at >= ?
+         AND json_extract(logs.details, '$.user_id') = eligible.id
+     ) < ?`
+  ).bind(today, dayStart, MAX_WATCHDOG_REQUEUES_PER_DAY)
+    .all<{ id: string; email: string }>();
 
   const users = missing.results ?? [];
   if (users.length === 0) {
@@ -1325,7 +1349,11 @@ async function runDigestWatchdog(env: Env): Promise<void> {
       triggered_at: new Date().toISOString(),
       run_id: runId,
     });
-    await logPipelineEvent(env, user.id, "watchdog_requeued", { run_id: runId, email: user.email });
+    await logPipelineEvent(env, user.id, "watchdog_requeued", {
+      run_id: runId,
+      email: user.email,
+      digest_date: today,
+    });
   }
 }
 
@@ -1645,7 +1673,11 @@ async function handleTTSAudioUpload(request: Request, env: Env, url: URL): Promi
   return json({ success: true, audio_url: audioUrl });
 }
 
-async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
+async function handleTTSWebhook(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<Response> {
   try {
     const payload = await request.json() as {
       status: string;
@@ -1668,9 +1700,9 @@ async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
     }
 
     // State check: only accept webhooks for digests currently in "generating" state
-    const existing = await one<{ id: string; status: string }>(
+    const existing = await one<{ id: string; status: string; user_id: string }>(
       env.DB,
-      `SELECT id, status FROM digests WHERE id = ?`,
+      `SELECT id, status, user_id FROM digests WHERE id = ?`,
       payload.digest_id
     );
     if (!existing) {
@@ -1711,6 +1743,23 @@ async function handleTTSWebhook(request: Request, env: Env): Promise<Response> {
         payload.error || "TTS generation failed",
         payload.digest_id
       );
+
+      const keyFailure = classifyApiKeyFailure(
+        payload.error || "TTS generation failed",
+        "openai"
+      );
+      if (keyFailure) {
+        ctx.waitUntil(
+          notifyApiKeyFailureOnce(env, {
+            userId: existing.user_id,
+            provider: keyFailure.provider,
+            kind: keyFailure.kind,
+            reason: keyFailure.reason,
+          }).catch((error) => {
+            console.error(`[TTS Webhook] API-key alert failed: ${error}`);
+          })
+        );
+      }
 
       console.log(`[TTS Webhook] Digest ${payload.digest_id} failed: ${payload.error}`);
       return json({ success: true, status: "failed" });
@@ -2814,12 +2863,12 @@ async function handleDispatcher(env: Env): Promise<Response> {
   });
   
   try {
-    // Get all active users
+    // Queue only users who can actually complete a digest.
     const profiles = await all<{
       id: string;
       email: string;
       timezone: string;
-    }>(env.DB, `SELECT id, email, timezone FROM profiles`);
+    }>(env.DB, ELIGIBLE_DIGEST_PROFILES_SQL);
     
     console.log(`[Dispatcher] Found ${profiles.length} users to queue`);
     
@@ -3108,18 +3157,19 @@ async function processUserDigest(
   const today = dateFormatter.format(new Date());
   
   // Step 1: Check if digest already exists for today
-  const existing = await all<{ id: string }>(
+  const existing = await all<{ id: string; status: string }>(
     env.DB,
-    `SELECT id FROM digests WHERE user_id = ? AND digest_date = ?`,
+    `SELECT id, status FROM digests WHERE user_id = ? AND digest_date = ?`,
     user_id,
     today
   );
   
-  if (existing.length > 0) {
-    console.log(`[Consumer-${user_id.slice(0,8)}] Digest already exists for ${today}, skipping`);
+  const existingStatus = usableDigestStatus(existing.map((digest) => digest.status));
+  if (existingStatus) {
+    console.log(`[Consumer-${user_id.slice(0,8)}] Usable digest already exists for ${today}, skipping`);
     await logPipelineEvent(env, user_id, 'digest_skipped', {
       run_id,
-      reason: 'already_exists',
+      reason: `already_${existingStatus}`,
       today_date: today,
     });
     return;
@@ -4195,7 +4245,8 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     try {
       const recentDigests = await all<{ episodes_included: string | null }>(
         env.DB,
-        `SELECT episodes_included FROM digests WHERE user_id = ? AND digest_date >= ?`,
+        `SELECT episodes_included FROM digests
+         WHERE user_id = ? AND digest_date >= ? AND status = 'completed'`,
         userId,
         weekAgo
       );
@@ -4438,7 +4489,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
           env.DB,
           `UPDATE digests SET id = ?, status = ?, topic_clusters = ?, script_text = ?,
              audio_storage_path = ?, audio_url = NULL, duration_seconds = ?,
-             episodes_included = ?, completed_at = NULL
+             episodes_included = ?, completed_at = NULL, error_message = NULL
            WHERE user_id = ? AND digest_date = ?`,
           digestId,
           "generating", // Will be updated to "completed" by webhook
@@ -4499,6 +4550,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
         start_seconds: c.start_seconds,
         end_seconds: c.end_seconds,
         marker_index: c.marker_index,
+        fallback_text: c.quote,
       }));
     }
     
@@ -4565,6 +4617,20 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
         }
       } catch (recordErr) {
         console.error(`[Digest] Failed to record failure: ${recordErr}`);
+      }
+
+      const keyFailure = classifyApiKeyFailure(message);
+      if (keyFailure) {
+        ctx.waitUntil(
+          notifyApiKeyFailureOnce(env, {
+            userId,
+            provider: keyFailure.provider,
+            kind: keyFailure.kind,
+            reason: keyFailure.reason,
+          }).catch((alertError) => {
+            console.error(`[Digest] API-key alert failed: ${alertError}`);
+          })
+        );
       }
     }
 

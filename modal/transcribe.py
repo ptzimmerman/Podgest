@@ -780,6 +780,8 @@ def tts_with_clips_web(request: dict) -> dict:
         MAX_CHUNK_SIZE = 4000
         audio_segments = []  # Ordered list of audio file paths
         temp_files = []
+        clips_included = 0
+        clips_skipped = 0
         
         for seg_idx, text_part in enumerate(parts):
             clean_text = text_part.replace("[PAUSE]", " ... ").strip()
@@ -822,42 +824,61 @@ def tts_with_clips_web(request: dict) -> dict:
                 start_s = clip["start_seconds"]
                 end_s = clip["end_seconds"]
                 duration = end_s - start_s
-                
-                print(f"🎬 Extracting clip {seg_idx+1}: {start_s:.1f}s-{end_s:.1f}s ({duration:.1f}s) from {clip_url[:60]}...")
-                
-                # Download the source audio
-                dl_path = tempfile.mktemp(suffix=".mp3")
-                temp_files.append(dl_path)
-                
-                dl_headers = {
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                    "Accept": "audio/mpeg,audio/*;q=0.9,*/*;q=0.8",
-                }
-                dl_response = requests.get(clip_url, stream=True, timeout=120, headers=dl_headers)
-                dl_response.raise_for_status()
-                with open(dl_path, "wb") as f:
-                    for data_chunk in dl_response.iter_content(chunk_size=1024*1024):
-                        if data_chunk:
-                            f.write(data_chunk)
-                
-                # Extract the clip segment with ffmpeg, normalize volume
-                clip_path = tempfile.mktemp(suffix=".mp3")
-                temp_files.append(clip_path)
-                
-                subprocess.run([
-                    "ffmpeg", "-y",
-                    "-ss", str(start_s),
-                    "-t", str(duration),
-                    "-i", dl_path,
-                    "-af", "loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:d=0.3,afade=t=out:st=" + str(max(0, duration-0.5)) + ":d=0.5",
-                    "-ar", "24000",
-                    "-ac", "1",
-                    "-b:a", "128k",
-                    clip_path
-                ], check=True, capture_output=True)
-                
-                audio_segments.append(clip_path)
-                print(f"✅ Clip {seg_idx+1} extracted successfully")
+
+                try:
+                    print(f"🎬 Extracting clip {seg_idx+1}: {start_s:.1f}s-{end_s:.1f}s ({duration:.1f}s) from {clip_url[:60]}...")
+
+                    # Download the source audio. A publisher may reject server-side
+                    # retrieval even though its RSS enclosure is playable in a browser.
+                    dl_path = tempfile.mktemp(suffix=".mp3")
+                    temp_files.append(dl_path)
+
+                    dl_headers = {
+                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                        "Accept": "audio/mpeg,audio/*;q=0.9,*/*;q=0.8",
+                    }
+                    dl_response = requests.get(clip_url, stream=True, timeout=120, headers=dl_headers)
+                    dl_response.raise_for_status()
+                    with open(dl_path, "wb") as f:
+                        for data_chunk in dl_response.iter_content(chunk_size=1024*1024):
+                            if data_chunk:
+                                f.write(data_chunk)
+
+                    # Extract the clip segment with ffmpeg, normalize volume.
+                    clip_path = tempfile.mktemp(suffix=".mp3")
+                    temp_files.append(clip_path)
+
+                    subprocess.run([
+                        "ffmpeg", "-y",
+                        "-ss", str(start_s),
+                        "-t", str(duration),
+                        "-i", dl_path,
+                        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:d=0.3,afade=t=out:st=" + str(max(0, duration-0.5)) + ":d=0.5",
+                        "-ar", "24000",
+                        "-ac", "1",
+                        "-b:a", "128k",
+                        clip_path
+                    ], check=True, capture_output=True)
+
+                    audio_segments.append(clip_path)
+                    clips_included += 1
+                    print(f"✅ Clip {seg_idx+1} extracted successfully")
+                except Exception as clip_error:
+                    clips_skipped += 1
+                    print(f"⚠️ Clip {seg_idx+1} unavailable ({clip_error}); using narrated quote")
+                    fallback_text = str(clip.get("fallback_text") or "").strip()
+                    if fallback_text:
+                        response = client.audio.speech.create(
+                            model=model,
+                            voice=voice,
+                            input=fallback_text,
+                            response_format="mp3",
+                        )
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+                            for audio_chunk in response.iter_bytes():
+                                f.write(audio_chunk)
+                            audio_segments.append(f.name)
+                            temp_files.append(f.name)
         
         # Concatenate all audio segments
         print(f"🔗 Concatenating {len(audio_segments)} audio segments")
@@ -909,7 +930,8 @@ def tts_with_clips_web(request: dict) -> dict:
             "status": "completed",
             "digest_id": digest_id,
             "duration_seconds": duration_seconds,
-            "clips_included": len(clips),
+            "clips_included": clips_included,
+            "clips_skipped": clips_skipped,
             "provider": "openai+clips",
             "voice": voice,
             "model": model,
