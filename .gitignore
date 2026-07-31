@@ -45,3 +45,7 @@ migration/dumps/
 migration/.better_auth_secret
 migration/d1_import/
 migration/vectorize_import/
+
+# ChatGPT exports (may contain secrets; never commit)
+chat_gpt_export/
+chatgpt_conversations.txt
