@@ -4,6 +4,7 @@
  * Uses OpenAI's text-embedding-3-small model (1536 dimensions).
  * Handles text chunking to stay under the 8191 token limit.
  */
+import { aiFetch } from './ai-gateway';
 
 // OpenAI's token limit for text-embedding-3-small
 const MAX_TOKENS = 8191;
@@ -41,7 +42,8 @@ interface OpenAIEmbeddingResponse {
  */
 export async function generateEmbedding(
   text: string,
-  openaiKey: string
+  openaiKey: string,
+  keyUserId?: string
 ): Promise<number[]> {
   if (!text || text.trim().length === 0) {
     throw new Error('Cannot generate embedding for empty text');
@@ -55,7 +57,7 @@ export async function generateEmbedding(
   const truncatedText = text.slice(0, MAX_CHARS_PER_CHUNK);
 
   try {
-    const response = await fetch('https://api.openai.com/v1/embeddings', {
+    const response = await aiFetch('https://api.openai.com/v1/embeddings', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${openaiKey}`,
@@ -65,7 +67,7 @@ export async function generateEmbedding(
         model: 'text-embedding-3-small',
         input: truncatedText,
       }),
-    });
+    }, { billing: 'byok', user_id: keyUserId, purpose: 'embeddings' });
 
     if (!response.ok) {
       const error = await response.text();
@@ -277,7 +279,8 @@ export function estimateTokens(text: string): number {
  */
 export async function generateChunkedEmbeddings(
   text: string,
-  openaiKey: string
+  openaiKey: string,
+  keyUserId?: string
 ): Promise<Array<{
   chunkIndex: number;
   chunkText: string;
@@ -294,7 +297,7 @@ export async function generateChunkedEmbeddings(
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
-    const embedding = await generateEmbedding(chunk, openaiKey);
+    const embedding = await generateEmbedding(chunk, openaiKey, keyUserId);
     
     results.push({
       chunkIndex: i,

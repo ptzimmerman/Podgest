@@ -6,6 +6,7 @@
 
 import { all, one, run } from "./db";
 import { getUserApiKeys } from "./user-keys";
+import { aiFetch } from "./ai-gateway";
 
 export interface SpecialEpisodeEnv {
   DB: D1Database;
@@ -58,7 +59,8 @@ async function callClaude(
   user: string,
   maxTokens: number
 ): Promise<string> {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  // Special episodes run on the platform's own Anthropic key (operator cost).
+  const response = await aiFetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -71,7 +73,7 @@ async function callClaude(
       system,
       messages: [{ role: "user", content: user }],
     }),
-  });
+  }, { billing: "platform", purpose: "special_episode" });
   if (!response.ok) {
     const err = await response.text();
     throw new Error(`Claude API error: ${response.status} - ${err.slice(0, 400)}`);

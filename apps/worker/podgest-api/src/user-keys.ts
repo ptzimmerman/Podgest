@@ -7,6 +7,7 @@
 
 import { decryptApiKey } from './encryption';
 import { one } from './db';
+import { aiFetch } from './ai-gateway';
 
 /**
  * Decrypted user API keys
@@ -200,12 +201,12 @@ export async function validateOpenAIKeyDetailed(apiKey: string): Promise<KeyVali
   }
 
   try {
-    const response = await fetch('https://api.openai.com/v1/models', {
+    const response = await aiFetch('https://api.openai.com/v1/models', {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
       },
-    });
+    }, { billing: 'byok', purpose: 'key_validation' });
 
     if (response.ok) {
       return { valid: true };
@@ -244,7 +245,7 @@ export async function validateAnthropicKeyDetailed(apiKey: string): Promise<KeyV
   }
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await aiFetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'x-api-key': apiKey,
@@ -256,7 +257,7 @@ export async function validateAnthropicKeyDetailed(apiKey: string): Promise<KeyV
         max_tokens: 1,
         messages: [{ role: 'user', content: 'Hi' }],
       }),
-    });
+    }, { billing: 'byok', purpose: 'key_validation' });
 
     // 200 = valid
     if (response.ok) {

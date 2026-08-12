@@ -1,5 +1,6 @@
 import { getUserApiKeys, validateOpenAIKey, validateAnthropicKey, validateOpenAIKeyDetailed, validateAnthropicKeyDetailed } from './user-keys';
 import { generateChunkedEmbeddings } from './embeddings';
+import { aiFetch } from './ai-gateway';
 import { encryptApiKey, decryptApiKey } from './encryption';
 import { one, all, run, parseJson } from './db';
 import { createAuth } from './auth';
@@ -1939,7 +1940,7 @@ You can also connect Podgest to Claude or ChatGPT using the MCP server, and ask 
 Alright, that's the quick tour. Welcome aboard!`;
 
   try {
-    const ttsResponse = await fetch("https://api.openai.com/v1/audio/speech", {
+    const ttsResponse = await aiFetch("https://api.openai.com/v1/audio/speech", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
@@ -1951,7 +1952,7 @@ Alright, that's the quick tour. Welcome aboard!`;
         input: script,
         response_format: "mp3",
       }),
-    });
+    }, { billing: "platform", purpose: "welcome_tts" });
 
     if (!ttsResponse.ok) {
       const errText = await ttsResponse.text();
@@ -2030,7 +2031,7 @@ async function extractTopicsForEpisode(episodeId: string, transcriptText: string
       return;
     }
     
-    const result = await callClaudeForTopics(transcriptText, userKeys.anthropicKey);
+    const result = await callClaudeForTopics(transcriptText, userKeys.anthropicKey, userId);
     
     // Get transcription ID
     const transcription = await one<{ id: string }>(
@@ -2066,7 +2067,7 @@ async function extractTopicsForEpisode(episodeId: string, transcriptText: string
   }
 }
 
-async function callClaudeForTopics(transcriptText: string, apiKey: string): Promise<TopicExtractionResult> {
+async function callClaudeForTopics(transcriptText: string, apiKey: string, keyUserId?: string): Promise<TopicExtractionResult> {
   // Truncate if too long (Claude has ~200k context, but we'll be conservative)
   const maxChars = 100000;
   const text = transcriptText.length > maxChars 
@@ -2088,7 +2089,7 @@ Be specific with topics (e.g., "Federal Reserve interest rate policy" not just "
 Keep the summary concise but informative.
 IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code fences. Do NOT include any text before or after the JSON.`;
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await aiFetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -2106,7 +2107,7 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code fenc
       ],
       system: systemPrompt,
     }),
-  });
+  }, { billing: "byok", user_id: keyUserId, purpose: "topics" });
 
   if (!response.ok) {
     const err = await response.text();
@@ -2343,7 +2344,7 @@ async function generateEmbeddingsForTranscript(episodeId: string, transcriptText
     
     // 5. Generate chunked embeddings (once)
     console.log(`[Embeddings] Generating embeddings for transcript (${transcriptText.length} chars)...`);
-    const chunkedEmbeddings = await generateChunkedEmbeddings(transcriptText, openaiKey);
+    const chunkedEmbeddings = await generateChunkedEmbeddings(transcriptText, openaiKey, keyUserId);
     
     console.log(`[Embeddings] Generated ${chunkedEmbeddings.length} chunks for episode ${episodeId}`);
     
@@ -3941,7 +3942,7 @@ async function handleExtractTopics(request: Request, env: Env): Promise<Response
     const transcript = await transcriptObj2.json() as { text: string };
     
     // Extract topics
-    const result = await callClaudeForTopics(transcript.text, userKeys.anthropicKey);
+    const result = await callClaudeForTopics(transcript.text, userKeys.anthropicKey, userId);
     
     // Get transcription ID
     const transcription = await one<{ id: string }>(
@@ -4489,7 +4490,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     console.log(`[Digest] Generating script with Claude (with clip markers)...`);
     
     // 5. Generate news broadcaster script with clip markers
-    const script = await generateDigestScriptWithClips(episodeSummaries, maxLengthMinutes, userAnthropicKey);
+    const script = await generateDigestScriptWithClips(episodeSummaries, maxLengthMinutes, userAnthropicKey, userId);
     
     console.log(`[Digest] Script generated: ${script.word_count} words, ${script.clips.length} clips requested`);
 
@@ -4707,7 +4708,8 @@ async function generateDigestScript(
     key_points: string[];
   }>,
   maxMinutes: number,
-  apiKey: string
+  apiKey: string,
+  keyUserId?: string
 ): Promise<DigestScript> {
   
   // ~150 words per minute for natural speech
@@ -4784,7 +4786,7 @@ Key Points: ${ep.key_points.join("; ")}
 Topics: ${ep.topics.join(", ")}`
   ).join("\n\n");
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await aiFetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -4802,7 +4804,7 @@ Topics: ${ep.topics.join(", ")}`
         },
       ],
     }),
-  });
+  }, { billing: "byok", user_id: keyUserId, purpose: "digest_script" });
 
   if (!response.ok) {
     const err = await response.text();
@@ -4847,7 +4849,8 @@ async function generateDigestScriptWithClips(
     transcript_excerpt: string;
   }>,
   maxMinutes: number,
-  apiKey: string
+  apiKey: string,
+  keyUserId?: string
 ): Promise<DigestScriptWithClips> {
 
   const targetWordCount = maxMinutes * 150;
@@ -4936,7 +4939,7 @@ Topics: ${ep.topics.join(", ")}
 Transcript Excerpt: ${ep.transcript_excerpt.substring(0, 3000)}`
   ).join("\n\n");
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await aiFetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -4954,7 +4957,7 @@ Transcript Excerpt: ${ep.transcript_excerpt.substring(0, 3000)}`
         },
       ],
     }),
-  });
+  }, { billing: "byok", user_id: keyUserId, purpose: "digest_script" });
 
   if (!response.ok) {
     const err = await response.text();
