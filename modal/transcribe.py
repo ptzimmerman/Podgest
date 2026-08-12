@@ -448,6 +448,41 @@ class TextToSpeech:
 # TTS with OpenAI (Primary - 10x cheaper than ElevenLabs)
 # ============================================
 
+# Cloudflare AI Gateway (observability: request/spend tracking per user).
+# TTS calls route through the gateway with metadata tags; any gateway failure
+# falls back to the direct OpenAI API so audio generation never breaks.
+AI_GATEWAY_OPENAI_BASE = (
+    "https://gateway.ai.cloudflare.com/v1/78bc485245e71abb26a6cee477ab3ede/podgest/openai"
+)
+
+
+def _openai_clients(api_key: str, user_id: str | None, purpose: str):
+    """Return (gateway_client, direct_client) for fail-open TTS calls."""
+    import json as _json
+    from openai import OpenAI
+
+    meta = {"billing": "byok", "purpose": purpose}
+    if user_id:
+        meta["user_id"] = user_id
+    gateway = OpenAI(
+        api_key=api_key,
+        base_url=AI_GATEWAY_OPENAI_BASE,
+        default_headers={"cf-aig-metadata": _json.dumps(meta)},
+    )
+    direct = OpenAI(api_key=api_key)
+    return gateway, direct
+
+
+def _tts_create(clients, **kwargs):
+    """Try the AI Gateway first; fail open to direct OpenAI on any error."""
+    gateway, direct = clients
+    try:
+        return gateway.audio.speech.create(**kwargs)
+    except Exception as exc:  # noqa: BLE001 - fail open on any gateway fault
+        print(f"⚠️ AI Gateway TTS failed ({exc}); falling back to direct OpenAI")
+        return direct.audio.speech.create(**kwargs)
+
+
 @app.cls(
     image=tts_image,
     timeout=600,
@@ -474,6 +509,7 @@ class OpenAITTS:
         webhook_url: str | None = None,
         admin_key: str | None = None,
         upload_url: str | None = None,  # worker endpoint that stores audio in R2
+        user_id: str | None = None,  # whose OpenAI key funds this (AI Gateway metadata)
     ) -> dict:
         """
         Generate audio from script text using OpenAI TTS.
@@ -490,7 +526,7 @@ class OpenAITTS:
         try:
             print(f"🎙️ Generating OpenAI TTS for {len(script)} characters (voice={voice}, model={model})")
             
-            client = OpenAI(api_key=openai_api_key)
+            clients = _openai_clients(openai_api_key, user_id, "digest_tts")
             
             # Remove [PAUSE] markers and split into chunks
             clean_script = script.replace("[PAUSE]", " ... ")
@@ -504,7 +540,8 @@ class OpenAITTS:
             for i, chunk in enumerate(chunks):
                 print(f"🔊 Generating chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
                 
-                response = client.audio.speech.create(
+                response = _tts_create(
+                    clients,
                     model=model,
                     voice=voice,
                     input=chunk,
@@ -712,6 +749,7 @@ def openai_tts_web(request: dict) -> dict:
         webhook_url=request.get("webhook_url"),
         admin_key=request.get("admin_key"),
         upload_url=request.get("upload_url"),
+        user_id=request.get("user_id"),
     )
 
 
@@ -758,6 +796,7 @@ def tts_with_clips_web(request: dict) -> dict:
     webhook_url = request.get("webhook_url")
     admin_key = request.get("admin_key")
     upload_url = request.get("upload_url")
+    user_id = request.get("user_id")
     
     if not script:
         return {"error": "script is required"}
@@ -767,7 +806,7 @@ def tts_with_clips_web(request: dict) -> dict:
     try:
         print(f"🎙️ TTS+Clips: {len(script)} chars, {len(clips)} clips, voice={voice}")
         
-        client = OpenAI(api_key=api_key)
+        clients = _openai_clients(api_key, user_id, "digest_tts_clips")
         
         # Split script on [CLIP:N] markers into segments
         # Pattern: [CLIP:1], [CLIP:2], etc.
@@ -805,7 +844,8 @@ def tts_with_clips_web(request: dict) -> dict:
                 
                 for chunk_idx, chunk in enumerate(chunks):
                     print(f"🔊 TTS segment {seg_idx+1}, chunk {chunk_idx+1}/{len(chunks)} ({len(chunk)} chars)")
-                    response = client.audio.speech.create(
+                    response = _tts_create(
+                        clients,
                         model=model,
                         voice=voice,
                         input=chunk,
@@ -868,7 +908,8 @@ def tts_with_clips_web(request: dict) -> dict:
                     print(f"⚠️ Clip {seg_idx+1} unavailable ({clip_error}); using narrated quote")
                     fallback_text = str(clip.get("fallback_text") or "").strip()
                     if fallback_text:
-                        response = client.audio.speech.create(
+                        response = _tts_create(
+                            clients,
                             model=model,
                             voice=voice,
                             input=fallback_text,

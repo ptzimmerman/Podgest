@@ -1896,6 +1896,7 @@ Alright, that's the quick tour. I'll catch you tomorrow with your first digest. 
           body: JSON.stringify({
             script: welcomeScript,
             openai_api_key: userKeys.openaiKey,
+            user_id: userId,
             voice: "echo",
             model: "tts-1-hd",
             upload_url: `https://api.podgest.app/api/webhooks/tts-audio?digest_id=${digestId}`,
@@ -4592,6 +4593,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
     const ttsPayload: Record<string, unknown> = {
       script: script.script,
       openai_api_key: userOpenAIKey,
+      user_id: userId,
       voice: "echo",
       model: "tts-1-hd",
       upload_url: `https://api.podgest.app/api/webhooks/tts-audio?digest_id=${digestId}`,
