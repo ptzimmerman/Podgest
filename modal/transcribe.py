@@ -456,7 +456,7 @@ AI_GATEWAY_OPENAI_BASE = (
 )
 
 
-def _openai_clients(api_key: str, user_id: str | None, purpose: str):
+def _openai_clients(api_key: str, user_id: str | None, purpose: str, aig_token: str | None = None):
     """Return (gateway_client, direct_client) for fail-open TTS calls."""
     import json as _json
     from openai import OpenAI
@@ -464,10 +464,14 @@ def _openai_clients(api_key: str, user_id: str | None, purpose: str):
     meta = {"billing": "byok", "purpose": purpose}
     if user_id:
         meta["user_id"] = user_id
+    headers = {"cf-aig-metadata": _json.dumps(meta)}
+    if aig_token:
+        # Authenticated gateway: requests without this header are rejected.
+        headers["cf-aig-authorization"] = f"Bearer {aig_token}"
     gateway = OpenAI(
         api_key=api_key,
         base_url=AI_GATEWAY_OPENAI_BASE,
-        default_headers={"cf-aig-metadata": _json.dumps(meta)},
+        default_headers=headers,
     )
     direct = OpenAI(api_key=api_key)
     return gateway, direct
@@ -510,6 +514,7 @@ class OpenAITTS:
         admin_key: str | None = None,
         upload_url: str | None = None,  # worker endpoint that stores audio in R2
         user_id: str | None = None,  # whose OpenAI key funds this (AI Gateway metadata)
+        cf_aig_token: str | None = None,  # authenticated-gateway token
     ) -> dict:
         """
         Generate audio from script text using OpenAI TTS.
@@ -526,7 +531,7 @@ class OpenAITTS:
         try:
             print(f"🎙️ Generating OpenAI TTS for {len(script)} characters (voice={voice}, model={model})")
             
-            clients = _openai_clients(openai_api_key, user_id, "digest_tts")
+            clients = _openai_clients(openai_api_key, user_id, "digest_tts", cf_aig_token)
             
             # Remove [PAUSE] markers and split into chunks
             clean_script = script.replace("[PAUSE]", " ... ")
@@ -750,6 +755,7 @@ def openai_tts_web(request: dict) -> dict:
         admin_key=request.get("admin_key"),
         upload_url=request.get("upload_url"),
         user_id=request.get("user_id"),
+        cf_aig_token=request.get("cf_aig_token"),
     )
 
 
@@ -797,6 +803,7 @@ def tts_with_clips_web(request: dict) -> dict:
     admin_key = request.get("admin_key")
     upload_url = request.get("upload_url")
     user_id = request.get("user_id")
+    cf_aig_token = request.get("cf_aig_token")
     
     if not script:
         return {"error": "script is required"}
@@ -806,7 +813,7 @@ def tts_with_clips_web(request: dict) -> dict:
     try:
         print(f"🎙️ TTS+Clips: {len(script)} chars, {len(clips)} clips, voice={voice}")
         
-        clients = _openai_clients(api_key, user_id, "digest_tts_clips")
+        clients = _openai_clients(api_key, user_id, "digest_tts_clips", cf_aig_token)
         
         # Split script on [CLIP:N] markers into segments
         # Pattern: [CLIP:1], [CLIP:2], etc.

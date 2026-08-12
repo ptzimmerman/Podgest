@@ -21,6 +21,16 @@ export interface AiCallMeta {
 const GATEWAY_BASE =
   "https://gateway.ai.cloudflare.com/v1/78bc485245e71abb26a6cee477ab3ede/podgest";
 
+// The gateway requires cf-aig-authorization (authenticated gateway). The token
+// is a worker secret; handlers call setAiGatewayToken(env.CF_AIG_TOKEN) once at
+// entry so every aiFetch call site doesn't need env threaded through. If it's
+// never set, gateway requests get a 401 AiGatewayError and fail open to direct.
+let aigToken: string | undefined;
+
+export function setAiGatewayToken(token: string | undefined): void {
+  aigToken = token;
+}
+
 function gatewayUrlFor(directUrl: string): string | null {
   if (directUrl.startsWith("https://api.anthropic.com/")) {
     return `${GATEWAY_BASE}/anthropic/${directUrl.slice("https://api.anthropic.com/".length)}`;
@@ -42,6 +52,7 @@ export async function aiFetch(
   try {
     const headers = new Headers(init.headers);
     headers.set("cf-aig-metadata", JSON.stringify(meta));
+    if (aigToken) headers.set("cf-aig-authorization", `Bearer ${aigToken}`);
     const response = await fetch(gatewayUrl, { ...init, headers });
     if (response.ok) return response;
     const gatewayFault =

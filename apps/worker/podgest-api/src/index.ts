@@ -1,6 +1,6 @@
 import { getUserApiKeys, validateOpenAIKey, validateAnthropicKey, validateOpenAIKeyDetailed, validateAnthropicKeyDetailed } from './user-keys';
 import { generateChunkedEmbeddings } from './embeddings';
-import { aiFetch } from './ai-gateway';
+import { aiFetch, setAiGatewayToken } from './ai-gateway';
 import { encryptApiKey, decryptApiKey } from './encryption';
 import { one, all, run, parseJson } from './db';
 import { createAuth } from './auth';
@@ -45,6 +45,8 @@ export interface Env {
   DB: D1Database;
   VECTORIZE: VectorizeIndex;
   SESSIONS_KV: KVNamespace;
+  // cf-aig-authorization token for the authenticated AI Gateway
+  CF_AIG_TOKEN?: string;
 }
 
 // Public base URL for the MEDIA bucket (R2 custom domain)
@@ -867,6 +869,7 @@ function withCors(response: Response, request?: Request): Response {
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    setAiGatewayToken(env.CF_AIG_TOKEN);
 		const url = new URL(request.url);
 
     // Handle CORS preflight requests
@@ -1305,6 +1308,7 @@ export default {
   // Queue consumer for async digest processing
   // Each message = one user's digest job with independent timeout/retry
   async queue(batch: MessageBatch<DigestQueueMessage | SpecialQueueMessage>, env: Env, ctx: ExecutionContext): Promise<void> {
+    setAiGatewayToken(env.CF_AIG_TOKEN);
     await handleQueueBatch(batch, env, ctx);
   },
 
@@ -1314,6 +1318,7 @@ export default {
   //   0 12 * * *    daily digest dispatch
   //   15,30 12 * * * + 45 12-16 * * *  watchdog: requeue users missing today's digest
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    setAiGatewayToken(env.CF_AIG_TOKEN);
     switch (event.cron) {
       case "30 11 * * *":
         await handlePollCron(env);
@@ -1897,6 +1902,7 @@ Alright, that's the quick tour. I'll catch you tomorrow with your first digest. 
             script: welcomeScript,
             openai_api_key: userKeys.openaiKey,
             user_id: userId,
+            cf_aig_token: env.CF_AIG_TOKEN,
             voice: "echo",
             model: "tts-1-hd",
             upload_url: `https://api.podgest.app/api/webhooks/tts-audio?digest_id=${digestId}`,
@@ -4594,6 +4600,7 @@ async function handleGenerateDigest(request: Request, env: Env, ctx: ExecutionCo
       script: script.script,
       openai_api_key: userOpenAIKey,
       user_id: userId,
+      cf_aig_token: env.CF_AIG_TOKEN,
       voice: "echo",
       model: "tts-1-hd",
       upload_url: `https://api.podgest.app/api/webhooks/tts-audio?digest_id=${digestId}`,
