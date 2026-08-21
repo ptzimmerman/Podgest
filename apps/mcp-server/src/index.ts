@@ -1335,6 +1335,18 @@ const defaultHandler = {
     // The Better Auth session cookie is set on .podgest.app (crossSubDomainCookies),
     // so we can verify it by forwarding cookies to the API's get-session endpoint.
     if (url.pathname === "/authorize") {
+      // Sign-in only works on the custom domain: the Better Auth session cookie
+      // (Domain=podgest.app) is never sent to the workers.dev fallback host, and
+      // the API's CORS allowlist only trusts mcp.podgest.app. Clients that
+      // connected via the workers.dev URL would loop forever on the sign-in
+      // page, so canonicalize the host here (token/register endpoints are
+      // host-agnostic and keep working on either host).
+      const isLocalDev = url.hostname === "localhost" || url.hostname === "127.0.0.1";
+      if (url.hostname !== "mcp.podgest.app" && !isLocalDev) {
+        url.hostname = "mcp.podgest.app";
+        url.port = "";
+        return Response.redirect(url.toString(), 302);
+      }
       const oauthReqInfo = await typedEnv.OAUTH_PROVIDER.parseAuthRequest(request);
 
       // Check for an existing Better Auth session
