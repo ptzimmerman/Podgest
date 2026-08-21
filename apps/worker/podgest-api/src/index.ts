@@ -829,6 +829,10 @@ function isAllowedAudioUrl(audioUrl: string, _env: Env): boolean {
 const ALLOWED_ORIGINS = [
   "https://dash.podgest.app",
   "https://podgest.app",
+  // MCP OAuth sign-in page (mcp.podgest.app /authorize) does a credentialed
+  // fetch to /api/auth/sign-in/social; without this origin the browser blocks
+  // it on CORS preflight and Claude connector sign-in fails.
+  "https://mcp.podgest.app",
   "http://localhost:5173",    // Local dev
   "http://localhost:3000",    // Local dev
 ];
