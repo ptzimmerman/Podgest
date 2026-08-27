@@ -1,6 +1,12 @@
 import { getUserApiKeys, validateOpenAIKey, validateAnthropicKey, validateOpenAIKeyDetailed, validateAnthropicKeyDetailed } from './user-keys';
 import { generateChunkedEmbeddings } from './embeddings';
 import { aiFetch, setAiGatewayToken } from './ai-gateway';
+import {
+  TOPICS_SYSTEM_PROMPT,
+  cachedSystem,
+  claudeMessages,
+  stripMarkdownJsonFence,
+} from './claude';
 import { encryptApiKey, decryptApiKey } from './encryption';
 import { one, all, run, parseJson } from './db';
 import { createAuth } from './auth';
@@ -2085,74 +2091,23 @@ async function callClaudeForTopics(transcriptText: string, apiKey: string, keyUs
     ? transcriptText.substring(0, maxChars) + "\n\n[Transcript truncated...]"
     : transcriptText;
   
-  const systemPrompt = `You are an expert at analyzing podcast transcripts. Extract structured information from the transcript provided.
-
-Return a JSON object with exactly this structure:
-{
-  "topics": ["topic1", "topic2", ...],  // Main topics discussed (5-10 items)
-  "themes": ["theme1", "theme2", ...],  // Broader themes (3-5 items)
-  "summary": "A 2-3 sentence summary of the episode",
-  "key_points": ["point1", "point2", ...],  // Key takeaways (3-7 items)
-  "sentiment": "positive" | "negative" | "neutral" | "mixed"
-}
-
-Be specific with topics (e.g., "Federal Reserve interest rate policy" not just "economics").
-Keep the summary concise but informative.
-IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code fences. Do NOT include any text before or after the JSON.`;
-
-  const response = await aiFetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-5",
-      max_tokens: 1024,
-      messages: [
-        {
-          role: "user",
-          content: `Analyze this podcast transcript and extract topics:\n\n${text}`,
-        },
-      ],
-      system: systemPrompt,
-    }),
-  }, { billing: "byok", user_id: keyUserId, purpose: "topics" });
-
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Claude API error: ${response.status} - ${err}`);
-  }
-
-  const data = await response.json() as {
-    content: Array<{ type: string; text: string }>;
-  };
-  
-  const textContent = data.content.find(c => c.type === "text");
-  if (!textContent) {
-    throw new Error("No text content in Claude response");
-  }
+  const { text: textContent } = await claudeMessages({
+    apiKey,
+    system: TOPICS_SYSTEM_PROMPT,
+    user: `Analyze this podcast transcript and extract topics:\n\n${text}`,
+    maxTokens: 1024,
+    cacheTtl: "1h",
+    meta: { billing: "byok", user_id: keyUserId, purpose: "topics" },
+  });
   
   // Parse the JSON response - strip markdown code fences if present
   try {
-    let jsonText = textContent.text.trim();
-    
-    // Remove markdown code fences if present
-    if (jsonText.startsWith("```json")) {
-      jsonText = jsonText.slice(7);
-    } else if (jsonText.startsWith("```")) {
-      jsonText = jsonText.slice(3);
-    }
-    if (jsonText.endsWith("```")) {
-      jsonText = jsonText.slice(0, -3);
-    }
-    jsonText = jsonText.trim();
+    const jsonText = stripMarkdownJsonFence(textContent);
     
     console.log("[Topics] Parsing JSON:", jsonText.substring(0, 200) + "...");
     return JSON.parse(jsonText) as TopicExtractionResult;
   } catch (parseError) {
-    console.error("[Topics] Failed to parse Claude response:", textContent.text.substring(0, 500));
+    console.error("[Topics] Failed to parse Claude response:", textContent.substring(0, 500));
     console.error("[Topics] Parse error:", parseError);
     // Return a fallback structure
     return {
@@ -4733,7 +4688,7 @@ async function generateDigestScript(
   const dayOfWeek = today.toLocaleDateString('en-US', { weekday: 'long' });
   const dateStr = today.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
   
-  const systemPrompt = `You are Alex Chen, an upbeat and energetic podcast host for "Podgest" - a daily news digest show.
+  const digestHostStatic = `You are Alex Chen, an upbeat and energetic podcast host for "Podgest" - a daily news digest show.
 Your style is enthusiastic, warm, and engaging - but STRICTLY NEUTRAL. You deliver facts, not opinions.
 
 CRITICAL RULE: You are a NEWS READER, not a commentator. 
@@ -4743,13 +4698,9 @@ CRITICAL RULE: You are a NEWS READER, not a commentator.
 - JUST report what was said on the source podcasts, attributed to them
 - Let the facts speak for themselves
 
-CRITICAL: The script MUST be approximately ${targetWordCount} words long (${maxMinutes} minutes at 150 words/minute). 
-This is a hard requirement - expand on stories with detail and analysis to hit this target.
-
 STRUCTURE YOUR SCRIPT EXACTLY LIKE THIS:
 
-1. OPENING (warm, energetic):
-   "Hey there! It's ${dayOfWeek}, ${dateStr}, and this is the Podgest Podcast. I'm Alex Chen, and I've got a great lineup for you today. [PAUSE] Here's what's on deck: [brief 2-3 sentence preview of main themes]. Let's get into it! [PAUSE]"
+1. OPENING (warm, energetic): use the exact opening in the schedule block below.
 
 2. MAIN CONTENT - Group stories into 3-5 SECTIONS by theme (e.g., "Markets & Money", "Politics & Policy", "Tech & Innovation", "Culture & Ideas"):
    - Start each section with a transition: "Alright, let's talk about [SECTION NAME]. [PAUSE]"
@@ -4773,7 +4724,7 @@ STRUCTURE YOUR SCRIPT EXACTLY LIKE THIS:
 3. CLOSING (tie it together):
    - "Alright, let's zoom out for a second. [PAUSE]"
    - Draw connections between stories - what themes emerged today?
-   - End with: "That's your Podgest for ${dayOfWeek}. Thanks for hanging out with me today - I'll catch you tomorrow. Until then, stay curious! [PAUSE]"
+   - End with the exact closing in the schedule block below.
 
 IMPORTANT FORMATTING:
 - Include [PAUSE] markers where natural breaks should occur (between sections, after transitions)
@@ -4783,13 +4734,20 @@ IMPORTANT FORMATTING:
 
 Return a JSON object with this structure:
 {
-  "title": "Podgest - ${dateStr}",
-  "script": "Hey there! It's ${dayOfWeek}... [full script with [PAUSE] markers]",
+  "title": "Podgest - <Month Day, Year>",
+  "script": "Hey there! It's <weekday>... [full script with [PAUSE] markers]",
   "topics_covered": ["topic1", "topic2", ...],
   "word_count": 450
 }
 
 IMPORTANT: Return ONLY the JSON object, no markdown formatting.`;
+
+  const digestSchedule = `SCHEDULE FOR THIS EPISODE:
+Today is ${dayOfWeek}, ${dateStr}.
+The script MUST be approximately ${targetWordCount} words long (${maxMinutes} minutes at 150 words/minute). This is a hard requirement - expand on stories with detail and analysis to hit this target.
+Exact opening: "Hey there! It's ${dayOfWeek}, ${dateStr}, and this is the Podgest Podcast. I'm Alex Chen, and I've got a great lineup for you today. [PAUSE] Here's what's on deck: [brief 2-3 sentence preview of main themes]. Let's get into it! [PAUSE]"
+Exact closing: "That's your Podgest for ${dayOfWeek}. Thanks for hanging out with me today - I'll catch you tomorrow. Until then, stay curious! [PAUSE]"
+JSON title must be "Podgest - ${dateStr}".`;
 
   const episodeContext = episodes.map((ep, i) => 
     `Story ${i + 1}: "${ep.title}"
@@ -4799,48 +4757,15 @@ Key Points: ${ep.key_points.join("; ")}
 Topics: ${ep.topics.join(", ")}`
   ).join("\n\n");
 
-  const response = await aiFetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-5",
-      max_tokens: 16000,
-      system: systemPrompt,
-      messages: [
-        {
-          role: "user",
-          content: `Create a ${maxMinutes}-minute news-style podcast script covering these ${episodes.length} stories:\n\n${episodeContext}`,
-        },
-      ],
-    }),
-  }, { billing: "byok", user_id: keyUserId, purpose: "digest_script" });
-
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Claude API error: ${response.status} - ${err}`);
-  }
-
-  const data = await response.json() as {
-    content: Array<{ type: string; text: string }>;
-  };
+  const { text: textContent } = await claudeMessages({
+    apiKey,
+    system: cachedSystem(digestHostStatic, digestSchedule, "1h"),
+    user: `Create a ${maxMinutes}-minute news-style podcast script covering these ${episodes.length} stories:\n\n${episodeContext}`,
+    maxTokens: 16000,
+    meta: { billing: "byok", user_id: keyUserId, purpose: "digest_script" },
+  });
   
-  const textContent = data.content.find(c => c.type === "text");
-  if (!textContent) {
-    throw new Error("No text content in Claude response");
-  }
-  
-  // Parse JSON, stripping markdown if present
-  let jsonText = textContent.text.trim();
-  if (jsonText.startsWith("```json")) jsonText = jsonText.slice(7);
-  else if (jsonText.startsWith("```")) jsonText = jsonText.slice(3);
-  if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3);
-  jsonText = jsonText.trim();
-  
-  const result = JSON.parse(jsonText) as DigestScript;
+  const result = JSON.parse(stripMarkdownJsonFence(textContent)) as DigestScript;
   
   // Ensure word_count is set
   if (!result.word_count) {
@@ -4872,7 +4797,7 @@ async function generateDigestScriptWithClips(
   const dayOfWeek = today.toLocaleDateString('en-US', { weekday: 'long' });
   const dateStr = today.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
 
-  const systemPrompt = `You are Alex Chen, an upbeat and energetic podcast host for "Podgest" - a daily news digest show.
+  const digestHostStatic = `You are Alex Chen, an upbeat and energetic podcast host for "Podgest" - a daily news digest show.
 Your style is enthusiastic, warm, and engaging - but STRICTLY NEUTRAL. You deliver facts, not opinions.
 
 CRITICAL RULE: You are a NEWS READER, not a commentator. 
@@ -4881,9 +4806,6 @@ CRITICAL RULE: You are a NEWS READER, not a commentator.
 - DO NOT editorialize with "This is huge", "shocking", "remarkable", etc.
 - JUST report what was said on the source podcasts, attributed to them
 - Let the facts speak for themselves
-
-CRITICAL: The script MUST be approximately ${targetWordCount} words long (${maxMinutes} minutes at 150 words/minute). 
-This is a hard requirement - expand on stories with detail and analysis to hit this target.
 
 AUDIO CLIPS: You have access to the original podcast audio. When you reference a particularly compelling quote or moment, 
 you can insert a clip marker: [CLIP:episode_index] where episode_index is the Story number (1-based).
@@ -4898,8 +4820,7 @@ CLIP GUIDELINES:
 
 STRUCTURE YOUR SCRIPT EXACTLY LIKE THIS:
 
-1. OPENING (warm, energetic):
-   "Hey there! It's ${dayOfWeek}, ${dateStr}, and this is the Podgest Podcast. I'm Alex Chen, and I've got a great lineup for you today. [PAUSE] Here's what's on deck: [brief 2-3 sentence preview of main themes]. Let's get into it! [PAUSE]"
+1. OPENING (warm, energetic): use the exact opening in the schedule block below.
 
 2. MAIN CONTENT - Group stories into 3-5 SECTIONS by theme:
    - Start each section with a transition: "Alright, let's talk about [SECTION NAME]. [PAUSE]"
@@ -4920,7 +4841,7 @@ STRUCTURE YOUR SCRIPT EXACTLY LIKE THIS:
 3. CLOSING (tie it together):
    - "Alright, let's zoom out for a second. [PAUSE]"
    - Draw connections between stories
-   - End with: "That's your Podgest for ${dayOfWeek}. Thanks for hanging out with me today - I'll catch you tomorrow. Until then, stay curious! [PAUSE]"
+   - End with the exact closing in the schedule block below.
 
 IMPORTANT FORMATTING:
 - Include [PAUSE] markers where natural breaks should occur
@@ -4930,8 +4851,8 @@ IMPORTANT FORMATTING:
 
 Return a JSON object with this structure:
 {
-  "title": "Podgest - ${dateStr}",
-  "script": "Hey there! It's ${dayOfWeek}... [full script with [PAUSE] and [CLIP:N] markers]",
+  "title": "Podgest - <Month Day, Year>",
+  "script": "Hey there! It's <weekday>... [full script with [PAUSE] and [CLIP:N] markers]",
   "topics_covered": ["topic1", "topic2", ...],
   "word_count": 450,
   "clips": [
@@ -4943,6 +4864,13 @@ Return a JSON object with this structure:
 IMPORTANT: Return ONLY the JSON object, no markdown formatting.
 The "quote" field in clips should be a verbatim excerpt from the transcript (15-40 words) that you want to play as audio.`;
 
+  const digestSchedule = `SCHEDULE FOR THIS EPISODE:
+Today is ${dayOfWeek}, ${dateStr}.
+The script MUST be approximately ${targetWordCount} words long (${maxMinutes} minutes at 150 words/minute). This is a hard requirement - expand on stories with detail and analysis to hit this target.
+Exact opening: "Hey there! It's ${dayOfWeek}, ${dateStr}, and this is the Podgest Podcast. I'm Alex Chen, and I've got a great lineup for you today. [PAUSE] Here's what's on deck: [brief 2-3 sentence preview of main themes]. Let's get into it! [PAUSE]"
+Exact closing: "That's your Podgest for ${dayOfWeek}. Thanks for hanging out with me today - I'll catch you tomorrow. Until then, stay curious! [PAUSE]"
+JSON title must be "Podgest - ${dateStr}".`;
+
   const episodeContext = episodes.map((ep, i) => 
     `Story ${i + 1} (id: ${ep.id}): "${ep.title}"
 Source Podcast: ${ep.podcast_name}
@@ -4952,47 +4880,15 @@ Topics: ${ep.topics.join(", ")}
 Transcript Excerpt: ${ep.transcript_excerpt.substring(0, 3000)}`
   ).join("\n\n");
 
-  const response = await aiFetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-5",
-      max_tokens: 16000,
-      system: systemPrompt,
-      messages: [
-        {
-          role: "user",
-          content: `Create a ${maxMinutes}-minute news-style podcast script covering these ${episodes.length} stories. Include 2-4 audio clips from the original episodes where compelling:\n\n${episodeContext}`,
-        },
-      ],
-    }),
-  }, { billing: "byok", user_id: keyUserId, purpose: "digest_script" });
-
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Claude API error: ${response.status} - ${err}`);
-  }
-
-  const data = await response.json() as {
-    content: Array<{ type: string; text: string }>;
-  };
+  const { text: textContent } = await claudeMessages({
+    apiKey,
+    system: cachedSystem(digestHostStatic, digestSchedule, "1h"),
+    user: `Create a ${maxMinutes}-minute news-style podcast script covering these ${episodes.length} stories. Include 2-4 audio clips from the original episodes where compelling:\n\n${episodeContext}`,
+    maxTokens: 16000,
+    meta: { billing: "byok", user_id: keyUserId, purpose: "digest_script" },
+  });
   
-  const textContent = data.content.find(c => c.type === "text");
-  if (!textContent) {
-    throw new Error("No text content in Claude response");
-  }
-  
-  let jsonText = textContent.text.trim();
-  if (jsonText.startsWith("```json")) jsonText = jsonText.slice(7);
-  else if (jsonText.startsWith("```")) jsonText = jsonText.slice(3);
-  if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3);
-  jsonText = jsonText.trim();
-  
-  const result = JSON.parse(jsonText) as {
+  const result = JSON.parse(stripMarkdownJsonFence(textContent)) as {
     title: string;
     script: string;
     topics_covered: string[];

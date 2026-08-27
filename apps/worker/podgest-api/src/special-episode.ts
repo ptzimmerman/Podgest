@@ -6,7 +6,7 @@
 
 import { all, one, run } from "./db";
 import { getUserApiKeys } from "./user-keys";
-import { aiFetch } from "./ai-gateway";
+import { cachedSystem, claudeMessages, stripMarkdownJsonFence, type ClaudeSystemBlock } from "./claude";
 
 export interface SpecialEpisodeEnv {
   DB: D1Database;
@@ -37,7 +37,7 @@ export type SpecialQueueMessage =
       triggered_at: string;
     };
 
-const CLAUDE_MODEL = "claude-sonnet-5";
+
 const CHUNK_CHARS = 90_000;
 
 function json(data: unknown, status = 200): Response {
@@ -55,34 +55,21 @@ function isValidUUID(value: string): boolean {
 
 async function callClaude(
   apiKey: string,
-  system: string,
+  system: string | ClaudeSystemBlock[],
   user: string,
   maxTokens: number
 ): Promise<string> {
   // Special episodes run on the platform's own Anthropic key (operator cost).
-  const response = await aiFetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: CLAUDE_MODEL,
-      max_tokens: maxTokens,
-      system,
-      messages: [{ role: "user", content: user }],
-    }),
-  }, { billing: "platform", purpose: "special_episode" });
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Claude API error: ${response.status} - ${err.slice(0, 400)}`);
-  }
-  const data = (await response.json()) as {
-    content?: Array<{ type: string; text?: string }>;
-  };
-  const text = data.content?.find((block) => block.type === "text")?.text;
-  if (!text) throw new Error("No text content in Claude response");
+  // Sequential chunks (and users in a batch) reuse the same instructions, so
+  // a 1h prefix cache is shared across that run.
+  const { text } = await claudeMessages({
+    apiKey,
+    system,
+    user,
+    maxTokens,
+    cacheTtl: typeof system === "string" ? "1h" : undefined,
+    meta: { billing: "platform", purpose: "special_episode" },
+  });
   return text;
 }
 
@@ -117,7 +104,25 @@ export async function summarizeDocumentNotes(
       `You extract dense, neutral briefing notes from long-form documents for a news podcast host.
 Return structured notes (bullets / short paragraphs). Capture: thesis, key timeline/events,
 institutions/actors, mechanisms/causes, evidence/stats, and conclusions.
-Do NOT write a podcast script. Do NOT editorialize. Prefer facts and attributions from the text.`,
+Do NOT write a podcast script. Do NOT editorialize. Prefer facts and attributions from the text.
+
+Use this outline every time (omit a section only if the source has nothing for it):
+- Thesis / what the document is arguing
+- Timeline and events (dates, sequence)
+- Institutions, people, and their roles
+- Mechanisms and causes (how the thing works)
+- Evidence, statistics, and named sources in the text
+- Conclusions, recommendations, or unresolved questions the author leaves
+
+Example of the density we want (not the content to invent):
+- Thesis: The author argues X because of Y, citing Z.
+- Timeline: 2019 event A → 2022 event B → present.
+- Actors: Agency Q issued the rule; Company R is the largest affected filer.
+- Mechanism: The fee is assessed on volume, not headcount, so small issuers are hit harder.
+- Evidence: "47% of filers" (section 3); GAO report 2024-NN.
+- Conclusion: The author wants a two-year phase-in, not repeal.
+
+Copy names, numbers, and quotes from THIS chunk. If this is part N of M, do not speculate about missing parts.`,
       `Document title: ${documentTitle}
 Part ${i + 1} of ${chunks.length}:
 
@@ -152,7 +157,7 @@ export async function generateSpecialEpisodeScript(
     year: "numeric",
   });
 
-  const systemPrompt = `You are Alex Chen, an upbeat and energetic podcast host for "Podgest".
+  const systemPromptStatic = `You are Alex Chen, an upbeat and energetic podcast host for "Podgest".
 Your style is enthusiastic, warm, and engaging — but STRICTLY NEUTRAL. You deliver facts, not opinions.
 
 This is a SPECIAL EPISODE summarizing ONE long document (not the usual multi-podcast digest).
@@ -164,21 +169,14 @@ CRITICAL RULE: You are a NEWS READER, not a commentator.
 - DO NOT use phrases like "What's fascinating is...", "Here's where it gets interesting..."
 - JUST report what the source document says, attributed to it
 
-CRITICAL: The script MUST be approximately ${targetWordCount} words (${maxMinutes} minutes at 150 words/minute).
-Hit that length with structure and detail from the notes — not filler.
-
 STRUCTURE:
-1. OPENING:
-   "Hey there! It's ${dayOfWeek}, ${dateStr}, and this is a special episode of the Podgest Podcast. I'm Alex Chen. [PAUSE] Today I'm covering one deep dive: ${documentTitle}. Here's the short version of what it argues, then we'll walk through the story. Let's get into it! [PAUSE]"
-
+1. OPENING: use the exact opening in the schedule block below.
 2. MAIN CONTENT — 3–5 thematic sections with transitions ("Alright, let's talk about… [PAUSE]").
    Cite the source naturally: "According to the document…", "The piece lays out…", "As the reporting describes…"
    End each section: "And that wraps up [SECTION]. [PAUSE]"
-
 3. CLOSING:
    "Alright, let's zoom out for a second. [PAUSE]"
-   Tie the threads together, then:
-   "That's your special Podgest on ${documentTitle}. Thanks for hanging out with me — I'll catch you on the next regular digest. Until then, stay curious! [PAUSE]"
+   Tie the threads together, then use the exact closing in the schedule block below.
 
 FORMATTING:
 - Include [PAUSE] markers at natural breaks
@@ -188,16 +186,24 @@ FORMATTING:
   "title": "Special Episode — <short title>",
   "script": "Hey there! ...",
   "topics_covered": ["...", "..."],
-  "word_count": ${targetWordCount}
+  "word_count": <integer>
 }`;
+
+  const systemPromptSchedule = `SCHEDULE FOR THIS EPISODE:
+Today is ${dayOfWeek}, ${dateStr}.
+The script MUST be approximately ${targetWordCount} words (${maxMinutes} minutes at 150 words/minute).
+Hit that length with structure and detail from the notes — not filler.
+Cover this document: ${documentTitle}.
+Exact opening: "Hey there! It's ${dayOfWeek}, ${dateStr}, and this is a special episode of the Podgest Podcast. I'm Alex Chen. [PAUSE] Today I'm covering one deep dive: ${documentTitle}. Here's the short version of what it argues, then we'll walk through the story. Let's get into it! [PAUSE]"
+Exact closing: "That's your special Podgest on ${documentTitle}. Thanks for hanging out with me — I'll catch you on the next regular digest. Until then, stay curious! [PAUSE]"`;
 
   const text = await callClaude(
     apiKey,
-    systemPrompt,
+    cachedSystem(systemPromptStatic, systemPromptSchedule, "1h"),
     `Create a ${maxMinutes}-minute special-episode script summarizing this document.\n\nTitle: ${documentTitle}\n\nBriefing notes:\n${briefingNotes}`,
     16000
   );
-  const cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+  const cleaned = stripMarkdownJsonFence(text);
   const parsed = JSON.parse(cleaned) as {
     title: string;
     script: string;
